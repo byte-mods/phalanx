@@ -1,4 +1,4 @@
-use regex::{Regex, RegexSet};
+use regex::RegexSet;
 
 pub struct WafRules {
     sqli_set: RegexSet,

@@ -128,11 +128,11 @@ impl Default for AppConfig {
             rate_limit_per_ip_sec: None,
             rate_limit_burst: None,
             global_rate_limit_sec: None,
-            waf_enabled: None,
+            waf_enabled: Some(false),
             waf_auto_ban_threshold: None,
             waf_auto_ban_duration: None,
             ai_epsilon: None,
-            ai_algorithm: None,
+            ai_algorithm: Some("none".to_string()),
             ai_temperature: None,
             ai_ucb_constant: None,
             ai_thompson_threshold_ms: None,
@@ -140,10 +140,9 @@ impl Default for AppConfig {
     }
 }
 
-/// Synchronously loads and parses `phalanx.conf` from the disk.
+/// Synchronously loads and parses the given config path from the disk.
 /// Falls back to default configuration if the file does not exist or is invalid.
-pub fn load_config() -> AppConfig {
-    let conf_path = "phalanx.conf";
+pub fn load_config(conf_path: &str) -> AppConfig {
     if let Ok(content) = std::fs::read_to_string(conf_path) {
         // Use our lightweight phalanx-syntax parser
         let phalanx_cfg = parser::parse_phalanx_config(&content);
@@ -151,6 +150,22 @@ pub fn load_config() -> AppConfig {
 
         if let Some(w) = phalanx_cfg.worker_threads {
             app_cfg.workers = w;
+        }
+
+        if let Some(t) = phalanx_cfg.tcp_listen {
+            if t.contains(':') {
+                app_cfg.tcp_bind = t;
+            } else {
+                app_cfg.tcp_bind = format!("0.0.0.0:{}", t);
+            }
+        }
+
+        if let Some(a) = phalanx_cfg.admin_listen {
+            if a.contains(':') {
+                app_cfg.admin_bind = a;
+            } else {
+                app_cfg.admin_bind = format!("127.0.0.1:{}", a);
+            }
         }
 
         if let Some(http) = phalanx_cfg.http {

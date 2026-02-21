@@ -5,17 +5,11 @@ use std::fs::File;
 use std::io::BufReader;
 use std::sync::Arc;
 use tokio_rustls::TlsAcceptor;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
-pub fn load_tls_acceptor(config: &AppConfig) -> Option<TlsAcceptor> {
-    let cert_path = config.tls_cert_path.as_ref()?;
-    let key_path = config.tls_key_path.as_ref()?;
-
-    info!(
-        "Loading TLS certificates from {} and {}",
-        cert_path, key_path
-    );
-
+/// Builds a rustls `ServerConfig` from cert and key file paths.
+/// Returns None if files are missing or parsing fails.
+fn build_server_config(cert_path: &str, key_path: &str) -> Option<Arc<ServerConfig>> {
     let cert_file = match File::open(cert_path) {
         Ok(f) => f,
         Err(e) => {
@@ -53,5 +47,43 @@ pub fn load_tls_acceptor(config: &AppConfig) -> Option<TlsAcceptor> {
 
     server_config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
 
-    Some(TlsAcceptor::from(Arc::new(server_config)))
+    Some(Arc::new(server_config))
+}
+
+/// Loads TLS configuration and returns a TlsAcceptor.
+/// Called once at startup.
+pub fn load_tls_acceptor(config: &AppConfig) -> Option<TlsAcceptor> {
+    let cert_path = config.tls_cert_path.as_ref()?;
+    let key_path = config.tls_key_path.as_ref()?;
+
+    info!(
+        "Loading TLS certificates from {} and {}",
+        cert_path, key_path
+    );
+
+    let server_config = build_server_config(cert_path, key_path)?;
+    Some(TlsAcceptor::from(server_config))
+}
+
+/// Reloads TLS certificates from disk and returns a new TlsAcceptor.
+/// Called on SIGHUP to hot-reload certificates without restarting.
+pub fn reload_tls_acceptor(config: &AppConfig) -> Option<TlsAcceptor> {
+    let cert_path = config.tls_cert_path.as_ref()?;
+    let key_path = config.tls_key_path.as_ref()?;
+
+    info!(
+        "Hot-reloading TLS certificates from {} and {}",
+        cert_path, key_path
+    );
+
+    match build_server_config(cert_path, key_path) {
+        Some(server_config) => {
+            info!("TLS certificates reloaded successfully.");
+            Some(TlsAcceptor::from(server_config))
+        }
+        None => {
+            warn!("TLS certificate reload failed — keeping existing certificates.");
+            None
+        }
+    }
 }

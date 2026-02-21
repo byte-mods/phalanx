@@ -1,0 +1,228 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Phalanx Dashboard</title>
+    <!-- Tailwind CSS for sleek, modern UI -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    <style>
+        /* Modern aesthetic styling */
+        body { font-family: 'Inter', sans-serif; background-color: #0d1117; color: #c9d1d9; }
+        .glass-panel { background: rgba(22, 27, 34, 0.7); backdrop-filter: blur(12px); border: 1px solid rgba(48, 54, 61, 0.5); border-radius: 16px; }
+        .stat-value { font-size: 3rem; font-weight: 700; color: #58a6ff; }
+        .stat-label { font-size: 0.875rem; color: #8b949e; text-transform: uppercase; letter-spacing: 0.05em; font-weight: 600; }
+        .metric-card { transition: transform 0.2s ease, box-shadow 0.2s ease; }
+        .metric-card:hover { transform: translateY(-2px); box-shadow: 0 10px 25px rgba(0,0,0,0.5); }
+        .pulse { animation: pulse-animation 2s infinite; }
+        @keyframes pulse-animation {
+            0% { transform: scale(0.95); opacity: 0.7; }
+            50% { transform: scale(1.05); opacity: 1; }
+            100% { transform: scale(0.95); opacity: 0.7; }
+        }
+    </style>
+    <!-- Google Fonts -->
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+</head>
+<body class="min-h-screen flex flex-col p-8">
+    <header class="mb-10 flex justify-between items-end">
+        <div>
+            <h1 class="text-4xl font-bold text-white tracking-tight flex items-center gap-3">
+                <svg class="w-8 h-8 text-blue-500" fill="none" stroke="currentColor" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 12l2 2 4-4m5.618-4.016A11.955 11.955 0 0112 2.944a11.955 11.955 0 01-8.618 3.04A12.02 12.02 0 003 9c0 5.591 3.824 10.29 9 11.622 5.176-1.332 9-6.03 9-11.622 0-1.042-.133-2.052-.382-3.016z"></path></svg>
+                Phalanx AI Load Balancer
+            </h1>
+            <p class="text-gray-400 mt-2 text-sm">Real-time Traffic & Security Overview</p>
+        </div>
+        <div class="flex items-center gap-2">
+            <span class="relative flex h-3 w-3">
+              <span class="animate-ping absolute inline-flex h-full w-full rounded-full bg-green-400 opacity-75"></span>
+              <span class="relative inline-flex rounded-full h-3 w-3 bg-green-500"></span>
+            </span>
+            <span class="text-sm text-green-400 font-medium" id="status-text">Connected</span>
+        </div>
+    </header>
+
+    <main class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-6 mb-8">
+        <!-- Active Connections -->
+        <div class="glass-panel p-6 flex flex-col justify-between metric-card">
+            <div class="flex justify-between items-start mb-4">
+                <span class="stat-label">Active Connections</span>
+                <svg class="w-5 h-5 text-gray-500" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 10V3L4 14h7v7l9-11h-7z"></path></svg>
+            </div>
+            <div class="stat-value" id="active-connections">0</div>
+        </div>
+
+        <!-- Total Requests -->
+        <div class="glass-panel p-6 flex flex-col justify-between metric-card">
+            <div class="flex justify-between items-start mb-4">
+                <span class="stat-label">Total Requests</span>
+                <svg class="w-5 h-5 text-gray-500" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 7v10c0 2.21 3.582 4 8 4s8-1.79 8-4V7M4 7c0 2.21 3.582 4 8 4s8-1.79 8-4M4 7c0-2.21 3.582-4 8-4s8 1.79 8 4m0 5c0 2.21-3.582 4-8 4s-8-1.79-8-4"></path></svg>
+            </div>
+            <div class="stat-value" id="total-requests">0</div>
+        </div>
+
+        <!-- Cache Hits -->
+        <div class="glass-panel p-6 flex flex-col justify-between metric-card">
+            <div class="flex justify-between items-start mb-4">
+                <span class="stat-label">Cache Hits</span>
+                <svg class="w-5 h-5 text-gray-500" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 13l4 4L19 7"></path></svg>
+            </div>
+            <div class="stat-value text-green-400" id="cache-hits">0</div>
+        </div>
+
+        <!-- WAF Blocks -->
+        <div class="glass-panel p-6 flex flex-col justify-between metric-card border-red-900/30">
+            <div class="flex justify-between items-start mb-4">
+                <span class="stat-label text-red-400">WAF Blocks</span>
+                <svg class="w-5 h-5 text-red-500" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 15v2m-6 4h12a2 2 0 002-2v-6a2 2 0 00-2-2H6a2 2 0 00-2 2v6a2 2 0 002 2zm10-10V7a4 4 0 00-8 0v4h8z"></path></svg>
+            </div>
+            <div class="stat-value text-red-500" id="waf-blocks">0</div>
+        </div>
+    </main>
+
+    <div class="grid grid-cols-1 lg:grid-cols-2 gap-6 flex-grow">
+        <!-- Request Status Breakdown -->
+        <div class="glass-panel p-6 flex flex-col">
+            <h2 class="text-xl font-semibold text-white mb-6 border-b border-gray-700 pb-2">Traffic by Status</h2>
+            <div class="flex-grow flex items-center justify-center">
+                <div class="w-full space-y-4" id="status-bars">
+                    <!-- Bars injected by JS -->
+                </div>
+            </div>
+        </div>
+
+        <!-- Recent Logs / Activity (Mocked concept) -->
+        <div class="glass-panel p-6 flex flex-col">
+            <h2 class="text-xl font-semibold text-white mb-6 border-b border-gray-700 pb-2">System Diagnostics</h2>
+            <div class="flex-grow bg-gray-900/50 rounded-lg p-4 font-mono text-sm text-green-400 overflow-y-auto" style="max-height: 250px;" id="sys-logs">
+                <div class="opacity-50">Initializing telemetry polling...</div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        const API_ENDPOINT = '/api/stats';
+        const POLL_INTERVAL = 2000;
+
+        function updateMetric(id, value) {
+            const el = document.getElementById(id);
+            if (el.innerText !== value.toString()) {
+                el.innerText = value.toLocaleString();
+                // Subtle pop animation on change
+                el.style.transform = 'scale(1.05)';
+                el.style.color = '#fff';
+                setTimeout(() => {
+                    el.style.transform = 'scale(1)';
+                    el.style.color = '';
+                }, 300);
+            }
+        }
+
+        function logEvent(msg) {
+            const logs = document.getElementById('sys-logs');
+            const time = new Date().toLocaleTimeString();
+            const div = document.createElement('div');
+            div.innerHTML = `<span class="text-gray-500">[${time}]</span> ${msg}`;
+            logs.prepend(div);
+            if (logs.children.length > 20) logs.removeChild(logs.lastChild);
+        }
+
+        async function fetchMetrics() {
+            try {
+                const res = await fetch(API_ENDPOINT);
+                if (!res.ok) throw new Error(`HTTP error! status: ${res.status}`);
+                const data = await res.json();
+                
+                document.getElementById('status-text').innerText = 'Connected';
+                document.getElementById('status-text').className = 'text-sm text-green-400 font-medium';
+
+                updateMetric('active-connections', data.active_connections || 0);
+                
+                // Aggregate total requests
+                let totalReqs = 0;
+                let statusCounts = {};
+                if (data.http_requests_total) {
+                    for (const req of data.http_requests_total) {
+                        totalReqs += req.value;
+                        const status = req.labels.status || 'unknown';
+                        statusCounts[status] = (statusCounts[status] || 0) + req.value;
+                    }
+                }
+                updateMetric('total-requests', totalReqs);
+
+                // Aggregate Cache Hits
+                let cacheHits = 0;
+                if (data.cache_hits_total) {
+                    for (const ch of data.cache_hits_total) {
+                        if (ch.labels.result === 'hit') cacheHits += ch.value;
+                    }
+                }
+                updateMetric('cache-hits', cacheHits);
+
+                // Aggregate WAF Blocks
+                let wafBlocks = 0;
+                if (data.waf_blocks_total) {
+                    for (const w of data.waf_blocks_total) {
+                        wafBlocks += w.value;
+                    }
+                }
+                
+                // Add rate limit rejections into blocks
+                if (data.rate_limit_rejections) {
+                     for (const r of data.rate_limit_rejections) {
+                         wafBlocks += r.value;
+                     }
+                }
+                updateMetric('waf-blocks', wafBlocks);
+
+                // Update Status Bars
+                renderStatusBars(statusCounts, totalReqs);
+
+            } catch (error) {
+                console.error("Failed to fetch metrics:", error);
+                document.getElementById('status-text').innerText = 'Disconnected';
+                document.getElementById('status-text').className = 'text-sm text-red-500 font-medium';
+                logEvent(`<span class="text-red-500">Error: Connection to telemetry API lost.</span>`);
+            }
+        }
+
+        function renderStatusBars(counts, total) {
+            const container = document.getElementById('status-bars');
+            container.innerHTML = '';
+            
+            if (total === 0) {
+                container.innerHTML = '<div class="text-center text-gray-500 mt-10">Waiting for traffic...</div>';
+                return;
+            }
+
+            // Map status classes to Tailwind colors
+            const getStatusColor = (status) => {
+                if (status.startsWith('2')) return 'bg-green-500';
+                if (status.startsWith('3')) return 'bg-blue-500';
+                if (status.startsWith('4')) return 'bg-yellow-500';
+                if (status.startsWith('5')) return 'bg-red-500';
+                return 'bg-gray-500';
+            };
+
+            Object.entries(counts).sort().forEach(([status, count]) => {
+                const percent = Math.min(100, Math.max(1, (count / total) * 100)).toFixed(1);
+                container.innerHTML += `
+                    <div>
+                        <div class="flex justify-between mb-1 text-sm">
+                            <span class="text-gray-300 font-medium">HTTP ${status}</span>
+                            <span class="text-gray-400">${count.toLocaleString()} (${percent}%)</span>
+                        </div>
+                        <div class="w-full bg-gray-800 rounded-full h-2">
+                            <div class="${getStatusColor(status)} h-2 rounded-full transition-all duration-500" style="width: ${percent}%"></div>
+                        </div>
+                    </div>
+                `;
+            });
+        }
+
+        logEvent('Dashboard initialized.');
+        fetchMetrics();
+        setInterval(fetchMetrics, POLL_INTERVAL);
+    </script>
+</body>
+</html>

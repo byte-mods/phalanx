@@ -142,6 +142,7 @@ async fn api_stats(metrics_data: web::Data<Arc<ProxyMetrics>>) -> impl Responder
     // Summing counters across all labels involves iterating the registry
     // But since the UI JS fetches this, we can give it raw counts or parsed.
     // The easiest robust way is just exposing the prometheus `gather()` in a simplified shape.
+    let mut http_requests = vec![];
     let families = metrics_data.registry.gather();
 
     // We'll return a raw JSON map that the JS can parse
@@ -156,22 +157,22 @@ async fn api_stats(metrics_data: web::Data<Arc<ProxyMetrics>>) -> impl Responder
     });
 
     for family in families {
-        let name = family.name().to_string();
+        let name = family.get_name();
         let mut metrics_array = vec![];
 
         for m in family.get_metric() {
             let mut labels = serde_json::Map::new();
             for lp in m.get_label() {
                 labels.insert(
-                    lp.name().to_string(),
-                    serde_json::Value::String(lp.value().to_string()),
+                    lp.get_name().to_string(),
+                    serde_json::Value::String(lp.get_value().to_string()),
                 );
             }
 
-            let val = if let Some(counter) = m.get_counter().as_ref() {
-                counter.value()
-            } else if let Some(gauge) = m.get_gauge().as_ref() {
-                gauge.value()
+            let val = if m.has_counter() {
+                m.get_counter().get_value()
+            } else if m.has_gauge() {
+                m.get_gauge().get_value()
             } else {
                 0.0
             };

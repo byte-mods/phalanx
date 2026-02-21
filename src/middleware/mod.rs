@@ -1,3 +1,4 @@
+pub mod compression;
 pub mod ratelimit;
 
 use moka::future::Cache;

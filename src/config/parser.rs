@@ -5,6 +5,10 @@ use std::collections::HashMap;
 pub struct PhalanxConfig {
     /// Number of worker threads for the Tokio runtime
     pub worker_threads: Option<usize>,
+    /// TCP listen port for the raw TCP multiplexer proxy
+    pub tcp_listen: Option<String>,
+    /// Admin listen address for the dashboard and metrics
+    pub admin_listen: Option<String>,
     /// The global `http` block containing server configurations
     pub http: Option<HttpBlock>,
 }
@@ -74,6 +78,20 @@ pub fn parse_phalanx_config(input: &str) -> PhalanxConfig {
             if let Ok(threads) = tokens[i + 1].parse::<usize>() {
                 config.worker_threads = Some(threads);
             }
+            i += 3;
+            continue;
+        }
+
+        // Parse: `tcp_listen 5000;`
+        if token == "tcp_listen" && i + 2 < tokens.len() && tokens[i + 2] == ";" {
+            config.tcp_listen = Some(tokens[i + 1].clone());
+            i += 3;
+            continue;
+        }
+
+        // Parse: `admin_listen 127.0.0.1:9090;`
+        if token == "admin_listen" && i + 2 < tokens.len() && tokens[i + 2] == ";" {
+            config.admin_listen = Some(tokens[i + 1].clone());
             i += 3;
             continue;
         }
@@ -218,8 +236,25 @@ fn tokenize(input: &str) -> Vec<String> {
     let mut tokens = Vec::new();
     let mut current_token = String::new();
     let mut in_quotes = false;
+    let mut in_comment = false;
 
     for c in input.chars() {
+        if in_comment {
+            if c == '\n' {
+                in_comment = false;
+            }
+            continue;
+        }
+
+        if c == '#' && !in_quotes {
+            in_comment = true;
+            if !current_token.is_empty() {
+                tokens.push(current_token.clone());
+                current_token.clear();
+            }
+            continue;
+        }
+
         // Toggle quote state to capture strings with embedded spaces
         if c == '"' || c == '\'' {
             in_quotes = !in_quotes;

@@ -1,0 +1,54 @@
+warning: fields `sqli_patterns`, `xss_patterns`, `lfi_rfi_patterns`, `cmd_injection_patterns`, and `bot_ua_patterns` are never read
+  --> src/waf/rules.rs:11:5
+   |
+ 3 | pub struct WafRules {
+   |            -------- fields in this struct
+...
+11 |     sqli_patterns: Vec<&'static str>,
+   |     ^^^^^^^^^^^^^
+12 |     xss_patterns: Vec<&'static str>,
+   |     ^^^^^^^^^^^^
+13 |     lfi_rfi_patterns: Vec<&'static ...
+   |     ^^^^^^^^^^^^^^^^
+14 |     cmd_injection_patterns: Vec<&'s...
+   |     ^^^^^^^^^^^^^^^^^^^^^^
+15 |     bot_ua_patterns: Vec<&'static s...
+   |     ^^^^^^^^^^^^^^^
+   |
+   = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: `ai_load_balancer` (lib) generated 1 warning
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.15s
+     Running `target/debug/ai_load_balancer phalanx.conf`
+[2m2026-02-21T12:35:08.949349Z[0m [32m INFO[0m [2mai_load_balancer::telemetry[0m[2m:[0m Telemetry initialized.
+[2m2026-02-21T12:35:08.950310Z[0m [32m INFO[0m [2mai_load_balancer::config[0m[2m:[0m Loaded config from phalanx.conf
+[2m2026-02-21T12:35:08.950445Z[0m [32m INFO[0m [2mai_load_balancer[0m[2m:[0m Starting AI Load Balancer with 2 worker threads... (Config: phalanx.conf)
+[2m2026-02-21T12:35:08.951570Z[0m [32m INFO[0m [2mai_load_balancer::routing[0m[2m:[0m Starting health check loop for pool: default
+[2m2026-02-21T12:35:08.951575Z[0m [32m INFO[0m [2mai_load_balancer::routing[0m[2m:[0m Starting health check loop for pool: api_pool
+[2m2026-02-21T12:35:08.957935Z[0m [32m INFO[0m [2mai_load_balancer::discovery[0m[2m:[0m Service Discovery initialized with RocksDB at "data/discovery.db"
+[2m2026-02-21T12:35:08.958675Z[0m [32m INFO[0m [2mai_load_balancer::telemetry::access_log[0m[2m:[0m Access log writer started: logs/access.log
+[2m2026-02-21T12:35:09.188626Z[0m [32m INFO[0m [2mai_load_balancer::ai[0m[2m:[0m Initializing AI Epsilon-Greedy Router (ε=0.1)
+[2m2026-02-21T12:35:09.188720Z[0m [32m INFO[0m [2mai_load_balancer::admin[0m[2m:[0m Admin API listening on http://127.0.0.1:9099
+[2m2026-02-21T12:35:09.188800Z[0m [32m INFO[0m [2mai_load_balancer::proxy[0m[2m:[0m Mux Proxy listening on 0.0.0.0:18080
+[2m2026-02-21T12:35:09.188836Z[0m [32m INFO[0m [2mai_load_balancer::proxy::tcp[0m[2m:[0m TCP Proxy listening on tcp://0.0.0.0:5555
+[2m2026-02-21T12:35:09.189015Z[0m [32m INFO[0m [2mactix_server::builder[0m[2m:[0m starting 12 workers
+[2m2026-02-21T12:35:09.189085Z[0m [32m INFO[0m [2mactix_server::server[0m[2m:[0m Tokio runtime found; starting in existing Tokio runtime
+[2m2026-02-21T12:35:09.189099Z[0m [32m INFO[0m [2mactix_server::server[0m[2m:[0m starting service: "actix-web-service-127.0.0.1:9099", workers: 12, listening on: 127.0.0.1:9099
+[2m2026-02-21T12:35:10.557357Z[0m [32m INFO[0m [2mai_load_balancer[0m[2m:[0m Received SIGTERM
+[2m2026-02-21T12:35:10.557357Z[0m [32m INFO[0m [2mactix_server::server[0m[2m:[0m SIGTERM received; starting graceful shutdown
+[2m2026-02-21T12:35:10.557428Z[0m [32m INFO[0m [2mai_load_balancer[0m[2m:[0m Shutdown signal received — initiating graceful shutdown...
+[2m2026-02-21T12:35:10.557511Z[0m [32m INFO[0m [2mai_load_balancer::proxy::tcp[0m[2m:[0m TCP Proxy shutting down gracefully.
+[2m2026-02-21T12:35:10.557531Z[0m [32m INFO[0m [2mactix_server::worker[0m[2m:[0m shutting down idle worker
+[2m2026-02-21T12:35:10.557616Z[0m [32m INFO[0m [2mai_load_balancer::proxy[0m[2m:[0m Mux Proxy shutting down gracefully — no new connections accepted.
+[2m2026-02-21T12:35:10.557629Z[0m [32m INFO[0m [2mactix_server::worker[0m[2m:[0m shutting down idle worker
+[2m2026-02-21T12:35:10.557686Z[0m [32m INFO[0m [2mactix_server::worker[0m[2m:[0m shutting down idle worker
+[2m2026-02-21T12:35:10.557737Z[0m [32m INFO[0m [2mactix_server::worker[0m[2m:[0m shutting down idle worker
+[2m2026-02-21T12:35:10.557766Z[0m [32m INFO[0m [2mactix_server::worker[0m[2m:[0m shutting down idle worker
+[2m2026-02-21T12:35:10.557629Z[0m [32m INFO[0m [2mactix_server::worker[0m[2m:[0m shutting down idle worker
+[2m2026-02-21T12:35:10.557671Z[0m [32m INFO[0m [2mactix_server::worker[0m[2m:[0m shutting down idle worker
+[2m2026-02-21T12:35:10.557683Z[0m [32m INFO[0m [2mactix_server::worker[0m[2m:[0m shutting down idle worker
+[2m2026-02-21T12:35:10.557531Z[0m [32m INFO[0m [2mactix_server::worker[0m[2m:[0m shutting down idle worker
+[2m2026-02-21T12:35:10.557548Z[0m [32m INFO[0m [2mactix_server::accept[0m[2m:[0m accept thread stopped
+[2m2026-02-21T12:35:10.557625Z[0m [32m INFO[0m [2mactix_server::worker[0m[2m:[0m shutting down idle worker
+[2m2026-02-21T12:35:10.557531Z[0m [32m INFO[0m [2mactix_server::worker[0m[2m:[0m shutting down idle worker
+[2m2026-02-21T12:35:10.557647Z[0m [32m INFO[0m [2mactix_server::worker[0m[2m:[0m shutting down idle worker

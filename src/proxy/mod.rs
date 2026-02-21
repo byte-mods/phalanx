@@ -1,5 +1,5 @@
 use bytes::{Buf, Bytes, BytesMut};
-use http_body_util::{BodyExt, combinators::BoxBody};
+use http_body_util::{BodyExt, Full, combinators::BoxBody};
 use hyper::server::conn::http1;
 use hyper::service::service_fn;
 use hyper::{Request, Response};
@@ -14,11 +14,13 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
+use crate::middleware::CachedResponse;
+use crate::middleware::compression;
+
 pub mod executor;
 pub mod router;
 pub mod tcp;
 pub mod tls;
-pub mod websocket;
 
 use crate::admin::ProxyMetrics;
 use crate::ai::AiRouter;
@@ -354,6 +356,28 @@ pub async fn start_proxy(
     }
 }
 
+/// Checks if an HTTP request is a WebSocket upgrade by examining typed headers.
+pub fn is_websocket_upgrade<T>(req: &Request<T>) -> bool {
+    let has_upgrade = req
+        .headers()
+        .get(hyper::header::UPGRADE)
+        .and_then(|v| v.to_str().ok())
+        .map(|v| v.eq_ignore_ascii_case("websocket"))
+        .unwrap_or(false);
+
+    let has_connection = req
+        .headers()
+        .get(hyper::header::CONNECTION)
+        .and_then(|v| v.to_str().ok())
+        .map(|v| {
+            v.split(',')
+                .any(|tok| tok.trim().eq_ignore_ascii_case("upgrade"))
+        })
+        .unwrap_or(false);
+
+    has_upgrade && has_connection
+}
+
 /// The main worker function for HTTP/1.x traffic.
 /// This parses route configurations, modifies headers, selects backends,
 /// and streams data bidirectionally between the client and downstream Server.
@@ -364,7 +388,7 @@ async fn handle_http_request(
     app_config: Arc<AppConfig>,
     waf: Arc<crate::waf::WafEngine>,
     ai_engine: Arc<dyn crate::ai::AiRouter>,
-    _cache: Arc<ResponseCache>,
+    cache: Arc<ResponseCache>,
     metrics: Arc<ProxyMetrics>,
     access_logger: Arc<AccessLogger>,
 ) -> Result<Response<BoxBody<Bytes, hyper::Error>>, hyper::Error> {
@@ -382,6 +406,13 @@ async fn handle_http_request(
         .get(hyper::header::USER_AGENT)
         .and_then(|v| v.to_str().ok());
 
+    // Capture Accept-Encoding before WAF check (needed later for compression)
+    let accepts_gzip = compression::accepts_gzip(
+        req.headers()
+            .get(hyper::header::ACCEPT_ENCODING)
+            .and_then(|v| v.to_str().ok()),
+    );
+
     if let crate::waf::WafAction::Block(reason) = waf.inspect(&ip_str, &path, query, user_agent) {
         warn!("WAF blocked request from {}: {}", ip_str, reason);
         metrics.waf_blocks_total.with_label_values(&[&reason]).inc();
@@ -389,11 +420,15 @@ async fn handle_http_request(
     }
 
     // Check for WebSocket upgrade request
-    if websocket::is_websocket_upgrade(&req) {
+    let is_websocket = is_websocket_upgrade(&req);
+    // If it's a WebSocket upgrade, we must extract the `OnUpgrade` future from the hyper request
+    // before the request body is consumed and sent to the backend.
+    let client_upgrade = if is_websocket {
         debug!("WebSocket upgrade detected from {}", ip_str);
-        // WebSocket handling is done in the websocket module
-        // For now, we fall through to normal proxying which will forward the upgrade headers
-    }
+        Some(hyper::upgrade::on(&mut req))
+    } else {
+        None
+    };
 
     // 1. Exact path routing matching Nginx-like config
     let route = app_config
@@ -413,6 +448,38 @@ async fn handle_http_request(
     let pool_name = route
         .map(|r| r.upstream.clone())
         .unwrap_or_else(|| host_name.to_string());
+
+    // ── Response Cache: lookup for GET requests ──
+    let is_get = req.method() == hyper::Method::GET;
+    let cache_key = if is_get && !is_websocket {
+        let ck = ResponseCache::cache_key("GET", host_name, &path, req.uri().query());
+        // Check cache
+        if let Some(cached) = cache.get(&ck).await {
+            debug!("Cache HIT for {}", ck);
+            metrics.cache_hits_total.with_label_values(&["hit"]).inc();
+            let body = Full::new(cached.body)
+                .map_err(|never| match never {})
+                .boxed();
+            let mut resp = Response::builder()
+                .status(cached.status)
+                .body(body)
+                .unwrap();
+            resp.headers_mut().insert(
+                hyper::header::CONTENT_TYPE,
+                hyper::header::HeaderValue::from_str(&cached.content_type).unwrap_or_else(|_| {
+                    hyper::header::HeaderValue::from_static("application/octet-stream")
+                }),
+            );
+            resp.headers_mut().insert(
+                hyper::header::HeaderName::from_static("x-phalanx-cache"),
+                hyper::header::HeaderValue::from_static("HIT"),
+            );
+            return Ok(resp);
+        }
+        Some(ck)
+    } else {
+        None
+    };
 
     // 2. Fetch healthy backend from pool manager
     let pool = upstreams
@@ -488,6 +555,48 @@ async fn handle_http_request(
 
     match res {
         Ok(mut response) => {
+            // Check if this is a 101 Switching Protocols response to our WebSocket upgrade
+            let is_101 = response.status() == hyper::StatusCode::SWITCHING_PROTOCOLS;
+            if is_websocket && is_101 {
+                if let Some(client_fut) = client_upgrade {
+                    // Extract the backend's upgrade future from the response
+                    let backend_upgrade = hyper::upgrade::on(&mut response);
+
+                    // Spawn a background task to handle the actual byte tunneling
+                    let backend_addr_clone = backend_addr.clone();
+                    tokio::spawn(async move {
+                        match tokio::try_join!(client_fut, backend_upgrade) {
+                            Ok((client_upgraded, backend_upgraded)) => {
+                                info!("WebSocket tunnel established to {}", backend_addr_clone);
+
+                                // Turn hyper::upgrade::Upgraded back into Tokio IO streams
+                                let mut client_io = TokioIo::new(client_upgraded);
+                                let mut backend_io = TokioIo::new(backend_upgraded);
+
+                                // Relay bytes bidirectionally
+                                match tokio::io::copy_bidirectional(&mut client_io, &mut backend_io)
+                                    .await
+                                {
+                                    Ok((from_client, from_backend)) => {
+                                        debug!(
+                                            "WebSocket tunnel closed normally to {}, client sent {} bytes, backend sent {} bytes",
+                                            backend_addr_clone, from_client, from_backend
+                                        );
+                                    }
+                                    Err(e) => {
+                                        debug!(
+                                            "WebSocket tunnel error to {}: {}",
+                                            backend_addr_clone, e
+                                        );
+                                    }
+                                }
+                            }
+                            Err(e) => error!("WebSocket upgrade handshake failed: {}", e),
+                        }
+                    });
+                }
+            }
+
             // Train AI Router
             let latency = start_time.elapsed().as_millis() as u64;
             let is_error = response.status().is_server_error();
@@ -505,19 +614,6 @@ async fn handle_http_request(
                 .with_label_values(&[method_str.as_str(), pool_name.as_str()])
                 .observe(start_time.elapsed().as_secs_f64());
 
-            // Structured Access Log
-            access_logger.log(AccessLogEntry {
-                timestamp: chrono_timestamp(),
-                client_ip: ip_str,
-                method: method_str,
-                path,
-                status: status_code,
-                latency_ms: latency,
-                backend: backend_addr,
-                pool: pool_name,
-                bytes_sent: 0, // Approximation — full body size tracking requires streaming
-            });
-
             // 5. Response Header Injection Phase (from config)
             if let Some(r) = route {
                 for (k, v) in &r.add_headers {
@@ -530,15 +626,119 @@ async fn handle_http_request(
                 }
             }
 
-            // Box the response body to match the uniform boxbody return type
-            let response = response.map(|body| {
-                body.map_err(|e| {
-                    // hyper::Error
-                    e
-                })
-                .boxed()
+            // 6. Fast-Path / Zero-Copy Routing
+            // If caching is bypassed AND compression is bypassed, simply pipe the raw Stream
+            // back to the client natively via hyper. No buffering = 0 RAM cost for massive files!
+            let content_type = response
+                .headers()
+                .get(hyper::header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("")
+                .to_string();
+
+            let should_compress = accepts_gzip && compression::is_compressible(Some(&content_type));
+            let should_cache = cache_key.is_some() && status_code == 200;
+
+            if !should_compress && !should_cache {
+                // Zero-Copy Fast Path: Map hyper::body::Incoming -> BoxBody
+                let boxed_fast_path = response.map(|b| b.map_err(|e| e).boxed());
+
+                access_logger.log(AccessLogEntry {
+                    timestamp: chrono_timestamp(),
+                    client_ip: ip_str,
+                    method: method_str,
+                    path,
+                    status: status_code,
+                    latency_ms: latency,
+                    backend: backend_addr,
+                    pool: pool_name,
+                    bytes_sent: Default::default(), // Size is dynamic, streaming.
+                });
+
+                return Ok(boxed_fast_path);
+            }
+
+            // 7. Slow-Path (Memory Buffering) for Caching and Compression
+            // Collect the full response body into memory
+            let body_bytes = match http_body_util::BodyExt::collect(response.body_mut()).await {
+                Ok(collected) => collected.to_bytes(),
+                Err(_) => {
+                    let boxed = response.map(|b| b.map_err(|e| e).boxed());
+                    return Ok(boxed);
+                }
+            };
+
+            let body_len = body_bytes.len();
+
+            // ── Cache Store: cache GET 200 responses ──
+            if should_cache {
+                if let Some(ref ck) = cache_key {
+                    cache
+                        .insert(
+                            ck.clone(),
+                            CachedResponse {
+                                status: status_code,
+                                body: body_bytes.clone(),
+                                content_type: content_type.clone(),
+                            },
+                        )
+                        .await;
+                }
+            }
+
+            // ── Compression: gzip ──
+            let (final_body, is_compressed) = if should_compress {
+                match compression::gzip_compress(&body_bytes) {
+                    Some(compressed) => (compressed, true),
+                    None => (body_bytes, false),
+                }
+            } else {
+                (body_bytes, false)
+            };
+
+            // Build final response
+            let mut final_resp = Response::builder()
+                .status(status_code)
+                .body(
+                    Full::new(final_body)
+                        .map_err(|never| match never {})
+                        .boxed(),
+                )
+                .unwrap();
+
+            // Copy original headers
+            for (key, value) in response.headers().iter() {
+                final_resp.headers_mut().insert(key.clone(), value.clone());
+            }
+
+            if is_compressed {
+                final_resp.headers_mut().insert(
+                    hyper::header::CONTENT_ENCODING,
+                    hyper::header::HeaderValue::from_static("gzip"),
+                );
+                final_resp.headers_mut().insert(
+                    hyper::header::HeaderName::from_static("vary"),
+                    hyper::header::HeaderValue::from_static("Accept-Encoding"),
+                );
+                final_resp
+                    .headers_mut()
+                    .remove(hyper::header::CONTENT_LENGTH);
+            }
+
+            // Structured Access Log
+            access_logger.log(AccessLogEntry {
+                timestamp: chrono_timestamp(),
+                client_ip: ip_str,
+                method: method_str,
+                path,
+                status: status_code,
+                latency_ms: latency,
+                backend: backend_addr,
+                pool: pool_name,
+                bytes_sent: body_len as u64,
             });
-            Ok(response)
+
+            Ok(final_resp)
         }
         Err(e) => {
             error!("Failed to proxy request to backend {}: {}", backend_addr, e);
@@ -569,15 +769,29 @@ async fn handle_http2_request(
     app_config: Arc<AppConfig>,
     waf: Arc<crate::waf::WafEngine>,
     ai_engine: Arc<dyn crate::ai::AiRouter>,
-    _cache: Arc<ResponseCache>,
+    cache: Arc<ResponseCache>,
     metrics: Arc<ProxyMetrics>,
     access_logger: Arc<AccessLogger>,
 ) -> Result<Response<BoxBody<Bytes, hyper::Error>>, hyper::Error> {
     let path = req.uri().path().to_string();
 
-    debug!("Handling HTTP/2 request: {}", path);
+    // Detect gRPC traffic via content-type header
+    let is_grpc = req
+        .headers()
+        .get(hyper::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .map(|ct| ct.starts_with("application/grpc"))
+        .unwrap_or(false);
+
+    if is_grpc {
+        debug!("gRPC request detected: {}", path);
+    } else {
+        debug!("Handling HTTP/2 request: {}", path);
+    }
+
     let start_time = std::time::Instant::now();
     let method_str = req.method().to_string();
+    let _ = &cache; // use cache (reserved for future H2 cache integration)
 
     // 0. WAF Inspection
     let ip_str = _peer.ip().to_string();
@@ -691,11 +905,42 @@ async fn handle_http2_request(
 
             let status_code = response.status().as_u16();
 
+            // gRPC-specific metrics
+            if is_grpc {
+                let grpc_status = response
+                    .headers()
+                    .get("grpc-status")
+                    .and_then(|v| v.to_str().ok())
+                    .unwrap_or("0");
+                debug!(
+                    "gRPC response: status={}, grpc-status={}",
+                    status_code, grpc_status
+                );
+                metrics
+                    .http_requests_total
+                    .with_label_values(&["GRPC", grpc_status, pool_name.as_str()])
+                    .inc();
+            } else {
+                let status_str = status_code.to_string();
+                metrics
+                    .http_requests_total
+                    .with_label_values(&[
+                        method_str.as_str(),
+                        status_str.as_str(),
+                        pool_name.as_str(),
+                    ])
+                    .inc();
+            }
+
             // Structured Access Log
             access_logger.log(AccessLogEntry {
                 timestamp: chrono_timestamp(),
                 client_ip: ip_str,
-                method: method_str,
+                method: if is_grpc {
+                    format!("gRPC:{}", method_str)
+                } else {
+                    method_str
+                },
                 path,
                 status: status_code,
                 latency_ms: latency,

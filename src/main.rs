@@ -1,14 +1,5 @@
-// Core module declarations
-mod admin;
-mod ai;
-mod config;
-mod discovery;
-mod middleware;
-mod proxy;
-mod reload;
-mod routing;
-mod telemetry;
-pub mod waf;
+// Core module declarations are now in lib.rs
+use ai_load_balancer::*;
 
 use arc_swap::ArcSwap;
 use std::sync::Arc;
@@ -23,15 +14,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     telemetry::init_telemetry();
 
     // 2. Load Configuration (Synchronous)
-    // This reads `phalanx.conf` and parses Nginx-like blocks into the `AppConfig` struct.
-    let cfg = Arc::new(ArcSwap::from_pointee(config::load_config()));
+    // This reads the path provided or defaults to `phalanx.conf` and parses Nginx-like blocks into the `AppConfig` struct.
+    let config_path = std::env::args()
+        .nth(1)
+        .unwrap_or_else(|| "phalanx.conf".to_string());
+    let cfg = Arc::new(ArcSwap::from_pointee(config::load_config(&config_path)));
 
     // Snapshot the current config for components that need a static Arc<AppConfig>
     let cfg_snapshot = cfg.load_full();
 
     tracing::info!(
-        "Starting AI Load Balancer with {} worker threads...",
-        cfg_snapshot.workers
+        "Starting AI Load Balancer with {} worker threads... (Config: {})",
+        cfg_snapshot.workers,
+        config_path
     );
 
     // 3. Build Tokio Runtime
@@ -56,7 +51,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         });
 
         // --- Hot Reload (SIGHUP) ---
-        reload::spawn_reload_handler(Arc::clone(&cfg));
+        reload::spawn_reload_handler(Arc::clone(&cfg), config_path.clone());
 
         // State & Routing: Manages backend health and load balancing algorithms.
         let upstreams = Arc::new(routing::UpstreamManager::new(&cfg_snapshot));
@@ -86,7 +81,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             cfg_snapshot.waf_auto_ban_duration.unwrap_or(3600),
         ));
         let waf_engine = Arc::new(waf::WafEngine::new(
-            cfg_snapshot.waf_enabled.unwrap_or(true),
+            cfg_snapshot.waf_enabled.unwrap_or(false),
             waf_reputation,
         ));
 

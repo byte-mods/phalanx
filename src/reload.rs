@@ -1,6 +1,6 @@
 use arc_swap::ArcSwap;
 use std::sync::Arc;
-use tracing::{error, info};
+use tracing::info;
 
 /// Spawns a background task that listens for SIGHUP (Unix) signals.
 /// On SIGHUP, it re-reads `phalanx.conf`, parses it into a new `AppConfig`,
@@ -11,7 +11,7 @@ use tracing::{error, info};
 /// - Changing rate limit thresholds
 /// - Toggling WAF rules
 /// - Switching AI routing algorithms
-pub fn spawn_reload_handler(config: Arc<ArcSwap<crate::config::AppConfig>>) {
+pub fn spawn_reload_handler(config: Arc<ArcSwap<crate::config::AppConfig>>, conf_path: String) {
     tokio::spawn(async move {
         #[cfg(unix)]
         {
@@ -23,7 +23,7 @@ pub fn spawn_reload_handler(config: Arc<ArcSwap<crate::config::AppConfig>>) {
                 sighup.recv().await;
                 info!("SIGHUP received — reloading configuration...");
 
-                let new_config = crate::config::load_config();
+                let new_config = crate::config::load_config(&conf_path);
                 info!(
                     "Config reloaded: {} workers, {} upstream pools, {} routes",
                     new_config.workers,
