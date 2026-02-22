@@ -26,6 +26,21 @@ pub enum LoadBalancingAlgorithm {
 pub struct BackendConfig {
     pub address: String,
     pub weight: u32,
+    /// Optional HTTP path to GET for health checks (e.g. "/health"). If None, TCP connect is used.
+    pub health_check_path: Option<String>,
+    /// Expected HTTP status code for a passing health check. Default: 200.
+    pub health_check_status: u16,
+}
+
+impl Default for BackendConfig {
+    fn default() -> Self {
+        Self {
+            address: String::new(),
+            weight: 1,
+            health_check_path: None,
+            health_check_status: 200,
+        }
+    }
 }
 
 /// A pool of backend servers associated with a specific load balancing algorithm.
@@ -33,14 +48,56 @@ pub struct BackendConfig {
 pub struct UpstreamPoolConfig {
     pub algorithm: LoadBalancingAlgorithm,
     pub backends: Vec<BackendConfig>,
+    /// Maximum number of idle keepalive connections per backend. 0 = disabled.
+    pub keepalive: u32,
 }
 
-/// Configuration for a specific route (e.g., `/api`).
-/// Maps a request path to an upstream pool and defines headers to inject.
-#[derive(Debug, Deserialize, Serialize, Clone)]
+/// Configuration for a specific route (e.g., `/api` or `/static`).
+/// Maps a request path to either an upstream pool or a static file root directory.
+#[derive(Debug, Deserialize, Serialize, Clone, Default)]
 pub struct RouteConfig {
-    pub upstream: String,
+    pub upstream: Option<String>,
+    pub root: Option<String>,
+    pub fastcgi_pass: Option<String>,
+    pub uwsgi_pass: Option<String>,
     pub add_headers: HashMap<String, String>,
+    /// Ordered list of `(pattern, replacement, flag)` rewrite rules for this route.
+    /// Applied before dispatching to a backend.
+    pub rewrite_rules: Vec<(String, String, String)>,
+
+    // ── Basic Auth ───────────────────────────────────────────────────────────
+    /// The realm string shown to the client in the WWW-Authenticate challenge.
+    /// Set to enable Basic Auth on this route.
+    pub auth_basic_realm: Option<String>,
+    /// Map of `username` → `password` (plaintext or bcrypt hash).
+    pub auth_basic_users: HashMap<String, String>,
+
+    // ── JWT Auth ─────────────────────────────────────────────────────────────
+    /// HMAC secret or RSA public key for verifying JWT Bearer tokens.
+    pub auth_jwt_secret: Option<String>,
+    /// Algorithm for JWT verification. Default: `HS256`.
+    /// Supported: HS256, HS384, HS512, RS256, RS384, RS512, ES256, ES384.
+    pub auth_jwt_algorithm: Option<String>,
+
+    // ── OAuth 2.0 Introspection ──────────────────────────────────────────────
+    /// RFC 7662 token introspection endpoint URL.
+    pub auth_oauth_introspect_url: Option<String>,
+    /// OAuth client ID used for introspection endpoint authentication.
+    pub auth_oauth_client_id: Option<String>,
+    /// OAuth client secret used for introspection endpoint authentication.
+    pub auth_oauth_client_secret: Option<String>,
+
+    // ── Gzip Compression ────────────────────────────────────────────────────
+    /// Enable gzip compression for responses on this route. Default: false.
+    pub gzip: bool,
+    /// Minimum response body size in bytes to trigger compression. Default: 1024.
+    pub gzip_min_length: usize,
+
+    // ── Response Cache ───────────────────────────────────────────────────────
+    /// Enable response caching for GET 200 responses on this route.
+    pub proxy_cache: bool,
+    /// Default TTL in seconds when backend sends no Cache-Control max-age. Default: 60.
+    pub proxy_cache_valid_secs: u64,
 }
 
 /// The global application configuration state.
@@ -85,6 +142,13 @@ pub struct AppConfig {
     pub ai_thompson_threshold_ms: Option<f64>,
     /// The global DDoS panic mode rate limit limit per second across the entire proxy
     pub global_rate_limit_sec: Option<u32>,
+    /// Path to write structured access logs. If None, access logging is disabled.
+    pub access_log_path: Option<String>,
+    /// Format of access log entries: "json" (default), "combined", or "common".
+    pub access_log_format: Option<String>,
+    /// Path to a CA certificate PEM file for verifying client TLS certificates (mTLS).
+    /// When set, all TLS connections must present a valid client certificate.
+    pub tls_ca_cert_path: Option<String>,
 }
 
 impl Default for AppConfig {
@@ -94,14 +158,15 @@ impl Default for AppConfig {
             "default".to_string(),
             UpstreamPoolConfig {
                 algorithm: LoadBalancingAlgorithm::RoundRobin,
+                keepalive: 0,
                 backends: vec![
                     BackendConfig {
                         address: "127.0.0.1:8081".to_string(),
-                        weight: 1,
+                        ..Default::default()
                     },
                     BackendConfig {
                         address: "127.0.0.1:8082".to_string(),
-                        weight: 1,
+                        ..Default::default()
                     },
                 ],
             },
@@ -111,8 +176,8 @@ impl Default for AppConfig {
         routes.insert(
             "/".to_string(),
             RouteConfig {
-                upstream: "default".to_string(),
-                add_headers: HashMap::new(),
+                upstream: Some("default".to_string()),
+                ..Default::default()
             },
         );
 
@@ -136,16 +201,21 @@ impl Default for AppConfig {
             ai_temperature: None,
             ai_ucb_constant: None,
             ai_thompson_threshold_ms: None,
+            access_log_path: None,
+            access_log_format: None,
+            tls_ca_cert_path: None,
         }
     }
 }
 
 /// Synchronously loads and parses the given config path from the disk.
-/// Falls back to default configuration if the file does not exist or is invalid.
+/// Panics immediately with a descriptive error if the config file is malformed
+/// (e.g., missing semicolons, unbalanced braces, or unknown directives).
 pub fn load_config(conf_path: &str) -> AppConfig {
     if let Ok(content) = std::fs::read_to_string(conf_path) {
-        // Use our lightweight phalanx-syntax parser
-        let phalanx_cfg = parser::parse_phalanx_config(&content);
+        // Use our strict phalanx-syntax parser — panics on malformed config
+        let phalanx_cfg = parser::parse_phalanx_config(&content)
+            .unwrap_or_else(|e| panic!("Configuration error in '{conf_path}': {e}"));
         let mut app_cfg = AppConfig::default();
 
         if let Some(w) = phalanx_cfg.worker_threads {
@@ -234,15 +304,28 @@ pub fn load_config(conf_path: &str) -> AppConfig {
 
                 // Map phalanx-style route blocks into our RouteConfig hashmap
                 for (path, route) in server.routes {
-                    if let Some(upstream) = route.upstream {
-                        app_cfg.routes.insert(
-                            path,
-                            RouteConfig {
-                                upstream,
-                                add_headers: route.add_headers,
-                            },
-                        );
-                    }
+                    app_cfg.routes.insert(
+                        path,
+                        RouteConfig {
+                            upstream: route.upstream,
+                            root: route.root,
+                            fastcgi_pass: route.fastcgi_pass,
+                            uwsgi_pass: route.uwsgi_pass,
+                            add_headers: route.add_headers,
+                            rewrite_rules: route.rewrite_rules,
+                            auth_basic_realm: route.auth_basic_realm,
+                            auth_basic_users: route.auth_basic_users,
+                            auth_jwt_secret: route.auth_jwt_secret,
+                            auth_jwt_algorithm: route.auth_jwt_algorithm,
+                            auth_oauth_introspect_url: route.auth_oauth_introspect_url,
+                            auth_oauth_client_id: route.auth_oauth_client_id,
+                            auth_oauth_client_secret: route.auth_oauth_client_secret,
+                            gzip: route.gzip,
+                            gzip_min_length: route.gzip_min_length,
+                            proxy_cache: route.proxy_cache,
+                            proxy_cache_valid_secs: route.proxy_cache_valid_secs,
+                        },
+                    );
                 }
             }
 
@@ -267,6 +350,8 @@ pub fn load_config(conf_path: &str) -> AppConfig {
                     .map(|(addr, weight)| BackendConfig {
                         address: addr,
                         weight,
+                        health_check_path: upstream.health_check_path.clone(),
+                        health_check_status: upstream.health_check_status,
                     })
                     .collect();
                 app_cfg.upstreams.insert(
@@ -274,6 +359,7 @@ pub fn load_config(conf_path: &str) -> AppConfig {
                     UpstreamPoolConfig {
                         algorithm,
                         backends,
+                        keepalive: upstream.keepalive,
                     },
                 );
             }

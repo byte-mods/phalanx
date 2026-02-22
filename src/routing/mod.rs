@@ -37,6 +37,8 @@ pub struct UpstreamPool {
     pub backends: Vec<Arc<BackendNode>>,
     /// Counter used strictly for Round-Robin selection logic
     round_robin_index: AtomicUsize,
+    /// Keepalive connection pool
+    pub connection_pool: Arc<crate::proxy::pool::ConnectionPool>,
 }
 
 impl UpstreamPool {
@@ -51,6 +53,7 @@ impl UpstreamPool {
             algorithm: config.algorithm,
             backends,
             round_robin_index: AtomicUsize::new(0),
+            connection_pool: Arc::new(crate::proxy::pool::ConnectionPool::new(config.keepalive)),
         }
     }
 
@@ -171,7 +174,8 @@ impl UpstreamManager {
 }
 
 /// A background asynchronous task that runs indefinitely, pinging the backends.
-/// Every 5 seconds, it attempts a raw TCP connection to determine if the node is UP or DOWN.
+/// Every 5 seconds, it checks each backend — using HTTP GET if `health_check_path` is
+/// configured on the backend, otherwise falling back to a raw TCP connect.
 async fn health_check_loop(pool_name: String, pool: Arc<UpstreamPool>) {
     let interval = Duration::from_secs(5);
     info!("Starting health check loop for pool: {}", pool_name);
@@ -180,20 +184,48 @@ async fn health_check_loop(pool_name: String, pool: Arc<UpstreamPool>) {
         sleep(interval).await;
         for backend in &pool.backends {
             let address = &backend.config.address;
-            match TcpStream::connect(address).await {
-                Ok(_) => {
-                    let was_down = !backend.is_healthy.swap(true, Ordering::Release);
-                    if was_down {
-                        info!("Backend {} in pool {} is now UP", address, pool_name);
+            let is_healthy = if let Some(ref path) = backend.config.health_check_path {
+                // HTTP GET health check
+                let url = format!("http://{}{}", address, path);
+                let expected_status = backend.config.health_check_status;
+                match reqwest_health_get(&url, expected_status).await {
+                    Ok(true) => true,
+                    Ok(false) => {
+                        warn!(
+                            "Health check FAILED for {} in pool {} (unexpected status)",
+                            address, pool_name
+                        );
+                        false
+                    }
+                    Err(e) => {
+                        warn!(
+                            "Health check ERROR for {} in pool {}: {}",
+                            address, pool_name, e
+                        );
+                        false
                     }
                 }
-                Err(e) => {
-                    let was_up = backend.is_healthy.swap(false, Ordering::Release);
-                    if was_up {
-                        warn!("Backend {} in pool {} is DOWN: {}", address, pool_name, e);
-                    }
-                }
+            } else {
+                // TCP connect health check (original behaviour)
+                matches!(TcpStream::connect(address).await, Ok(_))
+            };
+
+            let prev = backend.is_healthy.swap(is_healthy, Ordering::Release);
+            if is_healthy && !prev {
+                info!("Backend {} in pool {} is now UP", address, pool_name);
+            } else if !is_healthy && prev {
+                warn!("Backend {} in pool {} is DOWN", address, pool_name);
             }
         }
     }
+}
+
+/// Perform an HTTP GET to `url` and return true if the response status matches `expected`.
+async fn reqwest_health_get(url: &str, expected_status: u16) -> Result<bool, String> {
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(3))
+        .build()
+        .map_err(|e| e.to_string())?;
+    let resp = client.get(url).send().await.map_err(|e| e.to_string())?;
+    Ok(resp.status().as_u16() == expected_status)
 }

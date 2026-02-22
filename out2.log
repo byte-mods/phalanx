@@ -1,0 +1,63 @@
+   Compiling ai_load_balancer v0.1.0 (/Users/sudeepdasgupta/projects/phalanx)
+error[E0061]: this function takes 7 arguments but 6 arguments were supplied
+    --> src/proxy/mod.rs:870:27
+     |
+ 870 | ...et res = serve_static_file(
+     |             ^^^^^^^^^^^^^^^^^
+ 871 | ...   &path,
+ 872 | ...   root_path.clone(),
+     |       ----------------- argument #2 of type `&str` is missing
+     |
+note: function defined here
+    --> src/proxy/mod.rs:1104:10
+     |
+1104 | async fn serve_static_file<T>(
+     |          ^^^^^^^^^^^^^^^^^
+1105 |     route_path: &str,
+1106 |     req_path: &str,
+     |     --------------
+help: provide the argument
+     |
+ 870 ~                 let res = serve_static_file(
+ 871 +                     &path,
+ 872 +                     /* &str */,
+ 873 +                     root_path.clone(),
+ 874 +                     &req,
+ 875 +                     access_logger,
+ 876 +                     &ip_str,
+ 877 +                     &method_str,
+ 878 +                 )
+     |
+
+error[E0061]: this function takes 7 arguments but 6 arguments were supplied
+    --> src/proxy/mod.rs:462:27
+     |
+ 462 | ...et res = serve_static_file(
+     |             ^^^^^^^^^^^^^^^^^
+ 463 | ...   &path,
+ 464 | ...   root_path.clone(),
+     |       ----------------- argument #2 of type `&str` is missing
+     |
+note: function defined here
+    --> src/proxy/mod.rs:1104:10
+     |
+1104 | async fn serve_static_file<T>(
+     |          ^^^^^^^^^^^^^^^^^
+1105 |     route_path: &str,
+1106 |     req_path: &str,
+     |     --------------
+help: provide the argument
+     |
+ 462 ~                 let res = serve_static_file(
+ 463 +                     &path,
+ 464 +                     /* &str */,
+ 465 +                     root_path.clone(),
+ 466 +                     &req,
+ 467 +                     Arc::clone(&access_logger),
+ 468 +                     &ip_str,
+ 469 +                     &method_str,
+ 470 +                 )
+     |
+
+For more information about this error, try `rustc --explain E0061`.
+error: could not compile `ai_load_balancer` (lib) due to 2 previous errors

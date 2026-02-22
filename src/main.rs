@@ -65,8 +65,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // Response Cache: Moka-based in-memory LFU cache for GET responses.
         let cache = Arc::new(middleware::ResponseCache::new(10_000, 60));
 
-        // Access Logger: Structured JSON access log writer.
-        let access_logger = Arc::new(telemetry::access_log::AccessLogger::new("logs/access.log"));
+        // Access Logger: Writes formatted access log entries to disk.
+        let access_log_path = cfg_snapshot
+            .access_log_path
+            .as_deref()
+            .unwrap_or("logs/access.log");
+        let access_log_format = telemetry::access_log::LogFormat::from_str(
+            cfg_snapshot.access_log_format.as_deref().unwrap_or("json"),
+        );
+        let access_logger = Arc::new(telemetry::access_log::AccessLogger::new(
+            access_log_path,
+            access_log_format,
+        ));
 
         // Initialize Rate Limiter with config bounds (e.g. 50 req/sec, burst 100)
         let rate_limiter = Arc::new(middleware::ratelimit::PhalanxRateLimiter::new(

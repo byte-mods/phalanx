@@ -1,0 +1,21 @@
+warning: fields `sqli_patterns`, `xss_patterns`, `lfi_rfi_patterns`, `cmd_injection_patterns`, and `bot_ua_patterns` are never read
+  --> src/waf/rules.rs:11:5
+   |
+ 3 | pub struct WafRules {
+   |            -------- fields in this struct
+...
+11 |     sqli_patterns: Vec<&'static str>,
+   |     ^^^^^^^^^^^^^
+12 |     xss_patterns: Vec<&'static str>,
+   |     ^^^^^^^^^^^^
+13 |     lfi_rfi_patterns: Vec<&'static str>,
+   |     ^^^^^^^^^^^^^^^^
+14 |     cmd_injection_patterns: Vec<&'stat...
+   |     ^^^^^^^^^^^^^^^^^^^^^^
+15 |     bot_ua_patterns: Vec<&'static str>,
+   |     ^^^^^^^^^^^^^^^
+   |
+   = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: `ai_load_balancer` (lib) generated 1 warning
+   Compiling ai_load_balancer v0.1.0 (/Users/sudeepdasgupta/projects/phalanx)

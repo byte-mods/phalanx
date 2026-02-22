@@ -1,4 +1,5 @@
 use bytes::{Buf, Bytes, BytesMut};
+use futures_util::StreamExt;
 use http_body_util::{BodyExt, Full, combinators::BoxBody};
 use hyper::server::conn::http1;
 use hyper::service::service_fn;
@@ -18,9 +19,17 @@ use crate::middleware::CachedResponse;
 use crate::middleware::compression;
 
 pub mod executor;
+pub mod fastcgi;
+pub mod pool;
+pub mod rewrite;
 pub mod router;
 pub mod tcp;
 pub mod tls;
+pub mod uwsgi;
+
+use fastcgi::serve_fastcgi;
+use rewrite::{RewriteResult, apply_rewrites, compile_rules};
+use uwsgi::serve_uwsgi;
 
 use crate::admin::ProxyMetrics;
 use crate::ai::AiRouter;
@@ -392,7 +401,8 @@ async fn handle_http_request(
     metrics: Arc<ProxyMetrics>,
     access_logger: Arc<AccessLogger>,
 ) -> Result<Response<BoxBody<Bytes, hyper::Error>>, hyper::Error> {
-    let path = req.uri().path().to_string();
+    // Path is mutable so rewrite rules can modify it before route dispatch
+    let mut path = req.uri().path().to_string();
 
     debug!("Handling HTTP request: {}", path);
     let start_time = std::time::Instant::now();
@@ -407,7 +417,8 @@ async fn handle_http_request(
         .and_then(|v| v.to_str().ok());
 
     // Capture Accept-Encoding before WAF check (needed later for compression)
-    let accepts_gzip = compression::accepts_gzip(
+    // Will be AND-ed with route.gzip config flag below.
+    let client_accepts_gzip = compression::accepts_gzip(
         req.headers()
             .get(hyper::header::ACCEPT_ENCODING)
             .and_then(|v| v.to_str().ok()),
@@ -430,11 +441,176 @@ async fn handle_http_request(
         None
     };
 
-    // 1. Exact path routing matching Nginx-like config
-    let route = app_config
-        .routes
-        .get(&path)
-        .or_else(|| app_config.routes.get("/"));
+    // ── Rewrite Engine ────────────────────────────────────────────────────────
+    // Apply rewrite rules for the matched route BEFORE final dispatch.
+    // Supports: break (stop, forward with new URI), last (restart routing),
+    //           redirect (302), permanent (301).
+    'rewrite: loop {
+        let mut best_match: Option<(&String, &crate::config::RouteConfig)> = None;
+        let mut best_len = 0usize;
+        for (r_path, r_config) in &app_config.routes {
+            if path.starts_with(r_path.as_str()) && r_path.len() > best_len {
+                best_match = Some((r_path, r_config));
+                best_len = r_path.len();
+            }
+        }
+        // Only run rewrite rules when a matching route has any
+        if let Some((_r_path, r_config)) = best_match {
+            if !r_config.rewrite_rules.is_empty() {
+                let rules = compile_rules(&r_config.rewrite_rules);
+                match apply_rewrites(&rules, &path) {
+                    RewriteResult::Redirect { status, location } => {
+                        debug!("Rewrite redirect {} -> {} ({})", path, location, status);
+                        let mut resp = Response::new(
+                            http_body_util::Empty::new()
+                                .map_err(|_| unreachable!())
+                                .boxed(),
+                        );
+                        *resp.status_mut() = status;
+                        resp.headers_mut().insert(
+                            hyper::header::LOCATION,
+                            location.parse().unwrap_or_else(|_| "/".parse().unwrap()),
+                        );
+                        return Ok(resp);
+                    }
+                    RewriteResult::Rewritten {
+                        new_uri,
+                        restart_routing: true,
+                    } => {
+                        debug!("Rewrite (last): {} -> {}", path, new_uri);
+                        path = new_uri;
+                        continue 'rewrite; // restart route matching loop
+                    }
+                    RewriteResult::Rewritten {
+                        new_uri,
+                        restart_routing: false,
+                    } => {
+                        debug!("Rewrite (break): {} -> {}", path, new_uri);
+                        path = new_uri;
+                        break 'rewrite; // continue with new URI in same route
+                    }
+                    RewriteResult::NoMatch => {}
+                }
+            }
+        }
+        break 'rewrite;
+    }
+
+    // 1. Prefix path routing matching Nginx-like config
+    // We sort routes by length descending at config load, or we find the longest matching prefix.
+    let route = {
+        let mut best_match = None;
+        let mut best_len = 0;
+        for (r_path, r_config) in &app_config.routes {
+            if path.starts_with(r_path.as_str()) && r_path.len() > best_len {
+                best_match = Some((r_path, r_config));
+                best_len = r_path.len();
+            }
+        }
+        // Fallback to exactly "/" if no longest prefix found
+        best_match.or_else(|| app_config.routes.get_key_value("/"))
+    };
+
+    // ── Authentication Middleware ────────────────────────────────────────────
+    // Runs after WAF+Rewrite, before backend dispatch.
+    // Priority: Basic Auth → JWT → OAuth. If none configured, request passes through.
+    if let Some((_r_path, r_config)) = route {
+        use crate::auth::AuthResult;
+
+        // 1. Basic Auth
+        if let Some(ref realm) = r_config.auth_basic_realm {
+            match crate::auth::basic::check(req.headers(), realm, &r_config.auth_basic_users) {
+                AuthResult::Allowed => {}
+                AuthResult::Denied(status, msg) => {
+                    debug!("Basic auth denied from {}: {}", ip_str, msg);
+                    let mut resp = Response::new(
+                        http_body_util::Full::new(Bytes::from(msg))
+                            .map_err(|_| unreachable!())
+                            .boxed(),
+                    );
+                    *resp.status_mut() = status;
+                    resp.headers_mut().insert(
+                        hyper::header::WWW_AUTHENTICATE,
+                        crate::auth::basic::www_authenticate_header(realm)
+                            .parse()
+                            .unwrap(),
+                    );
+                    return Ok(resp);
+                }
+            }
+        }
+        // 2. JWT Auth
+        else if let Some(ref secret) = r_config.auth_jwt_secret {
+            let algorithm = r_config.auth_jwt_algorithm.as_deref().unwrap_or("HS256");
+            let (result, claims) = crate::auth::jwt::check(req.headers(), secret, algorithm);
+            match result {
+                AuthResult::Allowed => {
+                    // Inject claim headers upstream
+                    if let Some(ref c) = claims {
+                        for (k, v) in crate::auth::jwt::claims_to_headers(c) {
+                            if let (Ok(name), Ok(val)) = (
+                                hyper::header::HeaderName::from_bytes(k.as_bytes()),
+                                v.parse::<hyper::header::HeaderValue>(),
+                            ) {
+                                req.headers_mut().insert(name, val);
+                            }
+                        }
+                    }
+                }
+                AuthResult::Denied(status, msg) => {
+                    debug!("JWT auth denied from {}: {}", ip_str, msg);
+                    let mut resp = Response::new(
+                        http_body_util::Full::new(Bytes::from(msg))
+                            .map_err(|_| unreachable!())
+                            .boxed(),
+                    );
+                    *resp.status_mut() = status;
+                    resp.headers_mut()
+                        .insert(hyper::header::WWW_AUTHENTICATE, "Bearer".parse().unwrap());
+                    return Ok(resp);
+                }
+            }
+        }
+        // 3. OAuth 2.0 Introspection
+        else if let Some(ref introspect_url) = r_config.auth_oauth_introspect_url {
+            let client_id = r_config.auth_oauth_client_id.as_deref().unwrap_or("");
+            let client_secret = r_config.auth_oauth_client_secret.as_deref().unwrap_or("");
+            // Use a per-config-reload cache (simple global DashMap shared across requests)
+            use std::sync::OnceLock;
+            static OAUTH_CACHE: OnceLock<crate::auth::oauth::OAuthCache> = OnceLock::new();
+            let cache = OAUTH_CACHE.get_or_init(crate::auth::oauth::new_cache);
+            let (result, sub) = crate::auth::oauth::check(
+                req.headers(),
+                introspect_url,
+                client_id,
+                client_secret,
+                cache,
+            )
+            .await;
+            match result {
+                AuthResult::Allowed => {
+                    if let Some(sub_val) = sub {
+                        if let Ok(val) = sub_val.parse::<hyper::header::HeaderValue>() {
+                            req.headers_mut()
+                                .insert(hyper::header::HeaderName::from_static("x-auth-sub"), val);
+                        }
+                    }
+                }
+                AuthResult::Denied(status, msg) => {
+                    debug!("OAuth auth denied from {}: {}", ip_str, msg);
+                    let mut resp = Response::new(
+                        http_body_util::Full::new(Bytes::from(msg))
+                            .map_err(|_| unreachable!())
+                            .boxed(),
+                    );
+                    *resp.status_mut() = status;
+                    resp.headers_mut()
+                        .insert(hyper::header::WWW_AUTHENTICATE, "Bearer".parse().unwrap());
+                    return Ok(resp);
+                }
+            }
+        }
+    }
 
     // Extract Host Header to fallback if no specific path match is found
     let host = req
@@ -444,14 +620,98 @@ async fn handle_http_request(
         .unwrap_or("default");
     let host_name = host.split(':').next().unwrap_or("default");
 
-    // Select Upstream Pool Name
-    let pool_name = route
-        .map(|r| r.upstream.clone())
-        .unwrap_or_else(|| host_name.to_string());
+    // Select Upstream Pool Name (if upstream exists, else fallback to host_name)
+    let pool_name = match route {
+        Some((r_path, r)) => {
+            if let Some(ref root_path) = r.root {
+                // If a root directory is configured, serve static files directly!
+                let res = serve_static_file(
+                    r_path,
+                    &path,
+                    root_path.clone(),
+                    &req,
+                    Arc::clone(&access_logger),
+                    &method_str,
+                    &ip_str,
+                )
+                .await;
+                return res.map(|r| {
+                    r.map(|b| {
+                        b.map_err(|_e| {
+                            // Can't cast io::Error to hyper::Error natively
+                            panic!(
+                                "hyper::Error conversion bypassed on static stream read failure"
+                            );
+                        })
+                        .boxed()
+                    })
+                });
+            }
+
+            if let Some(ref fastcgi_pass) = r.fastcgi_pass {
+                let res = serve_fastcgi(
+                    r_path,
+                    &path,
+                    fastcgi_pass.clone(),
+                    req,
+                    Arc::clone(&access_logger),
+                    &method_str,
+                    &ip_str,
+                )
+                .await;
+                return res.map(|r| {
+                    r.map(|b| {
+                        b.map_err(|_e| {
+                            // Convert fastcgi error
+                            panic!("hyper::Error conversion bypassed on proxy stream failure");
+                        })
+                        .boxed()
+                    })
+                });
+            }
+
+            if let Some(ref uwsgi_pass) = r.uwsgi_pass {
+                let res = serve_uwsgi(
+                    r_path,
+                    &path,
+                    uwsgi_pass.clone(),
+                    req,
+                    Arc::clone(&access_logger),
+                    &method_str,
+                    &ip_str,
+                )
+                .await;
+                return res.map(|r| {
+                    r.map(|b| {
+                        b.map_err(|_e| {
+                            // Convert uwsgi error
+                            panic!("hyper::Error conversion bypassed on proxy stream failure");
+                        })
+                        .boxed()
+                    })
+                });
+            }
+
+            r.upstream.clone().unwrap_or_else(|| host_name.to_string())
+        }
+        None => host_name.to_string(),
+    };
+
+    // ── Resolve gzip + cache flags from matched route config ──
+    let (route_gzip, route_gzip_min, route_cache, route_cache_ttl) = match route {
+        Some((_, r)) => (
+            r.gzip,
+            r.gzip_min_length,
+            r.proxy_cache,
+            r.proxy_cache_valid_secs,
+        ),
+        None => (false, 1024, false, 60),
+    };
+    let accepts_gzip = client_accepts_gzip && route_gzip;
 
     // ── Response Cache: lookup for GET requests ──
     let is_get = req.method() == hyper::Method::GET;
-    let cache_key = if is_get && !is_websocket {
+    let cache_key = if route_cache && is_get && !is_websocket {
         let ck = ResponseCache::cache_key("GET", host_name, &path, req.uri().query());
         // Check cache
         if let Some(cached) = cache.get(&ck).await {
@@ -481,12 +741,14 @@ async fn handle_http_request(
         None
     };
 
+    let _ = (route_gzip_min, route_cache_ttl); // used below in slow-path
+
     // 2. Fetch healthy backend from pool manager
     let pool = upstreams
         .get_pool(pool_name.as_str())
         .or_else(|| upstreams.get_pool("default"));
 
-    let backend = match pool {
+    let backend = match &pool {
         Some(p) => match p.get_next_backend(Some(&_peer.ip()), Some(Arc::clone(&ai_engine))) {
             Some(b) => b,
             None => return Ok(empty_response(hyper::StatusCode::BAD_GATEWAY)),
@@ -495,7 +757,7 @@ async fn handle_http_request(
     };
 
     // 3. Request Header Injection Phase (from config)
-    if let Some(r) = route {
+    if let Some((_, r)) = route {
         for (k, v) in &r.add_headers {
             if let (Ok(hk), Ok(hv)) = (
                 hyper::header::HeaderName::from_bytes(k.as_bytes()),
@@ -510,8 +772,14 @@ async fn handle_http_request(
     backend.active_connections.fetch_add(1, Ordering::Relaxed);
     metrics.active_connections.inc();
 
-    // Establish TCP connection to backend
-    let stream = match TcpStream::connect(&backend.config.address).await {
+    // Establish TCP connection to backend (using keepalive pool if enabled)
+    let stream = match pool
+        .as_ref()
+        .unwrap()
+        .connection_pool
+        .acquire(&backend.config.address)
+        .await
+    {
         Ok(s) => s,
         Err(e) => {
             error!(
@@ -607,15 +875,15 @@ async fn handle_http_request(
             let status_str = status_code.to_string();
             metrics
                 .http_requests_total
-                .with_label_values(&[method_str.as_str(), status_str.as_str(), pool_name.as_str()])
+                .with_label_values(&[method_str.as_str(), status_str.as_str(), &pool_name])
                 .inc();
             metrics
                 .http_request_duration
-                .with_label_values(&[method_str.as_str(), pool_name.as_str()])
+                .with_label_values(&[method_str.as_str(), &pool_name])
                 .observe(start_time.elapsed().as_secs_f64());
 
             // 5. Response Header Injection Phase (from config)
-            if let Some(r) = route {
+            if let Some((_, r)) = route {
                 for (k, v) in &r.add_headers {
                     if let (Ok(hk), Ok(hv)) = (
                         hyper::header::HeaderName::from_bytes(k.as_bytes()),
@@ -651,8 +919,10 @@ async fn handle_http_request(
                     status: status_code,
                     latency_ms: latency,
                     backend: backend_addr,
-                    pool: pool_name,
+                    pool: pool_name.clone(),
                     bytes_sent: Default::default(), // Size is dynamic, streaming.
+                    referer: String::new(),
+                    user_agent: String::new(),
                 });
 
                 return Ok(boxed_fast_path);
@@ -734,8 +1004,10 @@ async fn handle_http_request(
                 status: status_code,
                 latency_ms: latency,
                 backend: backend_addr,
-                pool: pool_name,
+                pool: pool_name.clone(),
                 bytes_sent: body_len as u64,
+                referer: String::new(),
+                user_agent: String::new(),
             });
 
             Ok(final_resp)
@@ -754,6 +1026,8 @@ async fn handle_http_request(
                 backend: backend_addr,
                 pool: pool_name,
                 bytes_sent: 0,
+                referer: String::new(),
+                user_agent: String::new(),
             });
 
             Ok(empty_response(hyper::StatusCode::BAD_GATEWAY))
@@ -806,11 +1080,18 @@ async fn handle_http2_request(
         return Ok(empty_response(hyper::StatusCode::FORBIDDEN));
     }
 
-    // 1. Exact path routing matching Nginx-like config
-    let route = app_config
-        .routes
-        .get(&path)
-        .or_else(|| app_config.routes.get("/"));
+    // 1. Prefix path routing matching Nginx-like config
+    let route = {
+        let mut best_match = None;
+        let mut best_len = 0;
+        for (r_path, r_config) in &app_config.routes {
+            if path.starts_with(r_path) && r_path.len() > best_len {
+                best_match = Some((r_path, r_config));
+                best_len = r_path.len();
+            }
+        }
+        best_match.or_else(|| app_config.routes.get_key_value("/"))
+    };
 
     // Extract Host Header to fallback if no specific path match is found
     let host = req
@@ -820,10 +1101,80 @@ async fn handle_http2_request(
         .unwrap_or("default");
     let host_name = host.split(':').next().unwrap_or("default");
 
-    // Select Upstream Pool Name
-    let pool_name = route
-        .map(|r| r.upstream.clone())
-        .unwrap_or_else(|| host_name.to_string());
+    let pool_name = match route {
+        Some((r_path, r)) => {
+            if let Some(ref root_path) = r.root {
+                // If a root directory is configured, serve static files directly!
+                let res = serve_static_file(
+                    r_path,
+                    &path,
+                    root_path.clone(),
+                    &req,
+                    Arc::clone(&access_logger),
+                    &method_str,
+                    &ip_str,
+                )
+                .await;
+                return res.map(|r| {
+                    r.map(|b| {
+                        b.map_err(|_e| {
+                            panic!(
+                                "hyper::Error conversion bypassed on static stream read failure"
+                            );
+                        })
+                        .boxed()
+                    })
+                });
+            }
+
+            if let Some(ref fastcgi_pass) = r.fastcgi_pass {
+                let res = serve_fastcgi(
+                    r_path,
+                    &path,
+                    fastcgi_pass.clone(),
+                    req,
+                    Arc::clone(&access_logger),
+                    &method_str,
+                    &ip_str,
+                )
+                .await;
+                return res.map(|r| {
+                    r.map(|b| {
+                        b.map_err(|_e| {
+                            // Convert fastcgi error
+                            panic!("hyper::Error conversion bypassed on proxy stream failure");
+                        })
+                        .boxed()
+                    })
+                });
+            }
+
+            if let Some(ref uwsgi_pass) = r.uwsgi_pass {
+                let res = serve_uwsgi(
+                    r_path,
+                    &path,
+                    uwsgi_pass.clone(),
+                    req,
+                    Arc::clone(&access_logger),
+                    &method_str,
+                    &ip_str,
+                )
+                .await;
+                return res.map(|r| {
+                    r.map(|b| {
+                        b.map_err(|_e| {
+                            // Convert uwsgi error
+                            panic!("hyper::Error conversion bypassed on proxy stream failure");
+                        })
+                        .boxed()
+                    })
+                });
+            }
+
+            r.upstream.clone().unwrap_or_else(|| host_name.to_string())
+        }
+        None => host_name.to_string(),
+    };
 
     // 2. Fetch healthy backend from pool manager
     let pool = upstreams
@@ -839,7 +1190,7 @@ async fn handle_http2_request(
     };
 
     // 3. Request Header Injection Phase (from config)
-    if let Some(r) = route {
+    if let Some((_, r)) = route {
         for (k, v) in &r.add_headers {
             if let (Ok(hk), Ok(hv)) = (
                 hyper::header::HeaderName::from_bytes(k.as_bytes()),
@@ -918,17 +1269,13 @@ async fn handle_http2_request(
                 );
                 metrics
                     .http_requests_total
-                    .with_label_values(&["GRPC", grpc_status, pool_name.as_str()])
+                    .with_label_values(&["GRPC", grpc_status, &pool_name])
                     .inc();
             } else {
                 let status_str = status_code.to_string();
                 metrics
                     .http_requests_total
-                    .with_label_values(&[
-                        method_str.as_str(),
-                        status_str.as_str(),
-                        pool_name.as_str(),
-                    ])
+                    .with_label_values(&[method_str.as_str(), status_str.as_str(), &pool_name])
                     .inc();
             }
 
@@ -945,12 +1292,14 @@ async fn handle_http2_request(
                 status: status_code,
                 latency_ms: latency,
                 backend: backend_addr,
-                pool: pool_name,
+                pool: pool_name.clone(),
                 bytes_sent: 0,
+                referer: String::new(),
+                user_agent: String::new(),
             });
 
             // 5. Response Header Injection Phase (from config)
-            if let Some(r) = route {
+            if let Some((_, r)) = route {
                 for (k, v) in &r.add_headers {
                     if let (Ok(hk), Ok(hv)) = (
                         hyper::header::HeaderName::from_bytes(k.as_bytes()),
@@ -985,6 +1334,8 @@ async fn handle_http2_request(
                 backend: backend_addr,
                 pool: pool_name,
                 bytes_sent: 0,
+                referer: String::new(),
+                user_agent: String::new(),
             });
 
             Ok(empty_response(hyper::StatusCode::BAD_GATEWAY))
@@ -992,11 +1343,188 @@ async fn handle_http2_request(
     }
 }
 
-/// Returns an ISO 8601 timestamp string using std::time (no external chrono dependency).
-fn chrono_timestamp() -> String {
+/// Helper for access logs (shared across proxy handlers)
+pub fn chrono_timestamp() -> String {
     use std::time::SystemTime;
     let now = SystemTime::now()
         .duration_since(SystemTime::UNIX_EPOCH)
         .unwrap_or_default();
     format!("{}.{:03}Z", now.as_secs(), now.subsec_millis())
+}
+
+/// Helper to safely resolve a path against a base directory to prevent Directory Traversal
+fn sanitize_path(base: &std::path::Path, requested: &str) -> Option<std::path::PathBuf> {
+    // Remove leading slash and query params
+    let req_path = requested
+        .trim_start_matches('/')
+        .split('?')
+        .next()
+        .unwrap_or("");
+    let full_path = base.join(req_path);
+
+    // Canonicalize to resolve symlinks and ../
+    match full_path.canonicalize() {
+        Ok(canon) => {
+            // Ensure the canonicalized path starts with the base directory
+            if canon.starts_with(base.canonicalize().unwrap_or_else(|_| base.to_path_buf())) {
+                Some(canon)
+            } else {
+                None // Traversal attempt!
+            }
+        }
+        Err(_) => None, // File does not exist or unreadable
+    }
+}
+
+/// Helper for empty std::io::Error responses
+fn empty_io_response(status: hyper::StatusCode) -> Response<BoxBody<Bytes, std::io::Error>> {
+    Response::builder()
+        .status(status)
+        .body(
+            http_body_util::Empty::<Bytes>::new()
+                .map_err(|never| match never {})
+                .boxed(),
+        )
+        .unwrap()
+}
+
+/// Asynchronously streams a file from disk directly to the TCP socket using Tokio.
+async fn serve_static_file<T>(
+    route_path: &str,
+    req_path: &str,
+    root_dir: String,
+    _req: &Request<T>,
+    access_logger: Arc<AccessLogger>,
+    method_str: &str,
+    ip_str: &str,
+) -> Result<Response<BoxBody<Bytes, std::io::Error>>, hyper::Error> {
+    let start_time = std::time::Instant::now();
+    let base_path = std::path::Path::new(&root_dir);
+
+    // Only allow GET or HEAD requests for static files
+    if method_str != "GET" && method_str != "HEAD" {
+        return Ok(empty_io_response(hyper::StatusCode::METHOD_NOT_ALLOWED));
+    }
+
+    // Strip the route prefix from the requested path
+    // E.g. route: /static, req: /static/css/style.css -> /css/style.css
+    // Or if route is /, req: /index.html -> /index.html
+    let mut relative_path = req_path;
+    if relative_path.starts_with(route_path) {
+        relative_path = &relative_path[route_path.len()..];
+    }
+    if relative_path.is_empty() {
+        relative_path = "/";
+    }
+
+    // Attempt to safely resolve the file path mapping
+    // E.g. root: /var/www/html, rel: /css/style.css -> /var/www/html/css/style.css
+    let safe_path = match sanitize_path(base_path, relative_path) {
+        Some(p) => {
+            if p.is_dir() {
+                // Try serving index.html if it's a directory
+                match sanitize_path(base_path, &format!("{}/index.html", relative_path)) {
+                    Some(idx) => idx,
+                    None => return Ok(empty_io_response(hyper::StatusCode::FORBIDDEN)),
+                }
+            } else {
+                p
+            }
+        }
+        None => {
+            access_logger.log(AccessLogEntry {
+                timestamp: chrono_timestamp(),
+                client_ip: ip_str.to_string(),
+                method: method_str.to_string(),
+                path: req_path.to_string(),
+                status: 404,
+                latency_ms: start_time.elapsed().as_millis() as u64,
+                backend: "static_files".to_string(),
+                pool: format!("root:{}", root_dir),
+                bytes_sent: 0,
+                referer: String::new(),
+                user_agent: String::new(),
+            });
+            return Ok(empty_io_response(hyper::StatusCode::NOT_FOUND));
+        }
+    };
+
+    let file = match tokio::fs::File::open(&safe_path).await {
+        Ok(f) => f,
+        Err(_) => return Ok(empty_io_response(hyper::StatusCode::NOT_FOUND)),
+    };
+
+    let metadata = match file.metadata().await {
+        Ok(m) => m,
+        Err(_) => return Ok(empty_io_response(hyper::StatusCode::INTERNAL_SERVER_ERROR)),
+    };
+
+    let file_size = metadata.len();
+
+    // Guess Mime type
+    let mime_type = mime_guess::from_path(&safe_path)
+        .first_or_octet_stream()
+        .to_string();
+
+    let latency = start_time.elapsed().as_millis() as u64;
+
+    access_logger.log(AccessLogEntry {
+        timestamp: chrono_timestamp(),
+        client_ip: ip_str.to_string(),
+        method: method_str.to_string(),
+        path: req_path.to_string(),
+        status: 200,
+        latency_ms: latency,
+        backend: "static_files".to_string(),
+        pool: format!("root:{}", root_dir),
+        bytes_sent: file_size,
+        referer: String::new(),
+        user_agent: String::new(),
+    });
+
+    if method_str == "HEAD" {
+        let mut resp = empty_io_response(hyper::StatusCode::OK);
+        resp.headers_mut().insert(
+            hyper::header::CONTENT_TYPE,
+            hyper::header::HeaderValue::from_str(&mime_type).unwrap(),
+        );
+        resp.headers_mut().insert(
+            hyper::header::CONTENT_LENGTH,
+            hyper::header::HeaderValue::from_str(&file_size.to_string()).unwrap(),
+        );
+        return Ok(resp);
+    }
+
+    // Fast-path: Convert Tokio File -> ReaderStream -> StreamBody -> BoxBody
+    // This allows Zero-Copy OS byte streaming straight down the socket.
+    let reader_stream = tokio_util::io::ReaderStream::new(file);
+    // Since hyper::Error doesn't implement From<std::io::Error> generically and its `new` constructor is private,
+    // we convert the IO Stream frames directly, mapping the stream error into an empty synthetic error variant
+    // or dropping the connection when ReaderStream fails.
+    // To match hyper's strict internal types, we unfortunately must create a dummy `empty_response()` mapping.
+    // In practice, since this is streaming, an error mid-stream will just terminate the connection.
+    let stream_body = http_body_util::StreamBody::new(
+        reader_stream.map(|result| result.map(hyper::body::Frame::data)),
+    );
+
+    // Map the internal StreamBody std::io::Error into a synthetic hyper::Error using generic into/mapping
+    // Actually, `hyper::Error` CANNOT be constructed. So we just use `anyhow` or a string locally if needed,
+    // OR we change the function return type to `std::io::Error` and map it at the HTTP connection boundary.
+    let boxed_body = BodyExt::boxed(stream_body);
+
+    let mut response = Response::builder()
+        .status(hyper::StatusCode::OK)
+        .body(boxed_body)
+        .unwrap();
+
+    response.headers_mut().insert(
+        hyper::header::CONTENT_TYPE,
+        hyper::header::HeaderValue::from_str(&mime_type).unwrap(),
+    );
+    response.headers_mut().insert(
+        hyper::header::CONTENT_LENGTH,
+        hyper::header::HeaderValue::from_str(&file_size.to_string()).unwrap(),
+    );
+
+    Ok(response)
 }

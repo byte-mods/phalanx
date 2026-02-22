@@ -139,8 +139,19 @@ Client → [Rate Limiter] → [WAF Engine] → [Route Matching] → [Header Inje
 2. **Route Matching**: Match the request URI path against `phalanx.conf` route definitions (longest prefix match). Fall back to `/` if no specific match.
 3. **Header Injection**: Inject `add_header` values from the matched route into the outgoing request.
 4. **Backend Selection**: Look up the upstream pool, call `pool.get_next_backend()` with the chosen load balancing algorithm.
-5. **Proxying**: Open a TCP connection to the chosen backend, forward the full HTTP request via Hyper's client connector, and stream the response back.
+5. **Proxying**: Acquire an idle TCP connection from the keepalive pool (or open a new one), forward the full HTTP request via Hyper's client connector, and stream the response back.
 6. **AI Feedback**: After the response is received, measure turnaround latency and whether it was a 5xx error. Call `ai_engine.update_score()` to train the model.
+
+### 4.5 Static File Serving (Zero-Copy)
+If a route block contains the `root` directive instead of `upstream` (e.g., `route /static { root /var/www/html; }`), Phalanx intercepts the request before proxying.
+- It dynamically strips the route prefix from the request to sanitize the destination relative file path mapping natively into disk arrays avoiding Directory Traversal vulnerabilities. 
+- It efficiently acts as a high-performance web server by leveraging `tokio::fs::File`, `tokio_util::io::ReaderStream` and `http_body_util::StreamBody` allowing continuous asynchronous chunking of native byte structures back to callers with virtually **zero memory allocations** equivalent to highly optimized servers like Nginx.
+
+### 4.6 FastCGI & uWSGI Direct Proxying
+Like Nginx, Phalanx can directly execute Python or PHP backends bypassing intermediate HTTP servers using `fastcgi_pass` and `uwsgi_pass` directives.
+- **FastCGI** (`src/proxy/fastcgi.rs`): Uses the `fastcgi-client` crate to multiplex FastCGI params and data over a persistent TCP stream.
+- **uWSGI** (`src/proxy/uwsgi.rs`): Implements native dictionary-based binary serialization of the WSGI environment variables into the specific uWSGI TCP packet format.
+- Both endpoints stream response body chunks synchronously back to the client using chunked encoding, without buffering the entire payload in memory.
 
 ---
 

@@ -1,5 +1,6 @@
 pub mod admin;
 pub mod ai;
+pub mod auth;
 pub mod config;
 pub mod discovery;
 pub mod middleware;
