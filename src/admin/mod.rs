@@ -1,9 +1,17 @@
-use actix_web::{App, HttpResponse, HttpServer, Responder, get, web};
+use crate::discovery::{DiscoveredBackend, ServiceDiscovery};
+use crate::routing::UpstreamManager;
+use actix_web::{App, HttpResponse, HttpServer, Responder, delete, get, post, web};
 use prometheus::{
     Encoder, HistogramOpts, HistogramVec, IntCounterVec, IntGauge, Opts, Registry, TextEncoder,
 };
 use std::sync::Arc;
 use tracing::info;
+
+pub struct AdminState {
+    pub metrics: Arc<ProxyMetrics>,
+    pub discovery: Arc<ServiceDiscovery>,
+    pub manager: Arc<UpstreamManager>,
+}
 
 /// Global metrics registry shared across the proxy and admin server.
 #[derive(Clone)]
@@ -122,27 +130,27 @@ async fn health() -> impl Responder {
 }
 
 #[get("/metrics")]
-async fn metrics_endpoint(metrics_data: web::Data<Arc<ProxyMetrics>>) -> impl Responder {
-    let body = metrics_data.encode();
+async fn metrics_endpoint(state: web::Data<AdminState>) -> impl Responder {
+    let body = state.metrics.encode();
     HttpResponse::Ok()
         .content_type("text/plain; version=0.0.4; charset=utf-8")
         .body(body)
 }
 
 #[get("/api/stats")]
-async fn api_stats(metrics_data: web::Data<Arc<ProxyMetrics>>) -> impl Responder {
+async fn api_stats(state: web::Data<AdminState>) -> impl Responder {
     // Instead of using generic Prometheus encoding which is hard to parse in JS,
     // we create a custom JSON structure wrapping the registry output.
     // However, the cleanest way to expose Prometheus metrics to a simple UI
     // is to just use a custom struct. For simplicity here, we'll manually
     // extract the gauge/counter values.
 
-    let active = metrics_data.active_connections.get();
+    let active = state.metrics.active_connections.get();
 
     // Summing counters across all labels involves iterating the registry
     // But since the UI JS fetches this, we can give it raw counts or parsed.
     // The easiest robust way is just exposing the prometheus `gather()` in a simplified shape.
-    let families = metrics_data.registry.gather();
+    let families = state.metrics.registry.gather();
 
     // We'll return a raw JSON map that the JS can parse
     // using serde_json. We don't have to perfectly serialize prometheus,
@@ -202,18 +210,63 @@ async fn dashboard_ui() -> impl Responder {
     HttpResponse::Ok().content_type("text/html").body(html)
 }
 
-pub async fn start_admin_server(bind_addr: String, metrics: Arc<ProxyMetrics>) {
+#[post("/api/discovery/backends")]
+async fn add_backend(
+    state: web::Data<AdminState>,
+    backend: web::Json<DiscoveredBackend>,
+) -> impl Responder {
+    let backend = backend.into_inner();
+
+    // Persist to DB
+    state.discovery.register_backend(&backend);
+
+    // Add to active memory
+    if let Some(pool) = state.manager.get_pool(&backend.pool) {
+        pool.add_backend(crate::config::BackendConfig {
+            address: backend.address.clone(),
+            weight: backend.weight,
+            health_check_path: None,
+            health_check_status: 200,
+        });
+        HttpResponse::Ok().json(serde_json::json!({"status": "added"}))
+    } else {
+        HttpResponse::NotFound().json(serde_json::json!({"error": "pool not found"}))
+    }
+}
+
+#[delete("/api/discovery/backends/{pool}/{address}")]
+async fn remove_backend(
+    state: web::Data<AdminState>,
+    path: web::Path<(String, String)>,
+) -> impl Responder {
+    let (pool_name, address) = path.into_inner();
+
+    // Remove from DB
+    state.discovery.deregister_backend(&pool_name, &address);
+
+    // Remove from active memory
+    if let Some(pool) = state.manager.get_pool(&pool_name) {
+        pool.remove_backend(&address);
+        HttpResponse::Ok().json(serde_json::json!({"status": "removed"}))
+    } else {
+        HttpResponse::NotFound().json(serde_json::json!({"error": "pool not found"}))
+    }
+}
+
+pub async fn start_admin_server(bind_addr: String, state: AdminState) {
     info!("Admin API listening on http://{}", bind_addr);
 
-    let metrics_data = web::Data::new(metrics);
+    let admin_state = web::Data::new(state);
 
     let server = HttpServer::new(move || {
         App::new()
-            .app_data(metrics_data.clone())
+            .app_data(admin_state.clone())
             .service(health)
             .service(metrics_endpoint)
             .service(api_stats)
             .service(dashboard_ui)
+            .service(add_backend)
+            .service(remove_backend)
     })
     .bind(&bind_addr)
     .expect("Invalid admin bind address")

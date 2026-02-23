@@ -53,11 +53,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // --- Hot Reload (SIGHUP) ---
         reload::spawn_reload_handler(Arc::clone(&cfg), config_path.clone());
 
-        // State & Routing: Manages backend health and load balancing algorithms.
-        let upstreams = Arc::new(routing::UpstreamManager::new(&cfg_snapshot));
-
         // Service Discovery: RocksDB-backed persistent backend registry.
-        let _discovery = Arc::new(discovery::ServiceDiscovery::new("data/discovery.db"));
+        let discovery = Arc::new(discovery::ServiceDiscovery::new("data/discovery.db"));
+
+        // State & Routing: Manages backend health and load balancing algorithms.
+        let upstreams = Arc::new(routing::UpstreamManager::new(
+            &cfg_snapshot,
+            discovery.clone(),
+        ));
 
         // Prometheus Metrics: Real counters, histograms, and gauges.
         let metrics = Arc::new(admin::ProxyMetrics::new());
@@ -116,8 +119,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // Start the Admin Server API continuously in the background
         let cfg_admin = Arc::clone(&cfg_snapshot);
         let metrics_admin = Arc::clone(&metrics);
+        let discovery_admin = Arc::clone(&discovery);
+        let manager_admin = Arc::clone(&upstreams);
         tokio::spawn(async move {
-            admin::start_admin_server(cfg_admin.admin_bind.clone(), metrics_admin).await;
+            let admin_state = admin::AdminState {
+                metrics: metrics_admin,
+                discovery: discovery_admin,
+                manager: manager_admin,
+            };
+            admin::start_admin_server(cfg_admin.admin_bind.clone(), admin_state).await;
         });
 
         // Start the Raw TCP Proxy on a separate port (e.g., 5000)

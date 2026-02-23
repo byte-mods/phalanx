@@ -87,6 +87,14 @@ impl AsyncWrite for PeekableStream {
 }
 
 /// Helper function to create standard HTTP BoxBody responses for errors (like 502/404)
+///
+/// ### Example Input / Output
+///
+/// **Input**:
+/// `hyper::StatusCode::BAD_GATEWAY`
+///
+/// **Output**:
+/// `Response<BoxBody<Bytes, hyper::Error>>` with a status of 502 Bad Gateway and an empty body.
 fn empty_response(status: hyper::StatusCode) -> Response<BoxBody<Bytes, hyper::Error>> {
     Response::builder()
         .status(status)
@@ -99,6 +107,16 @@ fn empty_response(status: hyper::StatusCode) -> Response<BoxBody<Bytes, hyper::E
 }
 
 /// Constructs an HTTP 429 Too Many Requests response with a Retry-After header.
+///
+/// ### Example Input / Output
+///
+/// **Input**: (None)
+///
+/// **Output**:
+/// A `Response<BoxBody<Bytes, hyper::Error>>` with:
+/// - Status: 429 Too Many Requests
+/// - Headers: `Retry-After: 1`, `Content-Type: text/plain`
+/// - Body: "429 Too Many Requests\n"
 fn rate_limit_response() -> Response<BoxBody<Bytes, hyper::Error>> {
     let body = Bytes::from_static(b"429 Too Many Requests\n");
     Response::builder()
@@ -366,6 +384,24 @@ pub async fn start_proxy(
 }
 
 /// Checks if an HTTP request is a WebSocket upgrade by examining typed headers.
+///
+/// ### Example Input / Output
+///
+/// **Input 1 (WebSocket Request)**:
+/// ```text
+/// GET /chat HTTP/1.1
+/// Host: example.com
+/// Upgrade: websocket
+/// Connection: Upgrade
+/// ```
+/// **Output 1**: `true`
+///
+/// **Input 2 (Standard HTTP Request)**:
+/// ```text
+/// GET /index.html HTTP/1.1
+/// Host: example.com
+/// ```
+/// **Output 2**: `false`
 pub fn is_websocket_upgrade<T>(req: &Request<T>) -> bool {
     let has_upgrade = req
         .headers()
@@ -390,6 +426,19 @@ pub fn is_websocket_upgrade<T>(req: &Request<T>) -> bool {
 /// The main worker function for HTTP/1.x traffic.
 /// This parses route configurations, modifies headers, selects backends,
 /// and streams data bidirectionally between the client and downstream Server.
+///
+/// ### Example Input / Output
+///
+/// **Input**:
+/// - `req`: Incoming HTTP Request (e.g., `GET /api/v1/users HTTP/1.1`)
+/// - `_peer`: Client socket address (e.g., `192.168.1.50:54321`)
+/// - `upstreams`: Global `UpstreamManager` containing backend pools.
+/// - `app_config`: Current routing and server configuration.
+/// - Middleware components: WAF, Cache, AI Engine, Metrics, Logger.
+///
+/// **Output**:
+/// - `Ok(Response)`: A valid `hyper::Response` ready to be streamed to the client (e.g., `200 OK` with data or `502 Bad Gateway`).
+/// - `Err(hyper::Error)`: Low-level HTTP or TCP connection errors.
 async fn handle_http_request(
     mut req: Request<hyper::body::Incoming>,
     _peer: SocketAddr,

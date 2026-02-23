@@ -1,3 +1,4 @@
+use arc_swap::ArcSwap;
 use dashmap::DashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -34,7 +35,7 @@ pub struct UpstreamPool {
     /// The algorithm to use for picking the next backend (e.g., RoundRobin)
     pub algorithm: LoadBalancingAlgorithm,
     /// The list of physical backend nodes in this pool
-    pub backends: Vec<Arc<BackendNode>>,
+    pub backends: ArcSwap<Vec<Arc<BackendNode>>>,
     /// Counter used strictly for Round-Robin selection logic
     round_robin_index: AtomicUsize,
     /// Keepalive connection pool
@@ -43,7 +44,7 @@ pub struct UpstreamPool {
 
 impl UpstreamPool {
     pub fn new(config: &UpstreamPoolConfig) -> Self {
-        let backends = config
+        let backends: Vec<Arc<BackendNode>> = config
             .backends
             .iter()
             .map(|b| Arc::new(BackendNode::new(b.clone())))
@@ -51,22 +52,43 @@ impl UpstreamPool {
 
         Self {
             algorithm: config.algorithm,
-            backends,
+            backends: ArcSwap::from_pointee(backends),
             round_robin_index: AtomicUsize::new(0),
             connection_pool: Arc::new(crate::proxy::pool::ConnectionPool::new(config.keepalive)),
         }
     }
 
-    /// Selects the next healthy backend node using the configured algorithm.
-    /// Returns `None` if all nodes are marked as unhealthy.
+    /// Dynamically add a backend to this pool.
+    pub fn add_backend(&self, config: BackendConfig) {
+        let new_node = Arc::new(BackendNode::new(config));
+        let mut current_backends = self.backends.load().as_ref().clone();
+
+        // Prevent duplicates
+        if !current_backends
+            .iter()
+            .any(|b| b.config.address == new_node.config.address)
+        {
+            current_backends.push(new_node);
+            self.backends.store(Arc::new(current_backends));
+        }
+    }
+
+    /// Dynamically remove a backend from this pool by address.
+    pub fn remove_backend(&self, address: &str) {
+        let mut current_backends = self.backends.load().as_ref().clone();
+        current_backends.retain(|b| b.config.address != address);
+        self.backends.store(Arc::new(current_backends));
+    }
+
     pub fn get_next_backend(
         &self,
         client_ip: Option<&std::net::IpAddr>,
         ai_engine: Option<Arc<dyn crate::ai::AiRouter>>,
     ) -> Option<Arc<BackendNode>> {
+        let current_backends = self.backends.load();
+
         // Find only backends that the health checker confirmed are alive
-        let healthy_backends: Vec<_> = self
-            .backends
+        let healthy_backends: Vec<_> = current_backends
             .iter()
             .filter(|b| b.is_healthy.load(Ordering::Acquire))
             .map(|b| Arc::clone(b))
@@ -151,13 +173,35 @@ pub struct UpstreamManager {
 impl UpstreamManager {
     /// Initializes the manager with the supplied configurations and automatically
     /// spawns asynchronous background health checkers for each pool.
-    pub fn new(config: &crate::config::AppConfig) -> Self {
+    pub fn new(
+        config: &crate::config::AppConfig,
+        discovery: Arc<crate::discovery::ServiceDiscovery>,
+    ) -> Self {
         let manager = Self {
             pools: DashMap::new(),
         };
 
         for (name, pool_config) in &config.upstreams {
             let pool = Arc::new(UpstreamPool::new(pool_config));
+
+            // Load discovered backends from RocksDB for this pool
+            let discovered = discovery.list_backends(name);
+            for d in discovered {
+                pool.add_backend(BackendConfig {
+                    address: d.address.clone(),
+                    weight: d.weight,
+                    health_check_path: pool_config
+                        .backends
+                        .first()
+                        .and_then(|b| b.health_check_path.clone()),
+                    health_check_status: pool_config
+                        .backends
+                        .first()
+                        .map(|b| b.health_check_status)
+                        .unwrap_or(200),
+                });
+            }
+
             manager.pools.insert(name.clone(), pool.clone());
 
             // Start an asynchronous health check task specific to this pool
@@ -173,16 +217,17 @@ impl UpstreamManager {
     }
 }
 
-/// A background asynchronous task that runs indefinitely, pinging the backends.
-/// Every 5 seconds, it checks each backend — using HTTP GET if `health_check_path` is
-/// configured on the backend, otherwise falling back to a raw TCP connect.
 async fn health_check_loop(pool_name: String, pool: Arc<UpstreamPool>) {
     let interval = Duration::from_secs(5);
     info!("Starting health check loop for pool: {}", pool_name);
 
     loop {
         sleep(interval).await;
-        for backend in &pool.backends {
+
+        // Grab a snapshot of the current backends
+        let backends_snapshot = pool.backends.load().clone();
+
+        for backend in backends_snapshot.iter() {
             let address = &backend.config.address;
             let is_healthy = if let Some(ref path) = backend.config.health_check_path {
                 // HTTP GET health check

@@ -25,6 +25,7 @@ pub struct ServiceDiscovery {
 impl ServiceDiscovery {
     /// Opens or creates RocksDB at the given path.
     pub fn new<P: AsRef<Path>>(path: P) -> Self {
+        // setting rocks db settings
         let mut opts = Options::default();
         opts.create_if_missing(true);
         // Optimize for point lookups (backend addresses are short keys)
