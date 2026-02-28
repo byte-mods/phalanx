@@ -7,13 +7,6 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tracing::{debug, error, warn};
 
-/// Cached result for a previously introspected token.
-struct CachEntry {
-    active: bool,
-    sub: Option<String>,
-    cached_at: Instant,
-}
-
 /// The duration to cache a valid (active) introspection result.
 const CACHE_TTL: Duration = Duration::from_secs(60);
 

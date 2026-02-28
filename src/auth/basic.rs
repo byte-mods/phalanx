@@ -10,7 +10,7 @@ use std::collections::HashMap;
 /// - **Bcrypt hash**: `user:$2b$12$...` (prefix `$2b$` or `$2y$`)
 ///
 /// On failure, returns `Denied(401)` with the appropriate `WWW-Authenticate` challenge.
-pub fn check(headers: &HeaderMap, realm: &str, users: &HashMap<String, String>) -> AuthResult {
+pub fn check(headers: &HeaderMap, _realm: &str, users: &HashMap<String, String>) -> AuthResult {
     let auth_header = match headers.get(hyper::header::AUTHORIZATION) {
         Some(v) => v,
         None => {
@@ -123,7 +123,7 @@ fn bcrypt_verify(password: &str, hash: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use base64::{Engine as _, engine::general_purpose::STANDARD};
+    use base64::engine::general_purpose::STANDARD;
 
     fn make_headers(auth: &str) -> HeaderMap {
         let mut headers = HeaderMap::new();

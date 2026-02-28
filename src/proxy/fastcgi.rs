@@ -1,4 +1,4 @@
-use bytes::{BufMut, Bytes, BytesMut};
+use bytes::Bytes;
 use fastcgi_client::response::Content;
 use fastcgi_client::{Client, Params, Request as FcgiRequest};
 use futures_util::stream::{StreamExt, TryStreamExt};
@@ -8,7 +8,7 @@ use hyper::{Request, Response, StatusCode};
 use std::sync::Arc;
 use tokio::net::TcpStream;
 use tokio_util::io::StreamReader;
-use tracing::{debug, error};
+use tracing::error;
 
 use crate::proxy::chrono_timestamp;
 use crate::telemetry::access_log::{AccessLogEntry, AccessLogger};
@@ -35,7 +35,7 @@ pub async fn serve_fastcgi<T>(
 ) -> Result<Response<BoxBody<Bytes, std::io::Error>>, hyper::Error>
 where
     T: hyper::body::Body<Data = Bytes> + Send + Sync + Unpin + 'static,
-    T::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
+    T::Error: std::fmt::Display + Send + Sync + 'static,
 {
     let start_time = std::time::Instant::now();
 
@@ -88,7 +88,7 @@ where
 
     let mapped_body = body
         .into_data_stream()
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.into()));
+        .map_err(|e| std::io::Error::other(e.to_string()));
     let mut body_reader = StreamReader::new(mapped_body);
 
     let fcgi_req = FcgiRequest::new(params, &mut body_reader);
@@ -115,7 +115,7 @@ where
                     header_buf.extend_from_slice(&chunk);
                     // Check for end of headers
                     if let Some(pos) = header_buf.windows(4).position(|w| w == b"\r\n\r\n") {
-                        let mut body_start = header_buf.split_off(pos + 4);
+                        let body_start = header_buf.split_off(pos + 4);
                         if !body_start.is_empty() {
                             first_body_chunk = Some(Bytes::from(body_start));
                         }

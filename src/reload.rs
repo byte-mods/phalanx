@@ -11,7 +11,11 @@ use tracing::info;
 /// - Changing rate limit thresholds
 /// - Toggling WAF rules
 /// - Switching AI routing algorithms
-pub fn spawn_reload_handler(config: Arc<ArcSwap<crate::config::AppConfig>>, conf_path: String) {
+pub fn spawn_reload_handler(
+    config: Arc<ArcSwap<crate::config::AppConfig>>,
+    tls_acceptor: Arc<ArcSwap<Option<tokio_rustls::TlsAcceptor>>>,
+    conf_path: String,
+) {
     tokio::spawn(async move {
         #[cfg(unix)]
         {
@@ -31,7 +35,9 @@ pub fn spawn_reload_handler(config: Arc<ArcSwap<crate::config::AppConfig>>, conf
                     new_config.routes.len(),
                 );
 
+                let new_tls = crate::proxy::tls::reload_tls_acceptor(&new_config);
                 config.store(Arc::new(new_config));
+                tls_acceptor.store(Arc::new(new_tls));
                 info!("Configuration swap complete (zero-downtime reload).");
             }
         }
@@ -42,6 +48,7 @@ pub fn spawn_reload_handler(config: Arc<ArcSwap<crate::config::AppConfig>>, conf
             // The hot-reload feature is disabled.
             tracing::warn!("Hot reload (SIGHUP) is only supported on Unix platforms.");
             let _config = config; // suppress unused warning
+            let _tls_acceptor = tls_acceptor; // suppress unused warning
             std::future::pending::<()>().await;
         }
     });

@@ -5,6 +5,7 @@ use hyper::server::conn::http1;
 use hyper::service::service_fn;
 use hyper::{Request, Response};
 use hyper_util::rt::TokioIo;
+use rand::RngExt;
 use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -15,6 +16,7 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
+use arc_swap::ArcSwap;
 use crate::middleware::CachedResponse;
 use crate::middleware::compression;
 
@@ -26,6 +28,7 @@ pub mod router;
 pub mod tcp;
 pub mod tls;
 pub mod uwsgi;
+pub mod zero_copy;
 
 use fastcgi::serve_fastcgi;
 use rewrite::{RewriteResult, apply_rewrites, compile_rules};
@@ -136,9 +139,9 @@ fn rate_limit_response() -> Response<BoxBody<Bytes, hyper::Error>> {
 /// (HTTP/1, HTTP/2/gRPC, TLS), and spawns appropriate async tasks to handle the requests.
 pub async fn start_proxy(
     bind_addr: &str,
-    app_config: Arc<AppConfig>,
+    app_config: Arc<ArcSwap<AppConfig>>,
     upstreams: Arc<UpstreamManager>,
-    tls_acceptor: Option<tokio_rustls::TlsAcceptor>,
+    tls_acceptor: Arc<ArcSwap<Option<tokio_rustls::TlsAcceptor>>>,
     _waf: Arc<crate::waf::WafEngine>,
     rate_limiter: Arc<crate::middleware::ratelimit::PhalanxRateLimiter>,
     _ai_engine: Arc<dyn AiRouter>,
@@ -172,7 +175,7 @@ pub async fn start_proxy(
         // Clone Arcs to move into the background task
         let upstreams_clone = Arc::clone(&upstreams);
         let config_clone = Arc::clone(&app_config);
-        let tls_acceptor_clone = tls_acceptor.clone();
+        let tls_acceptor_clone = Arc::clone(&tls_acceptor);
         let waf_spawn_clone = Arc::clone(&_waf);
         let ai_spawn_clone = Arc::clone(&_ai_engine);
         let rl_clone = Arc::clone(&rate_limiter);
@@ -196,6 +199,10 @@ pub async fn start_proxy(
 
             // Rate Limit Check — for HTTP protocols, return 429; for others, silently drop
             if !rl_clone.check_ip(peer.ip()) {
+                metrics_clone
+                    .rate_limit_rejections
+                    .with_label_values(&["ip_or_global"])
+                    .inc();
                 match proto {
                     Protocol::Http1 | Protocol::Http2 => {
                         // Send a proper HTTP 429 response before closing
@@ -222,6 +229,7 @@ pub async fn start_proxy(
                 stream,
                 buffer: prefix_buf,
             };
+            let tls_acceptor_current = tls_acceptor_clone.load_full();
 
             // Route execution based on protocol
             match proto {
@@ -292,7 +300,7 @@ pub async fn start_proxy(
                     }
                 }
                 Protocol::Tls => {
-                    if let Some(acceptor) = tls_acceptor_clone {
+                    if let Some(acceptor) = tls_acceptor_current.as_ref().clone() {
                         match acceptor.accept(peekable_stream).await {
                             Ok(tls_stream) => {
                                 let (io, alpn) = {
@@ -443,13 +451,15 @@ async fn handle_http_request(
     mut req: Request<hyper::body::Incoming>,
     _peer: SocketAddr,
     upstreams: Arc<UpstreamManager>,
-    app_config: Arc<AppConfig>,
+    app_config: Arc<ArcSwap<AppConfig>>,
     waf: Arc<crate::waf::WafEngine>,
     ai_engine: Arc<dyn crate::ai::AiRouter>,
     cache: Arc<ResponseCache>,
     metrics: Arc<ProxyMetrics>,
     access_logger: Arc<AccessLogger>,
 ) -> Result<Response<BoxBody<Bytes, hyper::Error>>, hyper::Error> {
+    let app_config = app_config.load_full();
+
     // Path is mutable so rewrite rules can modify it before route dispatch
     let mut path = req.uri().path().to_string();
 
@@ -473,10 +483,14 @@ async fn handle_http_request(
             .and_then(|v| v.to_str().ok()),
     );
 
-    if let crate::waf::WafAction::Block(reason) = waf.inspect(&ip_str, &path, query, user_agent) {
-        warn!("WAF blocked request from {}: {}", ip_str, reason);
-        metrics.waf_blocks_total.with_label_values(&[&reason]).inc();
-        return Ok(empty_response(hyper::StatusCode::FORBIDDEN));
+    let waf_enabled = app_config.waf_enabled.unwrap_or(false);
+    if waf_enabled {
+        if let crate::waf::WafAction::Block(reason) = waf.inspect(&ip_str, &path, query, user_agent)
+        {
+            warn!("WAF blocked request from {}: {}", ip_str, reason);
+            metrics.waf_blocks_total.with_label_values(&[&reason]).inc();
+            return Ok(empty_response(hyper::StatusCode::FORBIDDEN));
+        }
     }
 
     // Check for WebSocket upgrade request
@@ -489,6 +503,25 @@ async fn handle_http_request(
     } else {
         None
     };
+
+    // Buffer request body once so we can inspect payloads and still forward unchanged bytes.
+    let (parts, body) = req.into_parts();
+    let body_bytes = match body.collect().await {
+        Ok(collected) => collected.to_bytes(),
+        Err(e) => {
+            error!("Failed to read request body: {}", e);
+            return Ok(empty_response(hyper::StatusCode::BAD_REQUEST));
+        }
+    };
+    if waf_enabled && !body_bytes.is_empty() {
+        let body_text = String::from_utf8_lossy(&body_bytes);
+        if let crate::waf::WafAction::Block(reason) = waf.inspect_body(&ip_str, &body_text) {
+            warn!("WAF blocked request body from {}: {}", ip_str, reason);
+            metrics.waf_blocks_total.with_label_values(&[&reason]).inc();
+            return Ok(empty_response(hyper::StatusCode::FORBIDDEN));
+        }
+    }
+    let mut req = Request::from_parts(parts, Full::new(body_bytes));
 
     // ── Rewrite Engine ────────────────────────────────────────────────────────
     // Apply rewrite rules for the matched route BEFORE final dispatch.
@@ -790,8 +823,6 @@ async fn handle_http_request(
         None
     };
 
-    let _ = (route_gzip_min, route_cache_ttl); // used below in slow-path
-
     // 2. Fetch healthy backend from pool manager
     let pool = upstreams
         .get_pool(pool_name.as_str())
@@ -816,19 +847,18 @@ async fn handle_http_request(
             }
         }
     }
+    let (trace_id, span_id) = generate_trace_context_ids();
+    crate::telemetry::otel::inject_trace_context(req.headers_mut(), &trace_id, &span_id, true);
+    let (trace_id, span_id) = generate_trace_context_ids();
+    crate::telemetry::otel::inject_trace_context(req.headers_mut(), &trace_id, &span_id, true);
 
     // 4. Forward the request to physical backend IP
     backend.active_connections.fetch_add(1, Ordering::Relaxed);
     metrics.active_connections.inc();
+    let pool_ref = Arc::clone(pool.as_ref().expect("pool presence already validated"));
 
     // Establish TCP connection to backend (using keepalive pool if enabled)
-    let stream = match pool
-        .as_ref()
-        .unwrap()
-        .connection_pool
-        .acquire(&backend.config.address)
-        .await
-    {
+    let stream = match pool_ref.connection_pool.acquire(&backend.config.address).await {
         Ok(s) => s,
         Err(e) => {
             error!(
@@ -855,13 +885,6 @@ async fn handle_http_request(
         }
     };
 
-    // Spawn the hyper connection driver task to manage IO asynchronously
-    tokio::spawn(async move {
-        if let Err(e) = conn.await {
-            debug!("Backend connection error: {:?}", e);
-        }
-    });
-
     // Send the proxy request
     let res = sender.send_request(req).await;
     // Client has responded locally, decrement active proxy connection count
@@ -875,6 +898,11 @@ async fn handle_http_request(
             // Check if this is a 101 Switching Protocols response to our WebSocket upgrade
             let is_101 = response.status() == hyper::StatusCode::SWITCHING_PROTOCOLS;
             if is_websocket && is_101 {
+                tokio::spawn(async move {
+                    if let Err(e) = conn.await {
+                        debug!("WebSocket backend connection error: {:?}", e);
+                    }
+                });
                 if let Some(client_fut) = client_upgrade {
                     // Extract the backend's upgrade future from the response
                     let backend_upgrade = hyper::upgrade::on(&mut response);
@@ -891,8 +919,11 @@ async fn handle_http_request(
                                 let mut backend_io = TokioIo::new(backend_upgraded);
 
                                 // Relay bytes bidirectionally
-                                match tokio::io::copy_bidirectional(&mut client_io, &mut backend_io)
-                                    .await
+                                match crate::proxy::zero_copy::copy_bidirectional_fallback(
+                                    &mut client_io,
+                                    &mut backend_io,
+                                )
+                                .await
                                 {
                                     Ok((from_client, from_backend)) => {
                                         debug!(
@@ -912,6 +943,8 @@ async fn handle_http_request(
                         }
                     });
                 }
+                let response = response.map(|body| body.map_err(|e| e).boxed());
+                return Ok(response);
             }
 
             // Train AI Router
@@ -955,51 +988,32 @@ async fn handle_http_request(
 
             let should_compress = accepts_gzip && compression::is_compressible(Some(&content_type));
             let should_cache = cache_key.is_some() && status_code == 200;
-
-            if !should_compress && !should_cache {
-                // Zero-Copy Fast Path: Map hyper::body::Incoming -> BoxBody
-                let boxed_fast_path = response.map(|b| b.map_err(|e| e).boxed());
-
-                access_logger.log(AccessLogEntry {
-                    timestamp: chrono_timestamp(),
-                    client_ip: ip_str,
-                    method: method_str,
-                    path,
-                    status: status_code,
-                    latency_ms: latency,
-                    backend: backend_addr,
-                    pool: pool_name.clone(),
-                    bytes_sent: Default::default(), // Size is dynamic, streaming.
-                    referer: String::new(),
-                    user_agent: String::new(),
-                });
-
-                return Ok(boxed_fast_path);
-            }
-
-            // 7. Slow-Path (Memory Buffering) for Caching and Compression
-            // Collect the full response body into memory
+            // Collect full body so we can optionally cache/compress and safely return
+            // the backend socket to the keepalive pool after request completion.
             let body_bytes = match http_body_util::BodyExt::collect(response.body_mut()).await {
                 Ok(collected) => collected.to_bytes(),
                 Err(_) => {
-                    let boxed = response.map(|b| b.map_err(|e| e).boxed());
-                    return Ok(boxed);
+                    return Ok(empty_response(hyper::StatusCode::BAD_GATEWAY));
                 }
             };
 
             let body_len = body_bytes.len();
+            let should_compress =
+                should_compress && body_len >= route_gzip_min.max(crate::middleware::compression::MIN_COMPRESS_SIZE);
 
             // ── Cache Store: cache GET 200 responses ──
             if should_cache {
                 if let Some(ref ck) = cache_key {
                     cache
-                        .insert(
+                        .insert_with_ttl(
                             ck.clone(),
                             CachedResponse {
                                 status: status_code,
                                 body: body_bytes.clone(),
                                 content_type: content_type.clone(),
+                                expires_at: std::time::Instant::now(),
                             },
+                            route_cache_ttl,
                         )
                         .await;
                 }
@@ -1044,6 +1058,24 @@ async fn handle_http_request(
                     .remove(hyper::header::CONTENT_LENGTH);
             }
 
+            // Return backend socket to keepalive pool when possible.
+            match conn.without_shutdown().await {
+                Ok(parts) => {
+                    if parts.read_buf.is_empty() {
+                        pool_ref
+                            .connection_pool
+                            .release(backend_addr.clone(), parts.io.into_inner())
+                            .await;
+                    }
+                }
+                Err(e) => {
+                    debug!(
+                        "Connection not reusable for backend {}: {}",
+                        backend_addr, e
+                    );
+                }
+            }
+
             // Structured Access Log
             access_logger.log(AccessLogEntry {
                 timestamp: chrono_timestamp(),
@@ -1086,16 +1118,18 @@ async fn handle_http_request(
 
 /// The main worker function for HTTP/2.x and gRPC traffic.
 async fn handle_http2_request(
-    mut req: Request<hyper::body::Incoming>,
+    req: Request<hyper::body::Incoming>,
     _peer: SocketAddr,
     upstreams: Arc<UpstreamManager>,
-    app_config: Arc<AppConfig>,
+    app_config: Arc<ArcSwap<AppConfig>>,
     waf: Arc<crate::waf::WafEngine>,
     ai_engine: Arc<dyn crate::ai::AiRouter>,
     cache: Arc<ResponseCache>,
     metrics: Arc<ProxyMetrics>,
     access_logger: Arc<AccessLogger>,
 ) -> Result<Response<BoxBody<Bytes, hyper::Error>>, hyper::Error> {
+    let app_config = app_config.load_full();
+
     let path = req.uri().path().to_string();
 
     // Detect gRPC traffic via content-type header
@@ -1124,10 +1158,31 @@ async fn handle_http2_request(
         .get(hyper::header::USER_AGENT)
         .and_then(|v| v.to_str().ok());
 
-    if let crate::waf::WafAction::Block(reason) = waf.inspect(&ip_str, &path, query, user_agent) {
-        warn!("WAF blocked HTTP/2 request from {}: {}", ip_str, reason);
-        return Ok(empty_response(hyper::StatusCode::FORBIDDEN));
+    let waf_enabled = app_config.waf_enabled.unwrap_or(false);
+    if waf_enabled {
+        if let crate::waf::WafAction::Block(reason) = waf.inspect(&ip_str, &path, query, user_agent)
+        {
+            warn!("WAF blocked HTTP/2 request from {}: {}", ip_str, reason);
+            return Ok(empty_response(hyper::StatusCode::FORBIDDEN));
+        }
     }
+
+    let (parts, body) = req.into_parts();
+    let body_bytes = match body.collect().await {
+        Ok(collected) => collected.to_bytes(),
+        Err(e) => {
+            error!("Failed to read HTTP/2 request body: {}", e);
+            return Ok(empty_response(hyper::StatusCode::BAD_REQUEST));
+        }
+    };
+    if waf_enabled && !body_bytes.is_empty() {
+        let body_text = String::from_utf8_lossy(&body_bytes);
+        if let crate::waf::WafAction::Block(reason) = waf.inspect_body(&ip_str, &body_text) {
+            warn!("WAF blocked HTTP/2 request body from {}: {}", ip_str, reason);
+            return Ok(empty_response(hyper::StatusCode::FORBIDDEN));
+        }
+    }
+    let mut req = Request::from_parts(parts, Full::new(body_bytes));
 
     // 1. Prefix path routing matching Nginx-like config
     let route = {
@@ -1390,6 +1445,17 @@ async fn handle_http2_request(
             Ok(empty_response(hyper::StatusCode::BAD_GATEWAY))
         }
     }
+}
+
+fn generate_trace_context_ids() -> (String, String) {
+    let mut trace = [0u8; 16];
+    let mut span = [0u8; 8];
+    let mut rng = rand::rng();
+    rng.fill(&mut trace);
+    rng.fill(&mut span);
+    let trace_id = trace.iter().map(|b| format!("{:02x}", b)).collect();
+    let span_id = span.iter().map(|b| format!("{:02x}", b)).collect();
+    (trace_id, span_id)
 }
 
 /// Helper for access logs (shared across proxy handlers)

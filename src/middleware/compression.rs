@@ -28,7 +28,7 @@ pub fn is_compressible(content_type: Option<&str>) -> bool {
 }
 
 /// Minimum body size to compress (1 KB). Below this, compression overhead isn't worth it.
-const MIN_COMPRESS_SIZE: usize = 1024;
+pub const MIN_COMPRESS_SIZE: usize = 1024;
 
 /// Compresses bytes using gzip. Returns None if the body is too small or compression fails.
 pub fn gzip_compress(body: &[u8]) -> Option<Bytes> {

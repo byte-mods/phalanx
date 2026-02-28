@@ -33,7 +33,7 @@ pub async fn serve_uwsgi<T>(
 ) -> Result<Response<BoxBody<Bytes, std::io::Error>>, hyper::Error>
 where
     T: hyper::body::Body<Data = Bytes> + Send + Sync + Unpin + 'static,
-    T::Error: Into<Box<dyn std::error::Error + Send + Sync>> + Send,
+    T::Error: std::fmt::Display + Send + Sync + 'static,
 {
     let start_time = std::time::Instant::now();
 
@@ -59,7 +59,7 @@ where
     };
 
     let (mut rx, mut tx) = stream.into_split();
-    let (parts, mut body) = req.into_parts();
+    let (parts, body) = req.into_parts();
 
     // Construct uWSGI payload (Dictionary encoding)
     let mut params = std::collections::HashMap::new();
@@ -131,7 +131,7 @@ where
         if !cgi_headers_done {
             header_buf.extend_from_slice(chunk);
             if let Some(pos) = header_buf.windows(4).position(|w| w == b"\r\n\r\n") {
-                let mut body_start = header_buf.split_off(pos + 4);
+                let body_start = header_buf.split_off(pos + 4);
                 if !body_start.is_empty() {
                     first_body_chunk = Some(Bytes::from(body_start));
                 }

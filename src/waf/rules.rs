@@ -6,13 +6,6 @@ pub struct WafRules {
     lfi_rfi_set: RegexSet,
     cmd_injection_set: RegexSet,
     bot_ua_set: RegexSet,
-
-    // Original patterns kept for reporting which specific rule matched
-    sqli_patterns: Vec<&'static str>,
-    xss_patterns: Vec<&'static str>,
-    lfi_rfi_patterns: Vec<&'static str>,
-    cmd_injection_patterns: Vec<&'static str>,
-    bot_ua_patterns: Vec<&'static str>,
 }
 
 impl WafRules {
@@ -58,12 +51,6 @@ impl WafRules {
             lfi_rfi_set: RegexSet::new(&lfi_rfi_patterns).unwrap(),
             cmd_injection_set: RegexSet::new(&cmd_injection_patterns).unwrap(),
             bot_ua_set: RegexSet::new(&bot_ua_patterns).unwrap(),
-
-            sqli_patterns,
-            xss_patterns,
-            lfi_rfi_patterns,
-            cmd_injection_patterns,
-            bot_ua_patterns,
         }
     }
 

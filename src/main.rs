@@ -50,8 +50,25 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             shutdown_token_signal.cancel();
         });
 
+        if let Some(endpoint) = cfg_snapshot.otel_endpoint.as_deref() {
+            let service = cfg_snapshot
+                .otel_service_name
+                .as_deref()
+                .unwrap_or("phalanx");
+            let _ = telemetry::otel::init_otel_layer(endpoint, service);
+        }
+
+        // Setup TLS (shared, hot-reloadable)
+        let tls_acceptor = Arc::new(ArcSwap::from_pointee(proxy::tls::load_tls_acceptor(
+            &cfg_snapshot,
+        )));
+
         // --- Hot Reload (SIGHUP) ---
-        reload::spawn_reload_handler(Arc::clone(&cfg), config_path.clone());
+        reload::spawn_reload_handler(
+            Arc::clone(&cfg),
+            Arc::clone(&tls_acceptor),
+            config_path.clone(),
+        );
 
         // Service Discovery: RocksDB-backed persistent backend registry.
         let discovery = Arc::new(discovery::ServiceDiscovery::new("data/discovery.db"));
@@ -94,7 +111,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             cfg_snapshot.waf_auto_ban_duration.unwrap_or(3600),
         ));
         let waf_engine = Arc::new(waf::WafEngine::new(
-            cfg_snapshot.waf_enabled.unwrap_or(false),
+            true,
             waf_reputation,
         ));
 
@@ -112,9 +129,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             cfg_snapshot.ai_ucb_constant.unwrap_or(2.0),
             cfg_snapshot.ai_thompson_threshold_ms.unwrap_or(100.0),
         );
-
-        // Setup TLS if configured
-        let tls_acceptor = proxy::tls::load_tls_acceptor(&cfg_snapshot);
 
         // Start the Admin Server API continuously in the background
         let cfg_admin = Arc::clone(&cfg_snapshot);
@@ -142,7 +156,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let cfg_proxy = Arc::clone(&cfg_snapshot);
         proxy::start_proxy(
             &cfg_proxy.proxy_bind,
-            cfg_snapshot.clone(),
+            cfg.clone(),
             upstreams.clone(),
             tls_acceptor.clone(),
             waf_engine.clone(),

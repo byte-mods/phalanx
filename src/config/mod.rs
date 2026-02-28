@@ -149,6 +149,10 @@ pub struct AppConfig {
     /// Path to a CA certificate PEM file for verifying client TLS certificates (mTLS).
     /// When set, all TLS connections must present a valid client certificate.
     pub tls_ca_cert_path: Option<String>,
+    /// Optional OTLP endpoint (e.g. http://127.0.0.1:4317) for trace export.
+    pub otel_endpoint: Option<String>,
+    /// Service name to emit in OpenTelemetry resources.
+    pub otel_service_name: Option<String>,
 }
 
 impl Default for AppConfig {
@@ -204,6 +208,8 @@ impl Default for AppConfig {
             access_log_path: None,
             access_log_format: None,
             tls_ca_cert_path: None,
+            otel_endpoint: None,
+            otel_service_name: None,
         }
     }
 }
@@ -249,6 +255,17 @@ pub fn load_config(conf_path: &str) -> AppConfig {
                 }
                 if server.ssl_certificate_key.is_some() {
                     app_cfg.tls_key_path = server.ssl_certificate_key;
+                }
+                if let Some(v) = server.directives.get("tls_ca_cert_path") {
+                    app_cfg.tls_ca_cert_path = Some(v.clone());
+                } else if let Some(v) = server.directives.get("ssl_client_certificate") {
+                    app_cfg.tls_ca_cert_path = Some(v.clone());
+                }
+                if let Some(v) = server.directives.get("otel_endpoint") {
+                    app_cfg.otel_endpoint = Some(v.clone());
+                }
+                if let Some(v) = server.directives.get("otel_service_name") {
+                    app_cfg.otel_service_name = Some(v.clone());
                 }
 
                 // Parse rate limiting directives

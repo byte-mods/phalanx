@@ -1,6 +1,5 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
-use tokio::io::copy_bidirectional;
 use tokio::net::{TcpListener, TcpStream};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info};
@@ -78,7 +77,20 @@ pub async fn start_tcp_proxy(
             match TcpStream::connect(&backend.config.address).await {
                 Ok(mut server_stream) => {
                     // Start streaming bytes bidirectionally: Client <-> Proxy <-> Backend
-                    match copy_bidirectional(&mut client_stream, &mut server_stream).await {
+                    #[cfg(target_os = "linux")]
+                    let res = crate::proxy::zero_copy::linux::splice_bidirectional(
+                        &mut client_stream,
+                        &mut server_stream,
+                    )
+                    .await;
+                    #[cfg(not(target_os = "linux"))]
+                    let res = crate::proxy::zero_copy::copy_bidirectional_fallback(
+                        &mut client_stream,
+                        &mut server_stream,
+                    )
+                    .await;
+
+                    match res {
                         Ok((from_client, from_server)) => {
                             debug!(
                                 "TCP Proxy completed: client sent {} bytes, server sent {} bytes",

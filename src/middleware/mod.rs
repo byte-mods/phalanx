@@ -2,7 +2,7 @@ pub mod compression;
 pub mod ratelimit;
 
 use moka::future::Cache;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tracing::debug;
 
 /// A high-performance in-memory response cache using Moka (a concurrent LFU cache).
@@ -18,6 +18,7 @@ pub struct CachedResponse {
     pub status: u16,
     pub body: bytes::Bytes,
     pub content_type: String,
+    pub expires_at: Instant,
 }
 
 impl ResponseCache {
@@ -41,14 +42,20 @@ impl ResponseCache {
     /// Attempts to retrieve a cached response.
     pub async fn get(&self, key: &str) -> Option<CachedResponse> {
         let hit = self.store.get(key).await;
-        if hit.is_some() {
+        if let Some(entry) = hit {
+            if Instant::now() >= entry.expires_at {
+                self.store.invalidate(key).await;
+                return None;
+            }
             debug!("Cache HIT: {}", key);
+            return Some(entry);
         }
-        hit
+        None
     }
 
     /// Stores a response in the cache.
-    pub async fn insert(&self, key: String, response: CachedResponse) {
+    pub async fn insert_with_ttl(&self, key: String, mut response: CachedResponse, ttl_secs: u64) {
+        response.expires_at = Instant::now() + Duration::from_secs(ttl_secs.max(1));
         debug!("Cache STORE: {} ({} bytes)", key, response.body.len());
         self.store.insert(key, response).await;
     }

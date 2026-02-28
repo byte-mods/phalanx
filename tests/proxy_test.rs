@@ -232,13 +232,15 @@ mod cache_tests {
 
         // Insert
         cache
-            .insert(
+            .insert_with_ttl(
                 key.clone(),
                 CachedResponse {
                     status: 200,
                     body: Bytes::from("cached response body"),
                     content_type: "text/plain".to_string(),
+                    expires_at: std::time::Instant::now(),
                 },
+                60,
             )
             .await;
 
