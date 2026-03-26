@@ -1,16 +1,22 @@
+pub mod api;
+
 use crate::discovery::{DiscoveredBackend, ServiceDiscovery};
+use crate::keyval::{KeyvalGetResponse, KeyvalListEntry, KeyvalSetRequest, KeyvalStore};
 use crate::routing::UpstreamManager;
 use actix_web::{App, HttpResponse, HttpServer, Responder, delete, get, post, web};
 use prometheus::{
     Encoder, HistogramOpts, HistogramVec, IntCounterVec, IntGauge, Opts, Registry, TextEncoder,
 };
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 use tracing::info;
 
 pub struct AdminState {
     pub metrics: Arc<ProxyMetrics>,
     pub discovery: Arc<ServiceDiscovery>,
     pub manager: Arc<UpstreamManager>,
+    /// Shared keyval store — injected from main at startup.
+    pub keyval: Arc<KeyvalStore>,
 }
 
 /// Global metrics registry shared across the proxy and admin server.
@@ -225,8 +231,7 @@ async fn add_backend(
         pool.add_backend(crate::config::BackendConfig {
             address: backend.address.clone(),
             weight: backend.weight,
-            health_check_path: None,
-            health_check_status: 200,
+            ..Default::default()
         });
         HttpResponse::Ok().json(serde_json::json!({"status": "added"}))
     } else {
@@ -267,6 +272,12 @@ pub async fn start_admin_server(bind_addr: String, state: AdminState) {
             .service(dashboard_ui)
             .service(add_backend)
             .service(remove_backend)
+            .service(keyval_get)
+            .service(keyval_set)
+            .service(keyval_delete)
+            .service(keyval_list)
+            .service(upstreams_detail)
+            .service(config_reload)
     })
     .bind(&bind_addr)
     .expect("Invalid admin bind address")
@@ -274,5 +285,188 @@ pub async fn start_admin_server(bind_addr: String, state: AdminState) {
 
     if let Err(e) = server.await {
         tracing::error!("Admin server error: {}", e);
+    }
+}
+
+// ─── Keyval Endpoints ─────────────────────────────────────────────────────────
+
+#[get("/api/keyval/{key}")]
+async fn keyval_get(
+    state: web::Data<AdminState>,
+    path: web::Path<String>,
+) -> impl Responder {
+    let key = path.into_inner();
+    match state.keyval.get(&key) {
+        Some(value) => HttpResponse::Ok().json(KeyvalGetResponse { key, value }),
+        None => HttpResponse::NotFound().json(serde_json::json!({ "error": "key not found" })),
+    }
+}
+
+#[post("/api/keyval/{key}")]
+async fn keyval_set(
+    state: web::Data<AdminState>,
+    path: web::Path<String>,
+    body: web::Json<KeyvalSetRequest>,
+) -> impl Responder {
+    let key = path.into_inner();
+    let req = body.into_inner();
+    state.keyval.set(key.clone(), req.value, req.ttl_secs);
+    HttpResponse::Ok().json(serde_json::json!({ "status": "ok", "key": key }))
+}
+
+#[delete("/api/keyval/{key}")]
+async fn keyval_delete(
+    state: web::Data<AdminState>,
+    path: web::Path<String>,
+) -> impl Responder {
+    let key = path.into_inner();
+    let deleted = state.keyval.delete(&key);
+    if deleted {
+        HttpResponse::Ok().json(serde_json::json!({ "status": "deleted", "key": key }))
+    } else {
+        HttpResponse::NotFound().json(serde_json::json!({ "error": "key not found" }))
+    }
+}
+
+#[get("/api/keyval")]
+async fn keyval_list(state: web::Data<AdminState>) -> impl Responder {
+    let entries: Vec<KeyvalListEntry> = state
+        .keyval
+        .list()
+        .into_iter()
+        .map(|(k, v)| KeyvalListEntry { key: k, value: v })
+        .collect();
+    HttpResponse::Ok().json(entries)
+}
+
+// ─── Upstream Detail Endpoint ────────────────────────────────────────────────
+
+#[get("/api/upstreams/detail")]
+async fn upstreams_detail(state: web::Data<AdminState>) -> impl Responder {
+    let mut pools = serde_json::Map::new();
+    // Iterate all pools via the discovery DB (all registered backends)
+    let all_backends = state.discovery.list_all_backends();
+
+    // Group by pool name from discovery
+    let mut pool_names: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for b in &all_backends {
+        pool_names.insert(b.pool.clone());
+    }
+
+    // Also add pools from the routing manager
+    for pool_entry in state.manager.inner_pools() {
+        let pool_name = pool_entry.0;
+        let pool = pool_entry.1;
+        let backends_snap = pool.backends.load();
+        let backends_json: Vec<serde_json::Value> = backends_snap
+            .iter()
+            .map(|b| {
+                serde_json::json!({
+                    "address": b.config.address,
+                    "healthy": b.is_healthy.load(Ordering::Relaxed),
+                    "active_conns": b.active_connections.load(Ordering::Relaxed),
+                    "weight": b.config.weight,
+                })
+            })
+            .collect();
+        pools.insert(pool_name, serde_json::json!({ "backends": backends_json }));
+    }
+
+    HttpResponse::Ok().json(pools)
+}
+
+// ─── Config Reload ────────────────────────────────────────────────────────────
+
+#[post("/api/reload")]
+async fn config_reload() -> impl Responder {
+    // Signal a config reload via SIGHUP (Unix only)
+    #[cfg(unix)]
+    {
+        use std::os::raw::c_int;
+        unsafe extern "C" {
+            fn getpid() -> u32;
+            fn kill(pid: u32, sig: c_int) -> c_int;
+        }
+        let sighup: c_int = 1; // SIGHUP = 1
+        unsafe { kill(getpid(), sighup); }
+        return HttpResponse::Ok().json(serde_json::json!({ "status": "reload signaled" }));
+    }
+    #[cfg(not(unix))]
+    HttpResponse::Ok().json(serde_json::json!({ "status": "reload not supported on this platform" }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_proxy_metrics_creation() {
+        let metrics = ProxyMetrics::new();
+        assert_eq!(metrics.active_connections.get(), 0);
+    }
+
+    #[test]
+    fn test_proxy_metrics_encode_not_empty() {
+        let metrics = ProxyMetrics::new();
+        let encoded = metrics.encode();
+        assert!(!encoded.is_empty());
+    }
+
+    #[test]
+    fn test_proxy_metrics_counter_increment() {
+        let metrics = ProxyMetrics::new();
+        metrics
+            .http_requests_total
+            .with_label_values(&["GET", "200", "default"])
+            .inc();
+        let encoded = metrics.encode();
+        assert!(encoded.contains("phalanx_http_requests_total"));
+    }
+
+    #[test]
+    fn test_proxy_metrics_gauge() {
+        let metrics = ProxyMetrics::new();
+        metrics.active_connections.inc();
+        metrics.active_connections.inc();
+        assert_eq!(metrics.active_connections.get(), 2);
+        metrics.active_connections.dec();
+        assert_eq!(metrics.active_connections.get(), 1);
+    }
+
+    #[test]
+    fn test_proxy_metrics_histogram() {
+        let metrics = ProxyMetrics::new();
+        metrics
+            .http_request_duration
+            .with_label_values(&["GET", "default"])
+            .observe(0.05);
+        let encoded = metrics.encode();
+        assert!(encoded.contains("phalanx_http_request_duration_seconds"));
+    }
+
+    #[test]
+    fn test_proxy_metrics_waf_blocks() {
+        let metrics = ProxyMetrics::new();
+        metrics
+            .waf_blocks_total
+            .with_label_values(&["sqli"])
+            .inc_by(3);
+        let encoded = metrics.encode();
+        assert!(encoded.contains("phalanx_waf_blocks_total"));
+    }
+
+    #[test]
+    fn test_proxy_metrics_cache_hits() {
+        let metrics = ProxyMetrics::new();
+        metrics
+            .cache_hits_total
+            .with_label_values(&["hit"])
+            .inc();
+        metrics
+            .cache_hits_total
+            .with_label_values(&["miss"])
+            .inc_by(5);
+        let encoded = metrics.encode();
+        assert!(encoded.contains("phalanx_cache_total"));
     }
 }

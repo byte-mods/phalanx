@@ -1,11 +1,16 @@
 pub mod admin;
 pub mod ai;
 pub mod auth;
+pub mod cluster;
 pub mod config;
 pub mod discovery;
+pub mod geo;
+pub mod keyval;
+pub mod mail;
 pub mod middleware;
 pub mod proxy;
 pub mod reload;
 pub mod routing;
+pub mod scripting;
 pub mod telemetry;
 pub mod waf;

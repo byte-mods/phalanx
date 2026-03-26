@@ -16,17 +16,25 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
-use arc_swap::ArcSwap;
 use crate::middleware::CachedResponse;
 use crate::middleware::compression;
+use arc_swap::ArcSwap;
 
 pub mod executor;
 pub mod fastcgi;
+pub mod grpc_web;
+pub mod http3;
+pub mod mirror;
+pub mod ocsp;
 pub mod pool;
+pub mod proxy_proto_v2;
+pub mod realip;
 pub mod rewrite;
 pub mod router;
+pub mod sticky;
 pub mod tcp;
 pub mod tls;
+pub mod udp;
 pub mod uwsgi;
 pub mod zero_copy;
 
@@ -146,6 +154,7 @@ pub async fn start_proxy(
     rate_limiter: Arc<crate::middleware::ratelimit::PhalanxRateLimiter>,
     _ai_engine: Arc<dyn AiRouter>,
     cache: Arc<ResponseCache>,
+    hook_engine: Arc<crate::scripting::HookEngine>,
     metrics: Arc<ProxyMetrics>,
     access_logger: Arc<AccessLogger>,
     shutdown: CancellationToken,
@@ -180,12 +189,40 @@ pub async fn start_proxy(
         let ai_spawn_clone = Arc::clone(&_ai_engine);
         let rl_clone = Arc::clone(&rate_limiter);
         let cache_clone = Arc::clone(&cache);
+        let hook_clone = Arc::clone(&hook_engine);
         let metrics_clone = Arc::clone(&metrics);
         let logger_clone = Arc::clone(&access_logger);
 
         // Spawn a new green thread per connection (Tokio task)
         tokio::spawn(async move {
+            // ── PROXY Protocol v2 detection ──────────────────────────────────
+            // Read up to 232 bytes (max PP2 fixed header + IPv6 address block)
+            // without consuming bytes needed by the protocol sniffer below.
+            let mut pp2_peek = [0u8; 232];
+            let n = match tokio::io::AsyncReadExt::read(&mut stream, &mut pp2_peek).await {
+                Ok(0) | Err(_) => return, // connection closed immediately
+                Ok(n) => n,
+            };
+
+            // Try to parse as PROXY Protocol v2. On success, override `peer` with
+            // the real source address. On failure/mismatch, put all bytes back.
+            let (real_peer, remaining_bytes) =
+                match proxy_proto_v2::parse_v2_header(&pp2_peek[..n]) {
+                    Ok((hdr, consumed)) => {
+                        let real_peer = hdr.src_addr.unwrap_or(peer);
+                        (real_peer, &pp2_peek[consumed..n])
+                    }
+                    Err(proxy_proto_v2::ParseError::NotProxyProtocol) => {
+                        // Not a PP2 connection — treat all peeked bytes as normal traffic
+                        (peer, &pp2_peek[..n])
+                    }
+                    Err(_) => return, // Malformed PP2 header — drop the connection
+                };
+            let peer = real_peer;
+
             let mut prefix_buf = BytesMut::with_capacity(64);
+            prefix_buf.extend_from_slice(remaining_bytes);
+
             // Wait to receive the first few bytes to guess the protocol
             let proto = match router::sniff_protocol(&mut stream, &mut prefix_buf).await {
                 Ok(p) => p,
@@ -241,6 +278,7 @@ pub async fn start_proxy(
                         let waf_svc = Arc::clone(&waf_spawn_clone);
                         let ai_svc = Arc::clone(&ai_spawn_clone);
                         let cache_svc = Arc::clone(&cache_clone);
+                        let hook_svc = Arc::clone(&hook_clone);
                         let metrics_svc = Arc::clone(&metrics_clone);
                         let logger_svc = Arc::clone(&logger_clone);
                         async move {
@@ -252,6 +290,7 @@ pub async fn start_proxy(
                                 waf_svc,
                                 ai_svc,
                                 cache_svc,
+                                hook_svc,
                                 metrics_svc,
                                 logger_svc,
                             )
@@ -272,6 +311,7 @@ pub async fn start_proxy(
                         let waf_svc = Arc::clone(&waf_spawn_clone);
                         let ai_svc = Arc::clone(&ai_spawn_clone);
                         let cache_svc = Arc::clone(&cache_clone);
+                        let hook_svc = Arc::clone(&hook_clone);
                         let metrics_svc = Arc::clone(&metrics_clone);
                         let logger_svc = Arc::clone(&logger_clone);
                         async move {
@@ -283,6 +323,7 @@ pub async fn start_proxy(
                                 waf_svc,
                                 ai_svc,
                                 cache_svc,
+                                hook_svc,
                                 metrics_svc,
                                 logger_svc,
                             )
@@ -318,6 +359,7 @@ pub async fn start_proxy(
                                         let waf_svc = Arc::clone(&waf_spawn_clone);
                                         let ai_svc = Arc::clone(&ai_spawn_clone);
                                         let cache_svc = Arc::clone(&cache_clone);
+                        let hook_svc = Arc::clone(&hook_clone);
                                         let metrics_svc = Arc::clone(&metrics_clone);
                                         let logger_svc = Arc::clone(&logger_clone);
                                         async move {
@@ -329,6 +371,7 @@ pub async fn start_proxy(
                                                 waf_svc,
                                                 ai_svc,
                                                 cache_svc,
+                                hook_svc,
                                                 metrics_svc,
                                                 logger_svc,
                                             )
@@ -350,6 +393,7 @@ pub async fn start_proxy(
                                         let waf_svc = Arc::clone(&waf_spawn_clone);
                                         let ai_svc = Arc::clone(&ai_spawn_clone);
                                         let cache_svc = Arc::clone(&cache_clone);
+                        let hook_svc = Arc::clone(&hook_clone);
                                         let metrics_svc = Arc::clone(&metrics_clone);
                                         let logger_svc = Arc::clone(&logger_clone);
                                         async move {
@@ -361,6 +405,7 @@ pub async fn start_proxy(
                                                 waf_svc,
                                                 ai_svc,
                                                 cache_svc,
+                                hook_svc,
                                                 metrics_svc,
                                                 logger_svc,
                                             )
@@ -455,6 +500,7 @@ async fn handle_http_request(
     waf: Arc<crate::waf::WafEngine>,
     ai_engine: Arc<dyn crate::ai::AiRouter>,
     cache: Arc<ResponseCache>,
+    hook_engine: Arc<crate::scripting::HookEngine>,
     metrics: Arc<ProxyMetrics>,
     access_logger: Arc<AccessLogger>,
 ) -> Result<Response<BoxBody<Bytes, hyper::Error>>, hyper::Error> {
@@ -820,6 +866,10 @@ async fn handle_http_request(
         }
         Some(ck)
     } else {
+        // Cache miss — record the miss metric even when caching is disabled/skipped
+        if route_cache && is_get && !is_websocket {
+            metrics.cache_hits_total.with_label_values(&["miss"]).inc();
+        }
         None
     };
 
@@ -849,8 +899,6 @@ async fn handle_http_request(
     }
     let (trace_id, span_id) = generate_trace_context_ids();
     crate::telemetry::otel::inject_trace_context(req.headers_mut(), &trace_id, &span_id, true);
-    let (trace_id, span_id) = generate_trace_context_ids();
-    crate::telemetry::otel::inject_trace_context(req.headers_mut(), &trace_id, &span_id, true);
 
     // 4. Forward the request to physical backend IP
     backend.active_connections.fetch_add(1, Ordering::Relaxed);
@@ -858,7 +906,11 @@ async fn handle_http_request(
     let pool_ref = Arc::clone(pool.as_ref().expect("pool presence already validated"));
 
     // Establish TCP connection to backend (using keepalive pool if enabled)
-    let stream = match pool_ref.connection_pool.acquire(&backend.config.address).await {
+    let stream = match pool_ref
+        .connection_pool
+        .acquire(&backend.config.address)
+        .await
+    {
         Ok(s) => s,
         Err(e) => {
             error!(
@@ -998,8 +1050,9 @@ async fn handle_http_request(
             };
 
             let body_len = body_bytes.len();
-            let should_compress =
-                should_compress && body_len >= route_gzip_min.max(crate::middleware::compression::MIN_COMPRESS_SIZE);
+            let should_compress = should_compress
+                && body_len
+                    >= route_gzip_min.max(crate::middleware::compression::MIN_COMPRESS_SIZE);
 
             // ── Cache Store: cache GET 200 responses ──
             if should_cache {
@@ -1095,6 +1148,8 @@ async fn handle_http_request(
         }
         Err(e) => {
             error!("Failed to proxy request to backend {}: {}", backend_addr, e);
+            // Passive health check: record this failure against the backend
+            backend.record_failure();
 
             // Log the error in access log
             access_logger.log(AccessLogEntry {
@@ -1117,6 +1172,7 @@ async fn handle_http_request(
 }
 
 /// The main worker function for HTTP/2.x and gRPC traffic.
+/// Now has full parity with HTTP/1: rewrites, auth, gzip/brotli, cache.
 async fn handle_http2_request(
     req: Request<hyper::body::Incoming>,
     _peer: SocketAddr,
@@ -1125,14 +1181,14 @@ async fn handle_http2_request(
     waf: Arc<crate::waf::WafEngine>,
     ai_engine: Arc<dyn crate::ai::AiRouter>,
     cache: Arc<ResponseCache>,
+    hook_engine: Arc<crate::scripting::HookEngine>,
     metrics: Arc<ProxyMetrics>,
     access_logger: Arc<AccessLogger>,
 ) -> Result<Response<BoxBody<Bytes, hyper::Error>>, hyper::Error> {
     let app_config = app_config.load_full();
 
-    let path = req.uri().path().to_string();
+    let mut path = req.uri().path().to_string();
 
-    // Detect gRPC traffic via content-type header
     let is_grpc = req
         .headers()
         .get(hyper::header::CONTENT_TYPE)
@@ -1148,7 +1204,6 @@ async fn handle_http2_request(
 
     let start_time = std::time::Instant::now();
     let method_str = req.method().to_string();
-    let _ = &cache; // use cache (reserved for future H2 cache integration)
 
     // 0. WAF Inspection
     let ip_str = _peer.ip().to_string();
@@ -1158,11 +1213,18 @@ async fn handle_http2_request(
         .get(hyper::header::USER_AGENT)
         .and_then(|v| v.to_str().ok());
 
+    let client_accepts_gzip = compression::accepts_gzip(
+        req.headers()
+            .get(hyper::header::ACCEPT_ENCODING)
+            .and_then(|v| v.to_str().ok()),
+    );
+
     let waf_enabled = app_config.waf_enabled.unwrap_or(false);
     if waf_enabled {
         if let crate::waf::WafAction::Block(reason) = waf.inspect(&ip_str, &path, query, user_agent)
         {
             warn!("WAF blocked HTTP/2 request from {}: {}", ip_str, reason);
+            metrics.waf_blocks_total.with_label_values(&[&reason]).inc();
             return Ok(empty_response(hyper::StatusCode::FORBIDDEN));
         }
     }
@@ -1178,13 +1240,64 @@ async fn handle_http2_request(
     if waf_enabled && !body_bytes.is_empty() {
         let body_text = String::from_utf8_lossy(&body_bytes);
         if let crate::waf::WafAction::Block(reason) = waf.inspect_body(&ip_str, &body_text) {
-            warn!("WAF blocked HTTP/2 request body from {}: {}", ip_str, reason);
+            warn!(
+                "WAF blocked HTTP/2 request body from {}: {}",
+                ip_str, reason
+            );
             return Ok(empty_response(hyper::StatusCode::FORBIDDEN));
         }
     }
     let mut req = Request::from_parts(parts, Full::new(body_bytes));
 
-    // 1. Prefix path routing matching Nginx-like config
+    // ── Rewrite Engine (parity with HTTP/1) ──
+    'rewrite: loop {
+        let mut best_match: Option<(&String, &crate::config::RouteConfig)> = None;
+        let mut best_len = 0usize;
+        for (r_path, r_config) in &app_config.routes {
+            if path.starts_with(r_path.as_str()) && r_path.len() > best_len {
+                best_match = Some((r_path, r_config));
+                best_len = r_path.len();
+            }
+        }
+        if let Some((_r_path, r_config)) = best_match {
+            if !r_config.rewrite_rules.is_empty() {
+                let rules = compile_rules(&r_config.rewrite_rules);
+                match apply_rewrites(&rules, &path) {
+                    RewriteResult::Redirect { status, location } => {
+                        let mut resp = Response::new(
+                            http_body_util::Empty::new()
+                                .map_err(|_| unreachable!())
+                                .boxed(),
+                        );
+                        *resp.status_mut() = status;
+                        resp.headers_mut().insert(
+                            hyper::header::LOCATION,
+                            location.parse().unwrap_or_else(|_| "/".parse().unwrap()),
+                        );
+                        return Ok(resp);
+                    }
+                    RewriteResult::Rewritten {
+                        new_uri,
+                        restart_routing: true,
+                    } => {
+                        path = new_uri;
+                        continue 'rewrite;
+                    }
+                    RewriteResult::Rewritten {
+                        new_uri,
+                        restart_routing: false,
+                    } => {
+                        path = new_uri;
+                        break 'rewrite;
+                    }
+                    RewriteResult::NoMatch => {}
+                }
+            }
+        }
+        break 'rewrite;
+    }
+
+    // 1. Prefix path routing
     let route = {
         let mut best_match = None;
         let mut best_len = 0;
@@ -1197,7 +1310,95 @@ async fn handle_http2_request(
         best_match.or_else(|| app_config.routes.get_key_value("/"))
     };
 
-    // Extract Host Header to fallback if no specific path match is found
+    // ── Authentication Middleware (parity with HTTP/1) ──
+    if let Some((_r_path, r_config)) = route {
+        use crate::auth::AuthResult;
+
+        if let Some(ref realm) = r_config.auth_basic_realm {
+            match crate::auth::basic::check(req.headers(), realm, &r_config.auth_basic_users) {
+                AuthResult::Allowed => {}
+                AuthResult::Denied(status, msg) => {
+                    let mut resp = Response::new(
+                        http_body_util::Full::new(Bytes::from(msg))
+                            .map_err(|_| unreachable!())
+                            .boxed(),
+                    );
+                    *resp.status_mut() = status;
+                    resp.headers_mut().insert(
+                        hyper::header::WWW_AUTHENTICATE,
+                        crate::auth::basic::www_authenticate_header(realm)
+                            .parse()
+                            .unwrap(),
+                    );
+                    return Ok(resp);
+                }
+            }
+        } else if let Some(ref secret) = r_config.auth_jwt_secret {
+            let algorithm = r_config.auth_jwt_algorithm.as_deref().unwrap_or("HS256");
+            let (result, claims) = crate::auth::jwt::check(req.headers(), secret, algorithm);
+            match result {
+                AuthResult::Allowed => {
+                    if let Some(ref c) = claims {
+                        for (k, v) in crate::auth::jwt::claims_to_headers(c) {
+                            if let (Ok(name), Ok(val)) = (
+                                hyper::header::HeaderName::from_bytes(k.as_bytes()),
+                                v.parse::<hyper::header::HeaderValue>(),
+                            ) {
+                                req.headers_mut().insert(name, val);
+                            }
+                        }
+                    }
+                }
+                AuthResult::Denied(status, msg) => {
+                    let mut resp = Response::new(
+                        http_body_util::Full::new(Bytes::from(msg))
+                            .map_err(|_| unreachable!())
+                            .boxed(),
+                    );
+                    *resp.status_mut() = status;
+                    resp.headers_mut()
+                        .insert(hyper::header::WWW_AUTHENTICATE, "Bearer".parse().unwrap());
+                    return Ok(resp);
+                }
+            }
+        } else if let Some(ref introspect_url) = r_config.auth_oauth_introspect_url {
+            let client_id = r_config.auth_oauth_client_id.as_deref().unwrap_or("");
+            let client_secret = r_config.auth_oauth_client_secret.as_deref().unwrap_or("");
+            use std::sync::OnceLock;
+            static OAUTH_CACHE_H2: OnceLock<crate::auth::oauth::OAuthCache> = OnceLock::new();
+            let oauth_cache = OAUTH_CACHE_H2.get_or_init(crate::auth::oauth::new_cache);
+            let (result, sub) = crate::auth::oauth::check(
+                req.headers(),
+                introspect_url,
+                client_id,
+                client_secret,
+                oauth_cache,
+            )
+            .await;
+            match result {
+                AuthResult::Allowed => {
+                    if let Some(sub_val) = sub {
+                        if let Ok(val) = sub_val.parse::<hyper::header::HeaderValue>() {
+                            req.headers_mut()
+                                .insert(hyper::header::HeaderName::from_static("x-auth-sub"), val);
+                        }
+                    }
+                }
+                AuthResult::Denied(status, msg) => {
+                    let mut resp = Response::new(
+                        http_body_util::Full::new(Bytes::from(msg))
+                            .map_err(|_| unreachable!())
+                            .boxed(),
+                    );
+                    *resp.status_mut() = status;
+                    resp.headers_mut()
+                        .insert(hyper::header::WWW_AUTHENTICATE, "Bearer".parse().unwrap());
+                    return Ok(resp);
+                }
+            }
+        }
+    }
+
     let host = req
         .headers()
         .get(hyper::header::HOST)
@@ -1205,10 +1406,21 @@ async fn handle_http2_request(
         .unwrap_or("default");
     let host_name = host.split(':').next().unwrap_or("default");
 
+    // ── Resolve gzip + cache flags from matched route config ──
+    let (route_gzip, route_gzip_min, route_cache, route_cache_ttl) = match route {
+        Some((_, r)) => (
+            r.gzip,
+            r.gzip_min_length,
+            r.proxy_cache,
+            r.proxy_cache_valid_secs,
+        ),
+        None => (false, 1024, false, 60),
+    };
+    let accepts_gzip = client_accepts_gzip && route_gzip;
+
     let pool_name = match route {
         Some((r_path, r)) => {
             if let Some(ref root_path) = r.root {
-                // If a root directory is configured, serve static files directly!
                 let res = serve_static_file(
                     r_path,
                     &path,
@@ -1245,7 +1457,6 @@ async fn handle_http2_request(
                 return res.map(|r| {
                     r.map(|b| {
                         b.map_err(|_e| {
-                            // Convert fastcgi error
                             panic!("hyper::Error conversion bypassed on proxy stream failure");
                         })
                         .boxed()
@@ -1267,7 +1478,6 @@ async fn handle_http2_request(
                 return res.map(|r| {
                     r.map(|b| {
                         b.map_err(|_e| {
-                            // Convert uwsgi error
                             panic!("hyper::Error conversion bypassed on proxy stream failure");
                         })
                         .boxed()
@@ -1278,6 +1488,37 @@ async fn handle_http2_request(
             r.upstream.clone().unwrap_or_else(|| host_name.to_string())
         }
         None => host_name.to_string(),
+    };
+
+    // ── Response Cache: lookup for GET requests ──
+    let is_get = method_str == "GET";
+    let cache_key = if route_cache && is_get {
+        let ck = ResponseCache::cache_key("GET", host_name, &path, req.uri().query());
+        if let Some(cached) = cache.get(&ck).await {
+            debug!("H2 Cache HIT for {}", ck);
+            metrics.cache_hits_total.with_label_values(&["hit"]).inc();
+            let body = Full::new(cached.body)
+                .map_err(|never| match never {})
+                .boxed();
+            let mut resp = Response::builder()
+                .status(cached.status)
+                .body(body)
+                .unwrap();
+            resp.headers_mut().insert(
+                hyper::header::CONTENT_TYPE,
+                hyper::header::HeaderValue::from_str(&cached.content_type).unwrap_or_else(|_| {
+                    hyper::header::HeaderValue::from_static("application/octet-stream")
+                }),
+            );
+            resp.headers_mut().insert(
+                hyper::header::HeaderName::from_static("x-phalanx-cache"),
+                hyper::header::HeaderValue::from_static("HIT"),
+            );
+            return Ok(resp);
+        }
+        Some(ck)
+    } else {
+        None
     };
 
     // 2. Fetch healthy backend from pool manager
@@ -1308,7 +1549,6 @@ async fn handle_http2_request(
     // 4. Forward the request to physical backend IP
     backend.active_connections.fetch_add(1, Ordering::Relaxed);
 
-    // Establish TCP connection to backend
     let stream = match TcpStream::connect(&backend.config.address).await {
         Ok(s) => s,
         Err(e) => {
@@ -1323,7 +1563,6 @@ async fn handle_http2_request(
 
     let io = TokioIo::new(stream);
 
-    // Perform hyper client handshake over the TCP connection using http2
     let (mut sender, conn) =
         match hyper::client::conn::http2::handshake(executor::TokioExecutor, io).await {
             Ok(handshake) => handshake,
@@ -1337,30 +1576,25 @@ async fn handle_http2_request(
             }
         };
 
-    // Spawn the hyper connection driver task to manage IO asynchronously
     tokio::spawn(async move {
         if let Err(e) = conn.await {
             debug!("Backend HTTP/2 connection error: {:?}", e);
         }
     });
 
-    // Send the proxy request
     let res = sender.send_request(req).await;
-    // Client has responded locally, decrement active proxy connection count
     backend.active_connections.fetch_sub(1, Ordering::Relaxed);
 
     let backend_addr = backend.config.address.clone();
 
     match res {
         Ok(mut response) => {
-            // Train AI Router
             let latency = start_time.elapsed().as_millis() as u64;
             let is_error = response.status().is_server_error();
             ai_engine.update_score(&backend_addr, latency, is_error);
 
             let status_code = response.status().as_u16();
 
-            // gRPC-specific metrics
             if is_grpc {
                 let grpc_status = response
                     .headers()
@@ -1382,8 +1616,100 @@ async fn handle_http2_request(
                     .with_label_values(&[method_str.as_str(), status_str.as_str(), &pool_name])
                     .inc();
             }
+            metrics
+                .http_request_duration
+                .with_label_values(&[method_str.as_str(), &pool_name])
+                .observe(start_time.elapsed().as_secs_f64());
 
-            // Structured Access Log
+            // 5. Response Header Injection Phase
+            if let Some((_, r)) = route {
+                for (k, v) in &r.add_headers {
+                    if let (Ok(hk), Ok(hv)) = (
+                        hyper::header::HeaderName::from_bytes(k.as_bytes()),
+                        hyper::header::HeaderValue::from_str(v),
+                    ) {
+                        response.headers_mut().insert(hk, hv);
+                    }
+                }
+            }
+
+            // 6. Collect body for cache + compression
+            let content_type = response
+                .headers()
+                .get(hyper::header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("")
+                .to_string();
+
+            let should_compress = accepts_gzip && compression::is_compressible(Some(&content_type));
+            let should_cache = cache_key.is_some() && status_code == 200;
+
+            let body_bytes = match http_body_util::BodyExt::collect(response.body_mut()).await {
+                Ok(collected) => collected.to_bytes(),
+                Err(_) => {
+                    return Ok(empty_response(hyper::StatusCode::BAD_GATEWAY));
+                }
+            };
+
+            let body_len = body_bytes.len();
+            let should_compress = should_compress
+                && body_len >= route_gzip_min.max(crate::middleware::compression::MIN_COMPRESS_SIZE);
+
+            // ── Cache Store ──
+            if should_cache {
+                if let Some(ref ck) = cache_key {
+                    cache
+                        .insert_with_ttl(
+                            ck.clone(),
+                            CachedResponse {
+                                status: status_code,
+                                body: body_bytes.clone(),
+                                content_type: content_type.clone(),
+                                expires_at: std::time::Instant::now(),
+                            },
+                            route_cache_ttl,
+                        )
+                        .await;
+                }
+            }
+
+            // ── Compression ──
+            let (final_body, is_compressed) = if should_compress {
+                match compression::gzip_compress(&body_bytes) {
+                    Some(compressed) => (compressed, true),
+                    None => (body_bytes, false),
+                }
+            } else {
+                (body_bytes, false)
+            };
+
+            let mut final_resp = Response::builder()
+                .status(status_code)
+                .body(
+                    Full::new(final_body)
+                        .map_err(|never| match never {})
+                        .boxed(),
+                )
+                .unwrap();
+
+            for (key, value) in response.headers().iter() {
+                final_resp.headers_mut().insert(key.clone(), value.clone());
+            }
+
+            if is_compressed {
+                final_resp.headers_mut().insert(
+                    hyper::header::CONTENT_ENCODING,
+                    hyper::header::HeaderValue::from_static("gzip"),
+                );
+                final_resp.headers_mut().insert(
+                    hyper::header::HeaderName::from_static("vary"),
+                    hyper::header::HeaderValue::from_static("Accept-Encoding"),
+                );
+                final_resp
+                    .headers_mut()
+                    .remove(hyper::header::CONTENT_LENGTH);
+            }
+
             access_logger.log(AccessLogEntry {
                 timestamp: chrono_timestamp(),
                 client_ip: ip_str,
@@ -1397,37 +1723,16 @@ async fn handle_http2_request(
                 latency_ms: latency,
                 backend: backend_addr,
                 pool: pool_name.clone(),
-                bytes_sent: 0,
+                bytes_sent: body_len as u64,
                 referer: String::new(),
                 user_agent: String::new(),
             });
 
-            // 5. Response Header Injection Phase (from config)
-            if let Some((_, r)) = route {
-                for (k, v) in &r.add_headers {
-                    if let (Ok(hk), Ok(hv)) = (
-                        hyper::header::HeaderName::from_bytes(k.as_bytes()),
-                        hyper::header::HeaderValue::from_str(v),
-                    ) {
-                        response.headers_mut().insert(hk, hv);
-                    }
-                }
-            }
-
-            // Box the response body to match the uniform boxbody return type
-            let response = response.map(|body| {
-                body.map_err(|e| {
-                    // hyper::Error
-                    e
-                })
-                .boxed()
-            });
-            Ok(response)
+            Ok(final_resp)
         }
         Err(e) => {
             error!("Failed to proxy request to backend {}: {}", backend_addr, e);
 
-            // Log the error in access log
             access_logger.log(AccessLogEntry {
                 timestamp: chrono_timestamp(),
                 client_ip: ip_str,
@@ -1441,6 +1746,7 @@ async fn handle_http2_request(
                 referer: String::new(),
                 user_agent: String::new(),
             });
+            backend.record_failure();
 
             Ok(empty_response(hyper::StatusCode::BAD_GATEWAY))
         }
@@ -1642,4 +1948,90 @@ async fn serve_static_file<T>(
     );
 
     Ok(response)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_chrono_timestamp_format() {
+        let ts = chrono_timestamp();
+        assert!(ts.ends_with('Z'));
+        assert!(ts.contains('.'));
+        let parts: Vec<&str> = ts.trim_end_matches('Z').split('.').collect();
+        assert_eq!(parts.len(), 2);
+        assert!(parts[0].parse::<u64>().is_ok());
+        assert_eq!(parts[1].len(), 3);
+    }
+
+    #[test]
+    fn test_is_websocket_upgrade_true() {
+        let req = Request::builder()
+            .method("GET")
+            .uri("http://example.com/ws")
+            .header(hyper::header::UPGRADE, "websocket")
+            .header(hyper::header::CONNECTION, "Upgrade")
+            .body(Full::new(Bytes::new()))
+            .unwrap();
+        assert!(is_websocket_upgrade(&req));
+    }
+
+    #[test]
+    fn test_is_websocket_upgrade_false_no_headers() {
+        let req = Request::builder()
+            .method("GET")
+            .uri("http://example.com/api")
+            .body(Full::new(Bytes::new()))
+            .unwrap();
+        assert!(!is_websocket_upgrade(&req));
+    }
+
+    #[test]
+    fn test_is_websocket_upgrade_false_wrong_upgrade() {
+        let req = Request::builder()
+            .method("GET")
+            .uri("http://example.com/")
+            .header(hyper::header::UPGRADE, "h2c")
+            .header(hyper::header::CONNECTION, "Upgrade")
+            .body(Full::new(Bytes::new()))
+            .unwrap();
+        assert!(!is_websocket_upgrade(&req));
+    }
+
+    #[test]
+    fn test_is_websocket_upgrade_case_insensitive() {
+        let req = Request::builder()
+            .method("GET")
+            .uri("http://example.com/ws")
+            .header(hyper::header::UPGRADE, "WebSocket")
+            .header(hyper::header::CONNECTION, "upgrade")
+            .body(Full::new(Bytes::new()))
+            .unwrap();
+        assert!(is_websocket_upgrade(&req));
+    }
+
+    #[test]
+    fn test_is_websocket_connection_with_multiple_values() {
+        let req = Request::builder()
+            .method("GET")
+            .uri("http://example.com/ws")
+            .header(hyper::header::UPGRADE, "websocket")
+            .header(hyper::header::CONNECTION, "keep-alive, Upgrade")
+            .body(Full::new(Bytes::new()))
+            .unwrap();
+        assert!(is_websocket_upgrade(&req));
+    }
+
+    #[test]
+    fn test_empty_io_response_status() {
+        let resp = empty_io_response(hyper::StatusCode::NOT_FOUND);
+        assert_eq!(resp.status(), hyper::StatusCode::NOT_FOUND);
+    }
+
+    #[test]
+    fn test_empty_io_response_ok() {
+        let resp = empty_io_response(hyper::StatusCode::OK);
+        assert_eq!(resp.status(), hyper::StatusCode::OK);
+    }
 }

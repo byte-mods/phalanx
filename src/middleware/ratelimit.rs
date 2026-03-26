@@ -50,3 +50,52 @@ impl PhalanxRateLimiter {
         true
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::{IpAddr, Ipv4Addr};
+
+    #[test]
+    fn test_rate_limiter_allows_initial_requests() {
+        let limiter = PhalanxRateLimiter::new(100, 10, None);
+        let ip = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1));
+        assert!(limiter.check_ip(ip));
+    }
+
+    #[test]
+    fn test_rate_limiter_global_disabled() {
+        let limiter = PhalanxRateLimiter::new(100, 10, None);
+        assert!(!limiter.global_enabled);
+    }
+
+    #[test]
+    fn test_rate_limiter_global_enabled() {
+        let limiter = PhalanxRateLimiter::new(100, 10, Some(1000));
+        assert!(limiter.global_enabled);
+    }
+
+    #[test]
+    fn test_rate_limiter_per_ip_eventually_blocks() {
+        let limiter = PhalanxRateLimiter::new(1, 1, None);
+        let ip = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1));
+        limiter.check_ip(ip);
+        let mut blocked = false;
+        for _ in 0..100 {
+            if !limiter.check_ip(ip) {
+                blocked = true;
+                break;
+            }
+        }
+        assert!(blocked, "per-IP rate limit should eventually block");
+    }
+
+    #[test]
+    fn test_rate_limiter_different_ips_independent() {
+        let limiter = PhalanxRateLimiter::new(1, 1, None);
+        let ip1 = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1));
+        let ip2 = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2));
+        limiter.check_ip(ip1);
+        assert!(limiter.check_ip(ip2), "different IPs should not share buckets");
+    }
+}

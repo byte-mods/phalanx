@@ -38,6 +38,14 @@ pub struct UpstreamBlock {
     pub health_check_status: u16,
     /// Max idle keepalive connections per backend. 0 = disabled.
     pub keepalive: u32,
+    /// Consecutive proxy failures before marking a backend DOWN. Default: 3.
+    pub max_fails: u32,
+    /// Window in seconds for max_fails to trip the circuit. Default: 30.
+    pub fail_timeout_secs: u64,
+    /// Slow-start ramp-up seconds after recovery. 0 = disabled.
+    pub slow_start_secs: u32,
+    /// DNS SRV record name for discovery
+    pub srv_discover: Option<String>,
 }
 
 /// Represents a `server { ... }` block inside the HTTP block.
@@ -86,6 +94,12 @@ pub struct RouteBlock {
     pub gzip_min_length: usize,
     pub proxy_cache: bool,
     pub proxy_cache_valid_secs: u64,
+    // ── Brotli ────────────────────────────────────────────────────────────────
+    pub brotli: bool,
+    // ── auth_request ──────────────────────────────────────────────────────────
+    pub auth_request_url: Option<String>,
+    // ── Mirror ────────────────────────────────────────────────────────────────
+    pub mirror_pool: Option<String>,
 }
 
 /// A strict parser for a subset of Nginx configuration syntax.
@@ -486,6 +500,30 @@ fn parse_route_block(
             continue;
         }
 
+        // Parse: `brotli on;` or `brotli off;`
+        if token == "brotli" {
+            expect_directive_value_semicolon(tokens, i, "brotli")?;
+            block.brotli = tokens[i + 1].to_lowercase() == "on";
+            i += 3;
+            continue;
+        }
+
+        // Parse: `auth_request http://auth-service:8080/verify;`
+        if token == "auth_request" {
+            expect_directive_value_semicolon(tokens, i, "auth_request")?;
+            block.auth_request_url = Some(tokens[i + 1].clone());
+            i += 3;
+            continue;
+        }
+
+        // Parse: `mirror shadow_pool;`
+        if token == "mirror" {
+            expect_directive_value_semicolon(tokens, i, "mirror")?;
+            block.mirror_pool = Some(tokens[i + 1].clone());
+            i += 3;
+            continue;
+        }
+
         // If we see `key value` without a semicolon next
         if i + 1 < tokens.len() && tokens[i + 1] != "{" && tokens[i + 1] != "}" {
             if i + 2 >= tokens.len() || tokens[i + 2] != ";" {
@@ -524,11 +562,47 @@ fn parse_upstream_block(
         health_check_path: None,
         health_check_status: 200,
         keepalive: 0,
+        max_fails: 3,
+        fail_timeout_secs: 30,
+        slow_start_secs: 0,
+        srv_discover: None,
     };
     while i < tokens.len() {
         let token = &tokens[i];
         if token == "}" {
             return Ok((block, i + 1));
+        }
+
+        // Parse: `max_fails 3;`
+        if token == "max_fails" {
+            expect_directive_value_semicolon(tokens, i, "max_fails")?;
+            block.max_fails = tokens[i + 1].parse().unwrap_or(3);
+            i += 3;
+            continue;
+        }
+
+        // Parse: `srv_discover _http._tcp.local;`
+        if token == "srv_discover" {
+            expect_directive_value_semicolon(tokens, i, "srv_discover")?;
+            block.srv_discover = Some(tokens[i + 1].clone());
+            i += 3;
+            continue;
+        }
+
+        // Parse: `fail_timeout 30;`
+        if token == "fail_timeout" {
+            expect_directive_value_semicolon(tokens, i, "fail_timeout")?;
+            block.fail_timeout_secs = tokens[i + 1].parse().unwrap_or(30);
+            i += 3;
+            continue;
+        }
+
+        // Parse: `slow_start 30;`
+        if token == "slow_start" {
+            expect_directive_value_semicolon(tokens, i, "slow_start")?;
+            block.slow_start_secs = tokens[i + 1].parse().unwrap_or(0);
+            i += 3;
+            continue;
         }
 
         // Parse: `server 127.0.0.1:8081 weight=3;` or `server 127.0.0.1:8081;`

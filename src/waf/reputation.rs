@@ -61,3 +61,65 @@ impl IpReputationManager {
         self.strikes.get(ip).map(|e| e.0).unwrap_or(0)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_initial_state_no_strikes() {
+        let mgr = IpReputationManager::new(5, 60);
+        assert_eq!(mgr.get_strikes("1.2.3.4"), 0);
+        assert!(!mgr.is_banned("1.2.3.4"));
+    }
+
+    #[test]
+    fn test_add_strike_increments() {
+        let mgr = IpReputationManager::new(10, 60);
+        mgr.add_strike("1.2.3.4", 3);
+        assert_eq!(mgr.get_strikes("1.2.3.4"), 3);
+        mgr.add_strike("1.2.3.4", 2);
+        assert_eq!(mgr.get_strikes("1.2.3.4"), 5);
+    }
+
+    #[test]
+    fn test_ban_threshold_reached() {
+        let mgr = IpReputationManager::new(5, 3600);
+        for _ in 0..5 {
+            mgr.add_strike("evil", 1);
+        }
+        assert!(mgr.is_banned("evil"));
+    }
+
+    #[test]
+    fn test_below_ban_threshold() {
+        let mgr = IpReputationManager::new(5, 3600);
+        mgr.add_strike("normal", 4);
+        assert!(!mgr.is_banned("normal"));
+    }
+
+    #[test]
+    fn test_ban_expiry() {
+        let mgr = IpReputationManager::new(1, 0);
+        mgr.add_strike("temp", 1);
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        assert!(!mgr.is_banned("temp"), "ban should have expired");
+        assert_eq!(mgr.get_strikes("temp"), 0, "strikes should be cleared on expiry");
+    }
+
+    #[test]
+    fn test_different_ips_independent() {
+        let mgr = IpReputationManager::new(3, 3600);
+        mgr.add_strike("a", 5);
+        mgr.add_strike("b", 1);
+        assert!(mgr.is_banned("a"));
+        assert!(!mgr.is_banned("b"));
+    }
+
+    #[test]
+    fn test_severity_multiplier() {
+        let mgr = IpReputationManager::new(10, 3600);
+        mgr.add_strike("high", 10);
+        assert!(mgr.is_banned("high"));
+    }
+}

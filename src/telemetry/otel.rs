@@ -1,4 +1,6 @@
-use tracing::{debug, info};
+use opentelemetry_otlp::WithExportConfig;
+use opentelemetry_sdk::trace::SdkTracerProvider;
+use tracing::info;
 
 /// Initializes OpenTelemetry tracing with an OTLP gRPC exporter.
 ///
@@ -6,67 +8,53 @@ use tracing::{debug, info};
 /// this sets up trace context propagation (W3C `traceparent` header) and
 /// exports spans to a collector like Jaeger, Tempo, or Datadog.
 ///
-/// # Integration
-///
-/// Traces are automatically created for each proxied request via the
-/// `tracing` instrumentation already in the proxy handlers. The OTLP
-/// exporter runs in a background task and batches span exports.
-///
 /// # Usage in phalanx.conf
 ///
 /// ```text
 /// otel_endpoint http://localhost:4317;
 /// otel_service_name phalanx-lb;
 /// ```
-pub fn init_otel_layer(endpoint: &str, service_name: &str) -> Option<()> {
+///
+/// # Returns
+/// `Some(SdkTracerProvider)` on success. Caller must keep the provider alive for the
+/// process lifetime — dropping it flushes and shuts down the exporter.
+pub fn init_otel_layer(endpoint: &str, service_name: &str) -> Option<SdkTracerProvider> {
     info!(
-        "OpenTelemetry OTLP exporter configured: endpoint={}, service={}",
+        "OpenTelemetry OTLP exporter initializing: endpoint={}, service={}",
         endpoint, service_name
     );
 
-    // NOTE: Full OTLP integration requires:
-    //   opentelemetry = { version = "0.31", features = ["trace"] }
-    //   opentelemetry-otlp = "0.31"
-    //   opentelemetry-sdk = "0.31"
-    //   tracing-opentelemetry = "0.31"
-    //
-    // The pipeline initialization code:
-    //
-    // ```rust
-    // use opentelemetry::trace::TracerProvider;
-    // use opentelemetry_otlp::WithExportConfig;
-    // use opentelemetry_sdk::trace::SdkTracerProvider;
-    //
-    // let exporter = opentelemetry_otlp::SpanExporter::builder()
-    //     .with_tonic()
-    //     .with_endpoint(endpoint)
-    //     .build()
-    //     .ok()?;
-    //
-    // let provider = SdkTracerProvider::builder()
-    //     .with_batch_exporter(exporter)
-    //     .with_resource(opentelemetry_sdk::Resource::builder()
-    //         .with_service_name(service_name.to_string())
-    //         .build())
-    //     .build();
-    //
-    // let tracer = provider.tracer("phalanx");
-    //
-    // let otel_layer = tracing_opentelemetry::layer().with_tracer(tracer);
-    // ```
-    //
-    // The otel_layer would be added to the tracing subscriber in telemetry/mod.rs:
-    //   subscriber.with(otel_layer)
-    //
-    // For now, we log that OTLP is configured but don't pull in the heavy
-    // opentelemetry-otlp SDK dependency until an actual collector is needed.
+    // Build the OTLP span exporter (gRPC / tonic)
+    let exporter = opentelemetry_otlp::SpanExporter::builder()
+        .with_tonic()
+        .with_endpoint(endpoint)
+        .build()
+        .map_err(|e| {
+            tracing::error!("Failed to build OTLP exporter: {}", e);
+        })
+        .ok()?;
 
-    debug!(
-        "OpenTelemetry: traces will export to {} as service '{}'",
+    // Build the SDK tracer provider with batch export and service resource
+    let provider = SdkTracerProvider::builder()
+        .with_batch_exporter(exporter)
+        .with_resource(
+            opentelemetry_sdk::Resource::builder()
+                .with_service_name(service_name.to_string())
+                .build(),
+        )
+        .build();
+
+    // Install this tracer as the global OTel provider.
+    // After this call, any `opentelemetry::global::tracer()` calls return spans
+    // that are exported to the configured collector.
+    opentelemetry::global::set_tracer_provider(provider.clone());
+
+    info!(
+        "OpenTelemetry: traces exporting to {} as service '{}'",
         endpoint, service_name
     );
 
-    Some(())
+    Some(provider)
 }
 
 /// Injects W3C Trace Context (`traceparent`) header into outgoing proxy requests.

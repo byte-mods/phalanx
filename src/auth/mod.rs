@@ -1,6 +1,9 @@
+pub mod auth_request;
 pub mod basic;
+pub mod jwks;
 pub mod jwt;
 pub mod oauth;
+pub mod oidc;
 
 use hyper::StatusCode;
 

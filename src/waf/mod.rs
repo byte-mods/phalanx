@@ -1,7 +1,10 @@
 use std::sync::Arc;
 use tracing::{debug, warn};
 
+use crate::keyval::KeyvalStore;
+
 pub mod bot;
+pub mod policy;
 pub mod reputation;
 pub mod rules;
 
@@ -19,6 +22,8 @@ pub struct WafEngine {
     rules: Arc<WafRules>,
     reputation: Arc<IpReputationManager>,
     pub enabled: bool,
+    /// Optional keyval store: if `keyval.get(ip)` returns any value, the IP is banned.
+    keyval: Option<Arc<KeyvalStore>>,
 }
 
 /// Decodes percent-encoded URL sequences (%XX → character).
@@ -52,7 +57,15 @@ impl WafEngine {
             rules: Arc::new(WafRules::new()),
             reputation,
             enabled,
+            keyval: None,
         }
+    }
+
+    /// Attach a shared [`KeyvalStore`] for dynamic IP ban list lookups.
+    /// Any key matching the client IP (with any value) is treated as a ban.
+    pub fn with_keyval(mut self, keyval: Arc<KeyvalStore>) -> Self {
+        self.keyval = Some(keyval);
+        self
     }
 
     /// Inspects the full request context (path, query, headers, and IP).
@@ -66,6 +79,14 @@ impl WafEngine {
     ) -> WafAction {
         if !self.enabled {
             return WafAction::Allow;
+        }
+
+        // 0. Keyval dynamic ban list (highest priority — overrides all other checks)
+        if let Some(kv) = &self.keyval {
+            if kv.contains(ip) {
+                warn!("WAF Blocked: IP {} found in keyval ban list", ip);
+                return WafAction::Block("Keyval Ban List".to_string());
+            }
         }
 
         // 1. IP Reputation Check (Fastest drop)

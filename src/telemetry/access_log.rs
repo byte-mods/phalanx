@@ -124,3 +124,74 @@ impl AccessLogger {
         let _ = self.sender.send(entry);
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_log_format_from_str() {
+        assert_eq!(LogFormat::from_str("json"), LogFormat::Json);
+        assert_eq!(LogFormat::from_str("combined"), LogFormat::Combined);
+        assert_eq!(LogFormat::from_str("common"), LogFormat::Common);
+        assert_eq!(LogFormat::from_str("COMBINED"), LogFormat::Combined);
+        assert_eq!(LogFormat::from_str("unknown"), LogFormat::Json);
+        assert_eq!(LogFormat::from_str(""), LogFormat::Json);
+    }
+
+    fn sample_entry() -> AccessLogEntry {
+        AccessLogEntry {
+            timestamp: "2025-01-01T00:00:00Z".to_string(),
+            client_ip: "192.168.1.1".to_string(),
+            method: "GET".to_string(),
+            path: "/api/v1/data".to_string(),
+            status: 200,
+            latency_ms: 42,
+            backend: "10.0.0.1:8080".to_string(),
+            pool: "default".to_string(),
+            bytes_sent: 1024,
+            referer: "https://example.com".to_string(),
+            user_agent: "Mozilla/5.0".to_string(),
+        }
+    }
+
+    #[test]
+    fn test_as_combined_format() {
+        let entry = sample_entry();
+        let line = entry.as_combined();
+        assert!(line.contains("192.168.1.1"));
+        assert!(line.contains("GET /api/v1/data HTTP/1.1"));
+        assert!(line.contains("200"));
+        assert!(line.contains("1024"));
+        assert!(line.contains("Mozilla/5.0"));
+        assert!(line.contains("https://example.com"));
+    }
+
+    #[test]
+    fn test_as_common_format() {
+        let entry = sample_entry();
+        let line = entry.as_common();
+        assert!(line.contains("192.168.1.1"));
+        assert!(line.contains("GET /api/v1/data HTTP/1.1"));
+        assert!(line.contains("200"));
+        assert!(line.contains("1024"));
+        assert!(!line.contains("Mozilla"));
+    }
+
+    #[test]
+    fn test_access_log_entry_json_serialization() {
+        let entry = sample_entry();
+        let json = serde_json::to_string(&entry).unwrap();
+        assert!(json.contains("\"client_ip\":\"192.168.1.1\""));
+        assert!(json.contains("\"status\":200"));
+        assert!(json.contains("\"latency_ms\":42"));
+    }
+
+    #[test]
+    fn test_access_log_entry_fields() {
+        let entry = sample_entry();
+        assert_eq!(entry.method, "GET");
+        assert_eq!(entry.pool, "default");
+        assert_eq!(entry.bytes_sent, 1024);
+    }
+}

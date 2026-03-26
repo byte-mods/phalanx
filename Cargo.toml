@@ -9,6 +9,7 @@ anyhow = "1.0.102"
 arc-swap = "1.8.2"
 async-stream = "0.3.6"
 base64 = "0.22"
+brotli = "7"
 bytes = "1.11.1"
 consistent_hash = "0.1.4"
 criterion = "0.8.2"
@@ -30,11 +31,16 @@ mime_guess = "2.0.5"
 moka = { version = "0.12.13", features = ["future"] }
 nix = { version = "0.31.1", features = ["fs", "net"] }
 nonzero = "0.2.0"
-opentelemetry = "0.31.0"
+opentelemetry = { version = "0.31.0", features = ["trace"] }
+opentelemetry-otlp = { version = "0.31.0", features = ["tonic", "grpc-tonic"] }
+opentelemetry_sdk = { version = "0.31.0", features = ["trace", "rt-tokio"] }
+tracing-opentelemetry = "0.32.0"
 parking_lot = "0.12.5"
 prometheus = "0.14.0"
 proptest = "1.10.0"
 quinn = "0.11.9"
+h3 = "0.0.8"
+h3-quinn = "0.0.10"
 rand = "0.10.0"
 rcgen = "0.14.7"
 regex = "1.12.3"
@@ -59,3 +65,4 @@ tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.22", features = ["env-filter"] }
 tract-onnx = "0.22.0"
 trust-dns-resolver = "0.23.2"
+rhai = { version = "1", features = ["sync"] }

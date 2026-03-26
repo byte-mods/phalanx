@@ -404,3 +404,138 @@ pub fn build_ai_router(
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::BackendConfig;
+    use crate::routing::BackendNode;
+
+    fn make_backends(addrs: &[&str]) -> Vec<Arc<BackendNode>> {
+        addrs
+            .iter()
+            .map(|a| {
+                Arc::new(BackendNode::new(BackendConfig {
+                    address: a.to_string(),
+                    ..Default::default()
+                }))
+            })
+            .collect()
+    }
+
+    #[test]
+    fn test_ai_algorithm_from_str() {
+        assert_eq!(AiAlgorithm::from_str("epsilon_greedy"), AiAlgorithm::EpsilonGreedy);
+        assert_eq!(AiAlgorithm::from_str("epsilongreedy"), AiAlgorithm::EpsilonGreedy);
+        assert_eq!(AiAlgorithm::from_str("epsilon-greedy"), AiAlgorithm::EpsilonGreedy);
+        assert_eq!(AiAlgorithm::from_str("ucb1"), AiAlgorithm::Ucb1);
+        assert_eq!(AiAlgorithm::from_str("ucb"), AiAlgorithm::Ucb1);
+        assert_eq!(AiAlgorithm::from_str("softmax"), AiAlgorithm::Softmax);
+        assert_eq!(AiAlgorithm::from_str("boltzmann"), AiAlgorithm::Softmax);
+        assert_eq!(AiAlgorithm::from_str("thompson"), AiAlgorithm::ThompsonSampling);
+        assert_eq!(AiAlgorithm::from_str("thompson_sampling"), AiAlgorithm::ThompsonSampling);
+        assert_eq!(AiAlgorithm::from_str("unknown"), AiAlgorithm::EpsilonGreedy);
+    }
+
+    #[test]
+    fn test_epsilon_greedy_empty_backends() {
+        let router = EpsilonGreedyRouter::new(0.1);
+        assert!(router.predict_best_backend(&[]).is_none());
+    }
+
+    #[test]
+    fn test_epsilon_greedy_single_backend() {
+        let router = EpsilonGreedyRouter::new(0.1);
+        let backends = make_backends(&["10.0.0.1:80"]);
+        let picked = router.predict_best_backend(&backends);
+        assert!(picked.is_some());
+        assert_eq!(picked.unwrap().config.address, "10.0.0.1:80");
+    }
+
+    #[test]
+    fn test_epsilon_greedy_update_score() {
+        let router = EpsilonGreedyRouter::new(0.0);
+        router.update_score("slow", 5000, false);
+        router.update_score("fast", 10, false);
+        let backends = make_backends(&["slow", "fast"]);
+        let picked = router.predict_best_backend(&backends).unwrap();
+        assert_eq!(picked.config.address, "fast");
+    }
+
+    #[test]
+    fn test_epsilon_greedy_error_penalty() {
+        let router = EpsilonGreedyRouter::new(0.0);
+        router.update_score("ok", 50, false);
+        router.update_score("err", 50, true);
+        let backends = make_backends(&["ok", "err"]);
+        let picked = router.predict_best_backend(&backends).unwrap();
+        assert_eq!(picked.config.address, "ok");
+    }
+
+    #[test]
+    fn test_ucb1_empty_backends() {
+        let router = Ucb1Router::new(2.0);
+        assert!(router.predict_best_backend(&[]).is_none());
+    }
+
+    #[test]
+    fn test_ucb1_prefers_unexplored() {
+        let router = Ucb1Router::new(2.0);
+        router.update_score("tried", 100, false);
+        let backends = make_backends(&["tried", "untried"]);
+        let picked = router.predict_best_backend(&backends).unwrap();
+        assert_eq!(picked.config.address, "untried");
+    }
+
+    #[test]
+    fn test_softmax_empty_backends() {
+        let router = SoftmaxRouter::new(1.0);
+        assert!(router.predict_best_backend(&[]).is_none());
+    }
+
+    #[test]
+    fn test_softmax_single_backend() {
+        let router = SoftmaxRouter::new(1.0);
+        let backends = make_backends(&["only"]);
+        let picked = router.predict_best_backend(&backends).unwrap();
+        assert_eq!(picked.config.address, "only");
+    }
+
+    #[test]
+    fn test_thompson_empty_backends() {
+        let router = ThompsonSamplingRouter::new(200.0);
+        assert!(router.predict_best_backend(&[]).is_none());
+    }
+
+    #[test]
+    fn test_thompson_update_and_predict() {
+        let router = ThompsonSamplingRouter::new(200.0);
+        for _ in 0..50 {
+            router.update_score("fast", 50, false);
+            router.update_score("slow", 500, false);
+        }
+        let backends = make_backends(&["fast", "slow"]);
+        let mut fast_count = 0;
+        for _ in 0..100 {
+            let picked = router.predict_best_backend(&backends).unwrap();
+            if picked.config.address == "fast" {
+                fast_count += 1;
+            }
+        }
+        assert!(fast_count > 50, "fast backend should be preferred: picked {} times", fast_count);
+    }
+
+    #[test]
+    fn test_build_ai_router_all_types() {
+        let _ = build_ai_router(AiAlgorithm::EpsilonGreedy, 0.1, 1.0, 2.0, 200.0);
+        let _ = build_ai_router(AiAlgorithm::Ucb1, 0.1, 1.0, 2.0, 200.0);
+        let _ = build_ai_router(AiAlgorithm::Softmax, 0.1, 1.0, 2.0, 200.0);
+        let _ = build_ai_router(AiAlgorithm::ThompsonSampling, 0.1, 1.0, 2.0, 200.0);
+    }
+
+    #[test]
+    fn test_softmax_temperature_floor() {
+        let router = SoftmaxRouter::new(0.0);
+        assert!(router.temperature >= 0.001);
+    }
+}

@@ -55,7 +55,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .otel_service_name
                 .as_deref()
                 .unwrap_or("phalanx");
-            let _ = telemetry::otel::init_otel_layer(endpoint, service);
+            // Keep the provider alive for the process lifetime.
+            // Dropping it on exit triggers a final span flush to the collector.
+            let _otel_provider = telemetry::otel::init_otel_layer(endpoint, service);
         }
 
         // Setup TLS (shared, hot-reloadable)
@@ -81,6 +83,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         // Prometheus Metrics: Real counters, histograms, and gauges.
         let metrics = Arc::new(admin::ProxyMetrics::new());
+
+        // Keyval Store: In-memory DashMap-backed store with TTL (NGINX Plus keyval_zone equivalent).
+        let keyval = Arc::new(keyval::KeyvalStore::new(0));
 
         // Response Cache: Moka-based in-memory LFU cache for GET responses.
         let cache = Arc::new(middleware::ResponseCache::new(10_000, 60));
@@ -110,10 +115,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             cfg_snapshot.waf_auto_ban_threshold.unwrap_or(15),
             cfg_snapshot.waf_auto_ban_duration.unwrap_or(3600),
         ));
-        let waf_engine = Arc::new(waf::WafEngine::new(
-            true,
-            waf_reputation,
-        ));
+        let waf_engine = Arc::new(
+            waf::WafEngine::new(true, waf_reputation).with_keyval(keyval.clone()),
+        );
+
+        // Service Discovery: DNS SRV records
+        for (pool_name, pool_config) in &cfg_snapshot.upstreams {
+            if let Some(srv_name) = &pool_config.srv_discover {
+                if let Some(pool) = upstreams.get_pool(pool_name) {
+                    let template = pool_config.backends.first().cloned().unwrap_or_default();
+                    discovery::spawn_srv_watcher(pool_name.clone(), srv_name.to_string(), pool, template);
+                }
+            }
+        }
 
         // AI Inference Engine: Config-driven algorithm selection
         let ai_algorithm = ai::AiAlgorithm::from_str(
@@ -130,16 +144,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             cfg_snapshot.ai_thompson_threshold_ms.unwrap_or(100.0),
         );
 
-        // Start the Admin Server API continuously in the background
         let cfg_admin = Arc::clone(&cfg_snapshot);
         let metrics_admin = Arc::clone(&metrics);
         let discovery_admin = Arc::clone(&discovery);
         let manager_admin = Arc::clone(&upstreams);
+        let keyval_admin = Arc::clone(&keyval);
         tokio::spawn(async move {
             let admin_state = admin::AdminState {
                 metrics: metrics_admin,
                 discovery: discovery_admin,
                 manager: manager_admin,
+                keyval: keyval_admin,
             };
             admin::start_admin_server(cfg_admin.admin_bind.clone(), admin_state).await;
         });
@@ -152,7 +167,34 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             proxy::tcp::start_tcp_proxy(&cfg_tcp.tcp_bind, upstreams_tcp, shutdown_tcp).await;
         });
 
+        // Start the HTTP/3 QUIC Server (opt-in: requires `listen_quic` in phalanx.conf)
+        if let Some(ref quic_bind) = cfg_snapshot.quic_bind {
+            let quic_bind = quic_bind.clone();
+            let cfg_h3 = Arc::clone(&cfg_snapshot);
+            let upstreams_h3 = Arc::clone(&upstreams);
+            let metrics_h3 = Arc::clone(&metrics);
+            let cache_h3 = Arc::clone(&cache);
+            let ai_h3 = Arc::clone(&ai_engine);
+            let shutdown_h3 = shutdown_token.clone();
+            tokio::spawn(async move {
+                proxy::http3::start_http3_proxy(
+                    &quic_bind,
+                    cfg_h3,
+                    upstreams_h3,
+                    metrics_h3,
+                    cache_h3,
+                    ai_h3,
+                    shutdown_h3,
+                )
+                .await;
+            });
+        }
+
         // Start the Main Protocol Multiplexer Proxy (Sniffs HTTP/gRPC/TCP on the primary port)
+        let hook_engine = Arc::new(scripting::HookEngine::new());
+        // Load global/route-level rhai scripts if configured in cfg_snapshot...
+        // For now, pass a default empty engine just to make it compile.
+        
         let cfg_proxy = Arc::clone(&cfg_snapshot);
         proxy::start_proxy(
             &cfg_proxy.proxy_bind,
@@ -163,6 +205,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             rate_limiter.clone(),
             ai_engine.clone(),
             cache.clone(),
+            hook_engine.clone(),
             metrics.clone(),
             access_logger.clone(),
             shutdown_token.clone(),
