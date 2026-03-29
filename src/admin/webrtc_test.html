@@ -1,0 +1,703 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Phalanx · WebRTC SFU Test Console</title>
+    <meta name="description" content="Phalanx SFU testing console — publish and subscribe to live media streams." />
+    <style>
+        @import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap');
+
+        *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+        :root {
+            --bg-base:    #0a0b0e;
+            --bg-surface: #12141a;
+            --bg-card:    #1a1d27;
+            --bg-input:   #1e2130;
+            --border:     #2a2d3e;
+            --accent:     #6c63ff;
+            --accent-dim: #4d46c7;
+            --accent-glow:#6c63ff55;
+            --green:      #22c55e;
+            --red:        #ef4444;
+            --amber:      #f59e0b;
+            --text:       #e2e8f0;
+            --text-muted: #8892a4;
+            --radius:     12px;
+            --radius-sm:  8px;
+        }
+
+        body {
+            font-family: 'Inter', sans-serif;
+            background: var(--bg-base);
+            color: var(--text);
+            min-height: 100vh;
+            display: flex;
+            flex-direction: column;
+        }
+
+        /* ── Header ───────────────────────────────────── */
+        header {
+            padding: 20px 32px;
+            border-bottom: 1px solid var(--border);
+            background: linear-gradient(135deg, #0f1117 0%, #12141a 100%);
+            display: flex;
+            align-items: center;
+            gap: 16px;
+            position: relative;
+            overflow: hidden;
+        }
+        header::before {
+            content: '';
+            position: absolute;
+            top: -60px; left: -60px;
+            width: 200px; height: 200px;
+            background: radial-gradient(circle, var(--accent-glow) 0%, transparent 70%);
+            pointer-events: none;
+        }
+        .logo {
+            width: 38px; height: 38px;
+            border-radius: 10px;
+            background: linear-gradient(135deg, var(--accent), #8b5cf6);
+            display: flex; align-items: center; justify-content: center;
+            font-weight: 700; font-size: 16px;
+            box-shadow: 0 0 20px var(--accent-glow);
+        }
+        header h1 { font-size: 1.1rem; font-weight: 600; }
+        header h1 span { color: var(--accent); }
+        .badge {
+            margin-left: auto;
+            font-size: 0.7rem;
+            font-weight: 600;
+            padding: 4px 10px;
+            border-radius: 99px;
+            background: var(--accent-dim);
+            color: #c4c0ff;
+            letter-spacing: 0.05em;
+            text-transform: uppercase;
+        }
+
+        /* ── Layout ───────────────────────────────────── */
+        main {
+            flex: 1;
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            grid-template-rows: auto auto;
+            gap: 20px;
+            padding: 24px 32px;
+            max-width: 1400px;
+            margin: 0 auto;
+            width: 100%;
+        }
+        @media (max-width: 900px) {
+            main { grid-template-columns: 1fr; padding: 16px; }
+        }
+
+        /* ── Card ─────────────────────────────────────── */
+        .card {
+            background: var(--bg-card);
+            border: 1px solid var(--border);
+            border-radius: var(--radius);
+            overflow: hidden;
+            transition: border-color 0.2s;
+        }
+        .card:hover { border-color: #3a3d55; }
+        .card-header {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            padding: 16px 20px;
+            border-bottom: 1px solid var(--border);
+            background: linear-gradient(90deg, #1e2130 0%, var(--bg-card) 100%);
+        }
+        .card-header-icon {
+            width: 30px; height: 30px;
+            border-radius: 8px;
+            display: flex; align-items: center; justify-content: center;
+            font-size: 15px;
+        }
+        .icon-purple { background: #3b3680; }
+        .icon-green  { background: #154a2d; }
+        .icon-blue   { background: #1a3665; }
+        .icon-orange { background: #4a2f10; }
+        .card-header h2 { font-size: 0.9rem; font-weight: 600; }
+        .card-body { padding: 20px; }
+
+        /* ── Form controls ────────────────────────────── */
+        label {
+            display: block;
+            font-size: 0.78rem;
+            font-weight: 500;
+            color: var(--text-muted);
+            margin-bottom: 6px;
+            text-transform: uppercase;
+            letter-spacing: 0.04em;
+        }
+        input[type="text"] {
+            width: 100%;
+            background: var(--bg-input);
+            border: 1px solid var(--border);
+            border-radius: var(--radius-sm);
+            padding: 10px 14px;
+            color: var(--text);
+            font-family: 'Inter', sans-serif;
+            font-size: 0.9rem;
+            outline: none;
+            transition: border-color 0.2s, box-shadow 0.2s;
+        }
+        input[type="text"]:focus {
+            border-color: var(--accent);
+            box-shadow: 0 0 0 3px var(--accent-glow);
+        }
+        .form-row { margin-bottom: 14px; }
+
+        /* ── Buttons ──────────────────────────────────── */
+        button {
+            display: inline-flex;
+            align-items: center;
+            gap: 7px;
+            padding: 10px 20px;
+            border-radius: var(--radius-sm);
+            border: none;
+            cursor: pointer;
+            font-family: 'Inter', sans-serif;
+            font-size: 0.875rem;
+            font-weight: 600;
+            transition: all 0.18s ease;
+        }
+        .btn-primary {
+            background: linear-gradient(135deg, var(--accent), #8b5cf6);
+            color: #fff;
+            box-shadow: 0 4px 15px var(--accent-glow);
+        }
+        .btn-primary:hover { transform: translateY(-1px); box-shadow: 0 6px 20px var(--accent-glow); }
+        .btn-primary:active { transform: translateY(0); }
+        .btn-success {
+            background: linear-gradient(135deg, #15803d, #22c55e);
+            color: #fff;
+            box-shadow: 0 4px 15px #22c55e30;
+        }
+        .btn-success:hover { transform: translateY(-1px); }
+        .btn-danger {
+            background: linear-gradient(135deg, #7f1d1d, #ef4444);
+            color: #fff;
+            box-shadow: 0 4px 15px #ef444430;
+        }
+        .btn-danger:hover { transform: translateY(-1px); }
+        .btn-secondary {
+            background: var(--bg-input);
+            color: var(--text);
+            border: 1px solid var(--border);
+        }
+        .btn-secondary:hover { background: #252839; }
+
+        .btn-row { display: flex; gap: 10px; flex-wrap: wrap; margin-top: 16px; }
+
+        /* ── Video ────────────────────────────────────── */
+        .video-wrapper {
+            background: #000;
+            border-radius: var(--radius-sm);
+            overflow: hidden;
+            border: 1px solid var(--border);
+            position: relative;
+            margin-bottom: 16px;
+        }
+        video {
+            width: 100%;
+            display: block;
+            max-height: 280px;
+            object-fit: cover;
+            background: #0a0b0e;
+        }
+        .video-label {
+            position: absolute;
+            top: 8px; left: 8px;
+            background: #000a;
+            padding: 3px 10px;
+            border-radius: 99px;
+            font-size: 0.72rem;
+            font-weight: 600;
+            color: var(--text-muted);
+        }
+        .video-label.live { color: var(--green); }
+
+        /* ── Status indicator ─────────────────────────── */
+        .status-bar {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            font-size: 0.82rem;
+            padding: 8px 12px;
+            border-radius: var(--radius-sm);
+            background: var(--bg-input);
+            margin-bottom: 12px;
+        }
+        .dot {
+            width: 8px; height: 8px;
+            border-radius: 50%;
+            background: var(--text-muted);
+            flex-shrink: 0;
+            animation: none;
+        }
+        .dot.green  { background: var(--green); animation: pulse 2s infinite; }
+        .dot.red    { background: var(--red); }
+        .dot.amber  { background: var(--amber); animation: pulse 1s infinite; }
+        @keyframes pulse {
+            0%, 100% { opacity: 1; }
+            50%       { opacity: 0.4; }
+        }
+
+        /* ── Log ─────────────────────────────────────── */
+        .log-box {
+            background: #0d0f14;
+            border: 1px solid var(--border);
+            border-radius: var(--radius-sm);
+            padding: 12px;
+            font-family: 'JetBrains Mono', monospace;
+            font-size: 0.72rem;
+            height: 160px;
+            overflow-y: auto;
+            line-height: 1.6;
+        }
+        .log-box::-webkit-scrollbar { width: 4px; }
+        .log-box::-webkit-scrollbar-thumb { background: var(--border); border-radius: 2px; }
+        .log-entry { margin-bottom: 3px; }
+        .log-entry.info  { color: #94a3b8; }
+        .log-entry.ok    { color: var(--green); }
+        .log-entry.warn  { color: var(--amber); }
+        .log-entry.err   { color: var(--red); }
+        .log-time { color: #4b5563; margin-right: 6px; }
+
+        /* ── Rooms panel ──────────────────────────────── */
+        .rooms-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fill, minmax(180px, 1fr));
+            gap: 10px;
+            margin-top: 12px;
+        }
+        .room-chip {
+            background: var(--bg-input);
+            border: 1px solid var(--border);
+            border-radius: var(--radius-sm);
+            padding: 10px 14px;
+            display: flex;
+            flex-direction: column;
+            gap: 4px;
+        }
+        .room-chip .room-id { font-weight: 600; font-size: 0.85rem; }
+        .room-chip .room-meta { font-size: 0.73rem; color: var(--text-muted); }
+
+        /* ── Footer ───────────────────────────────────── */
+        footer {
+            padding: 14px 32px;
+            border-top: 1px solid var(--border);
+            font-size: 0.75rem;
+            color: var(--text-muted);
+            display: flex;
+            align-items: center;
+            gap: 16px;
+        }
+        footer a { color: var(--accent); text-decoration: none; }
+
+        /* ── Full-width card ──────────────────────────── */
+        .full-width { grid-column: 1 / -1; }
+    </style>
+</head>
+<body>
+
+<header>
+    <div class="logo">⚡</div>
+    <div>
+        <h1>Phalanx <span>SFU</span> Test Console</h1>
+        <p style="font-size:0.75rem;color:var(--text-muted);margin-top:2px;">WebRTC Selective Forwarding Unit · Phase 2</p>
+    </div>
+    <div class="badge">Live Dev</div>
+</header>
+
+<main>
+
+    <!-- ── Publisher Card ──────────────────────────────────────────────── -->
+    <div class="card" id="publish-card">
+        <div class="card-header">
+            <div class="card-header-icon icon-purple">📡</div>
+            <h2>Publish Stream</h2>
+        </div>
+        <div class="card-body">
+            <div id="pub-status" class="status-bar">
+                <div class="dot" id="pub-dot"></div>
+                <span id="pub-status-text">Idle — camera not started</span>
+            </div>
+
+            <div class="video-wrapper">
+                <video id="local-video" autoplay muted playsinline></video>
+                <span class="video-label" id="local-label">Local Preview</span>
+            </div>
+
+            <div class="form-row">
+                <label for="pub-room-id">Room ID</label>
+                <input type="text" id="pub-room-id" value="main" placeholder="e.g. main, room-42" />
+            </div>
+            <div class="form-row">
+                <label for="pub-peer-id">Peer ID (auto-generated)</label>
+                <input type="text" id="pub-peer-id" value="" placeholder="pub-xxxxxxxx" readonly />
+            </div>
+
+            <div class="btn-row">
+                <button class="btn-secondary" id="btn-camera" onclick="startCamera()">🎥 Start Camera</button>
+                <button class="btn-primary"   id="btn-publish" onclick="startPublish()" disabled>📤 Publish</button>
+                <button class="btn-danger"    id="btn-pub-stop" onclick="stopPublish()" disabled>⏹ Stop</button>
+            </div>
+
+            <div class="form-row" style="margin-top:16px;">
+                <label>Publish Log</label>
+                <div class="log-box" id="pub-log"></div>
+            </div>
+        </div>
+    </div>
+
+    <!-- ── Subscriber Card ─────────────────────────────────────────────── -->
+    <div class="card" id="subscribe-card">
+        <div class="card-header">
+            <div class="card-header-icon icon-green">📺</div>
+            <h2>Subscribe to Stream</h2>
+        </div>
+        <div class="card-body">
+            <div id="sub-status" class="status-bar">
+                <div class="dot" id="sub-dot"></div>
+                <span id="sub-status-text">Idle — not subscribed</span>
+            </div>
+
+            <div class="video-wrapper">
+                <video id="remote-video" autoplay playsinline></video>
+                <span class="video-label" id="remote-label">Remote Stream</span>
+            </div>
+
+            <div class="form-row">
+                <label for="sub-room-id">Room ID to join</label>
+                <input type="text" id="sub-room-id" value="main" placeholder="e.g. main" />
+            </div>
+            <div class="form-row">
+                <label for="sub-peer-id">Subscriber Peer ID</label>
+                <input type="text" id="sub-peer-id" value="" readonly />
+            </div>
+
+            <div class="btn-row">
+                <button class="btn-success" id="btn-subscribe" onclick="startSubscribe()">▶ Subscribe</button>
+                <button class="btn-danger"  id="btn-sub-stop" onclick="stopSubscribe()" disabled>⏹ Stop</button>
+            </div>
+
+            <div class="form-row" style="margin-top:16px;">
+                <label>Subscribe Log</label>
+                <div class="log-box" id="sub-log"></div>
+            </div>
+        </div>
+    </div>
+
+    <!-- ── Active Rooms Panel ─────────────────────────────────────────── -->
+    <div class="card full-width">
+        <div class="card-header">
+            <div class="card-header-icon icon-blue">🏠</div>
+            <h2>Active Rooms</h2>
+            <button class="btn-secondary" style="margin-left:auto;padding:6px 14px;font-size:0.8rem;" onclick="fetchRooms()">↺ Refresh</button>
+        </div>
+        <div class="card-body">
+            <p style="font-size:0.82rem;color:var(--text-muted);margin-bottom:4px;">Live SFU room status. Rooms are created on first publish and removed when all peers disconnect.</p>
+            <div class="rooms-grid" id="rooms-grid">
+                <p style="color:var(--text-muted);font-size:0.82rem;" id="rooms-empty">No active rooms — publish a stream to create one.</p>
+            </div>
+        </div>
+    </div>
+
+</main>
+
+<footer>
+    <span>🔒 Phalanx SFU v0.1 · WebRTC-RS</span>
+    <span>·</span>
+    <a href="/dashboard">← Back to Dashboard</a>
+    <span>·</span>
+    <span id="footer-time"></span>
+</footer>
+
+<script>
+// ── Utilities ─────────────────────────────────────────────────────────────────
+function uid() { return Math.random().toString(36).slice(2, 10); }
+function now() { return new Date().toISOString().slice(11,19); }
+
+function log(boxId, msg, level = 'info') {
+    const box = document.getElementById(boxId);
+    const el  = document.createElement('div');
+    el.className = `log-entry ${level}`;
+    el.innerHTML = `<span class="log-time">${now()}</span>${escHtml(msg)}`;
+    box.appendChild(el);
+    box.scrollTop = box.scrollHeight;
+}
+
+function escHtml(s) { return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
+
+function setStatus(prefix, dotClass, text) {
+    document.getElementById(`${prefix}-dot`).className = `dot ${dotClass}`;
+    document.getElementById(`${prefix}-status-text`).textContent = text;
+}
+
+// ── State ─────────────────────────────────────────────────────────────────────
+let localStream   = null;
+let pubPeerConn   = null;
+let subPeerConn   = null;
+
+const adminBase = window.location.origin; // Same origin as admin server
+
+// Pre-fill peer IDs
+document.getElementById('pub-peer-id').value = 'pub-' + uid();
+document.getElementById('sub-peer-id').value = 'sub-' + uid();
+
+// ── Camera Access ─────────────────────────────────────────────────────────────
+async function startCamera() {
+    try {
+        localStream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
+        document.getElementById('local-video').srcObject = localStream;
+        document.getElementById('local-label').textContent = '🔴 Live';
+        document.getElementById('local-label').className = 'video-label live';
+        document.getElementById('btn-publish').disabled = false;
+        setStatus('pub', 'amber', 'Camera ready — click Publish to start streaming');
+        log('pub-log', 'Camera & microphone captured', 'ok');
+    } catch (err) {
+        log('pub-log', `Camera error: ${err.message}`, 'err');
+        setStatus('pub', 'red', 'Camera access denied');
+    }
+}
+
+// ── Publish ───────────────────────────────────────────────────────────────────
+async function startPublish() {
+    if (!localStream) { log('pub-log', 'Start camera first!', 'warn'); return; }
+
+    const roomId  = document.getElementById('pub-room-id').value.trim() || 'main';
+    const peerId  = document.getElementById('pub-peer-id').value;
+
+    log('pub-log', `Connecting to room "${roomId}" as publisher…`);
+    setStatus('pub', 'amber', 'Negotiating…');
+
+    pubPeerConn = new RTCPeerConnection({
+        iceServers: [
+            { urls: 'stun:stun.l.google.com:19302' },
+            { urls: 'stun:stun1.l.google.com:19302' },
+        ]
+    });
+
+    // Add local tracks to the connection
+    for (const track of localStream.getTracks()) {
+        pubPeerConn.addTrack(track, localStream);
+        log('pub-log', `Added ${track.kind} track to connection`);
+    }
+
+    // Trickle ICE — send candidates to server
+    pubPeerConn.onicecandidate = async (e) => {
+        if (e.candidate) {
+            try {
+                await fetch(`${adminBase}/api/webrtc/ice/${peerId}?room=${encodeURIComponent(roomId)}`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(e.candidate),
+                });
+            } catch (_) {}
+        }
+    };
+
+    pubPeerConn.onconnectionstatechange = () => {
+        const s = pubPeerConn.connectionState;
+        log('pub-log', `Connection state: ${s}`, s === 'connected' ? 'ok' : s === 'failed' ? 'err' : 'info');
+        if (s === 'connected') setStatus('pub', 'green', `Publishing to room "${roomId}"`);
+        if (s === 'failed')    setStatus('pub', 'red', 'Connection failed');
+    };
+
+    // Create offer
+    const offer = await pubPeerConn.createOffer();
+    await pubPeerConn.setLocalDescription(offer);
+
+    log('pub-log', 'SDP offer created — sending to server…');
+
+    let response;
+    try {
+        response = await fetch(`${adminBase}/api/webrtc/publish`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                room_id: roomId,
+                peer_id: peerId,
+                sdp: offer.sdp,
+            }),
+        });
+    } catch (err) {
+        log('pub-log', `Network error: ${err.message}`, 'err');
+        setStatus('pub', 'red', 'Network error');
+        return;
+    }
+
+    if (!response.ok) {
+        const txt = await response.text();
+        log('pub-log', `Server error: ${txt}`, 'err');
+        setStatus('pub', 'red', 'Server error');
+        return;
+    }
+
+    const { sdp: answerSdp } = await response.json();
+    await pubPeerConn.setRemoteDescription({ type: 'answer', sdp: answerSdp });
+
+    log('pub-log', 'SDP answer received — ICE negotiation in progress…', 'ok');
+    document.getElementById('btn-publish').disabled  = true;
+    document.getElementById('btn-pub-stop').disabled = false;
+
+    fetchRooms();
+}
+
+async function stopPublish() {
+    if (pubPeerConn) { pubPeerConn.close(); pubPeerConn = null; }
+    if (localStream)  { localStream.getTracks().forEach(t => t.stop()); localStream = null; }
+    document.getElementById('local-video').srcObject = null;
+    document.getElementById('local-label').textContent = 'Local Preview';
+    document.getElementById('local-label').className   = 'video-label';
+    document.getElementById('btn-publish').disabled    = false;
+    document.getElementById('btn-pub-stop').disabled   = true;
+    document.getElementById('btn-camera').disabled     = false;
+    setStatus('pub', '', 'Stopped');
+    log('pub-log', 'Publish stopped', 'warn');
+    fetchRooms();
+}
+
+// ── Subscribe ─────────────────────────────────────────────────────────────────
+async function startSubscribe() {
+    const roomId = document.getElementById('sub-room-id').value.trim() || 'main';
+    const peerId = document.getElementById('sub-peer-id').value;
+
+    log('sub-log', `Subscribing to room "${roomId}"…`);
+    setStatus('sub', 'amber', 'Negotiating…');
+
+    subPeerConn = new RTCPeerConnection({
+        iceServers: [
+            { urls: 'stun:stun.l.google.com:19302' },
+            { urls: 'stun:stun1.l.google.com:19302' },
+        ]
+    });
+
+    subPeerConn.ontrack = (e) => {
+        log('sub-log', `Received remote ${e.track.kind} track`, 'ok');
+        document.getElementById('remote-video').srcObject = e.streams[0];
+        document.getElementById('remote-label').textContent = '🔴 Live';
+        document.getElementById('remote-label').className   = 'video-label live';
+    };
+
+    subPeerConn.onicecandidate = async (e) => {
+        if (e.candidate) {
+            try {
+                await fetch(`${adminBase}/api/webrtc/ice/${peerId}?room=${encodeURIComponent(roomId)}`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(e.candidate),
+                });
+            } catch (_) {}
+        }
+    };
+
+    subPeerConn.onconnectionstatechange = () => {
+        const s = subPeerConn.connectionState;
+        log('sub-log', `Connection state: ${s}`, s === 'connected' ? 'ok' : s === 'failed' ? 'err' : 'info');
+        if (s === 'connected') setStatus('sub', 'green', `Subscribed to room "${roomId}"`);
+        if (s === 'failed')    setStatus('sub', 'red', 'Connection failed');
+    };
+
+    // Request tracks from server (send offer)
+    // We add a transceiver to tell the server we want to receive video+audio
+    subPeerConn.addTransceiver('video', { direction: 'recvonly' });
+    subPeerConn.addTransceiver('audio', { direction: 'recvonly' });
+
+    const offer = await subPeerConn.createOffer();
+    await subPeerConn.setLocalDescription(offer);
+
+    log('sub-log', 'SDP offer sent to server…');
+
+    let response;
+    try {
+        response = await fetch(`${adminBase}/api/webrtc/subscribe`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                room_id: roomId,
+                peer_id: peerId,
+                sdp: offer.sdp,
+            }),
+        });
+    } catch (err) {
+        log('sub-log', `Network error: ${err.message}`, 'err');
+        setStatus('sub', 'red', 'Network error');
+        return;
+    }
+
+    if (!response.ok) {
+        const txt = await response.text();
+        log('sub-log', `Server error: ${txt}`, 'err');
+        setStatus('sub', 'red', 'Server error');
+        return;
+    }
+
+    const { sdp: answerSdp } = await response.json();
+    await subPeerConn.setRemoteDescription({ type: 'answer', sdp: answerSdp });
+
+    log('sub-log', 'SDP answer received — ICE negotiation in progress…', 'ok');
+    document.getElementById('btn-subscribe').disabled = true;
+    document.getElementById('btn-sub-stop').disabled  = false;
+
+    fetchRooms();
+}
+
+async function stopSubscribe() {
+    if (subPeerConn) { subPeerConn.close(); subPeerConn = null; }
+    document.getElementById('remote-video').srcObject = null;
+    document.getElementById('remote-label').textContent = 'Remote Stream';
+    document.getElementById('remote-label').className   = 'video-label';
+    document.getElementById('btn-subscribe').disabled = false;
+    document.getElementById('btn-sub-stop').disabled  = true;
+    setStatus('sub', '', 'Stopped');
+    log('sub-log', 'Subscription stopped', 'warn');
+    fetchRooms();
+}
+
+// ── Rooms ─────────────────────────────────────────────────────────────────────
+async function fetchRooms() {
+    try {
+        const res = await fetch(`${adminBase}/api/webrtc/rooms`);
+        if (!res.ok) return;
+        const rooms = await res.json();
+        const grid  = document.getElementById('rooms-grid');
+        const empty = document.getElementById('rooms-empty');
+
+        grid.querySelectorAll('.room-chip').forEach(c => c.remove());
+
+        if (!rooms || rooms.length === 0) {
+            empty.style.display = '';
+            return;
+        }
+        empty.style.display = 'none';
+        for (const room of rooms) {
+            const chip = document.createElement('div');
+            chip.className = 'room-chip';
+            chip.innerHTML = `
+                <div class="room-id">${escHtml(room.id)}</div>
+                <div class="room-meta">🎞 ${room.track_count} track(s) · 👤 ${room.peer_count} peer(s)</div>
+            `;
+            grid.appendChild(chip);
+        }
+    } catch (_) {
+        // Admin server may not be running — silently ignore
+    }
+}
+
+// ── Init ──────────────────────────────────────────────────────────────────────
+fetchRooms();
+setInterval(fetchRooms, 5000);
+
+setInterval(() => {
+    document.getElementById('footer-time').textContent = new Date().toLocaleTimeString();
+}, 1000);
+</script>
+</body>
+</html>

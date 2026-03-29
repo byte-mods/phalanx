@@ -36,6 +36,7 @@ pub mod tcp;
 pub mod tls;
 pub mod udp;
 pub mod uwsgi;
+pub mod webrtc;
 pub mod zero_copy;
 
 use fastcgi::serve_fastcgi;
@@ -235,7 +236,7 @@ pub async fn start_proxy(
             debug!("Sniffed Protocol: {:?} from {}", proto, peer);
 
             // Rate Limit Check — for HTTP protocols, return 429; for others, silently drop
-            if !rl_clone.check_ip(peer.ip()) {
+            if !rl_clone.check_ip(peer.ip()).await {
                 metrics_clone
                     .rate_limit_rejections
                     .with_label_values(&["ip_or_global"])
@@ -567,6 +568,21 @@ async fn handle_http_request(
             return Ok(empty_response(hyper::StatusCode::FORBIDDEN));
         }
     }
+    
+    // Dispatch request metadata to Machine Learning Fraud Engine (Async/OOB)
+    let ml_event = crate::waf::ml_fraud::MlEvent {
+        ip: ip_str.clone(),
+        method: parts.method.as_str().to_string(),
+        path: parts.uri.path().to_string(),
+        query: parts.uri.query().map(|s| s.to_string()),
+        timestamp: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs(),
+        header_count: parts.headers.len(),
+        user_agent_len: parts.headers.get(hyper::header::USER_AGENT).map(|v| v.len()).unwrap_or(0),
+        body_len: body_bytes.len(),
+        body_snippet: String::from_utf8_lossy(&body_bytes).chars().take(200).collect(),
+    };
+    waf.ml_engine.queue_inspection(ml_event);
+
     let mut req = Request::from_parts(parts, Full::new(body_bytes));
 
     // ── Rewrite Engine ────────────────────────────────────────────────────────

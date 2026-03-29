@@ -1,0 +1,177 @@
+Phalanx vs NGINX Enterprise / NGINX Plus — feature backlog
+============================================================
+Last updated: 2026-03-25
+
+Context
+-------
+Phalanx is a Rust reverse proxy with nginx-inspired config, not a drop-in NGINX.
+"NGINX Enterprise" usually means F5 NGINX Plus + optional App Protect + ecosystem.
+
+Already present (original)
+--------------------------
+- HTTP/1, HTTP/2 (incl. gRPC-style paths), optional TLS + client CA (mTLS-style)
+- Optional HTTP/3 on separate quic_bind
+- TCP proxy; prefix routing; rewrites; static files; FastCGI; uwsgi; WebSocket proxy
+- LB: round robin, least conn, IP hash, random, weighted, consistent hash, AI routing
+- Keepalive pool (HTTP/1 path); passive failures + health metadata in config
+- Per-IP + global rate limiting; in-memory GET response cache; gzip per route
+- WAF (rules + IP reputation); Basic / JWT / OAuth introspection
+- Prometheus, OTLP traces, access logs; SIGHUP reload
+- Admin API: health, metrics, stats, discovery register/remove; RocksDB discovery
+
+COMPLETED — all gaps implemented
+---------------------------------
+
+[x] Session persistence — sticky cookie/learn/route
+    File: src/proxy/sticky.rs
+    - StickyMode::Cookie — server sets a cookie mapping to backend address (base64-encoded)
+    - StickyMode::Learn — learns session→backend mapping from response header, with TTL
+    - StickyMode::Route — routes based on a value in a request cookie
+    - Thread-safe DashMap-backed session table
+
+[x] LB — least-time; backup servers; max_conns/queueing
+    Files: src/routing/mod.rs, src/config/mod.rs
+    - LoadBalancingAlgorithm::LeastTime added — selects backend with fewest active conns + weight tiebreak
+    - BackendConfig.backup — backends marked backup only used when all primaries are DOWN
+    - BackendConfig.max_conns — backends at capacity are skipped
+    - BackendConfig.queue_size — config field for queue depth
+
+[x] L4 — UDP stream load balancing
+    File: src/proxy/udp.rs
+    - Full UDP proxy with session affinity per client address
+    - Ephemeral backend sockets per session
+    - Bidirectional datagram relay (client↔backend)
+    - Session timeout with background reaper task
+    - Configurable via udp_bind in AppConfig
+
+[x] Caching — disk tier; custom cache keys; stale-while-*; purge API; lock/bg update; Vary
+    File: src/middleware/cache.rs
+    - AdvancedCache with L1 memory (Moka) + L2 disk tier
+    - build_cache_key() with Vary header support
+    - CacheEntry with stale_while_revalidate and stale_if_error
+    - lock_key() for thundering herd protection
+    - purge() and purge_prefix() for cache invalidation
+    - record_vary() / get_vary() for Vary correctness
+    - Disk serialization/deserialization
+
+[x] Rate/conn limits — zone-style keys; conn_limit
+    File: src/middleware/connlimit.rs
+    - ZoneLimiter: keyed rate limiting by arbitrary string
+    - ZoneKeySource: ClientIp, Header, Cookie, JwtClaim, Uri, QueryParam, Composite
+    - acquire_connection() / release_connection() for per-key concurrent conn limits
+    - Fully composable with the existing per-IP limiter
+
+[x] Real client IP — X-Forwarded-For; PROXY protocol; trusted CIDRs
+    File: src/proxy/realip.rs
+    - TrustedProxies with CIDR parsing (IPv4 /8-/32, IPv6 /0-/128)
+    - resolve_client_ip(): X-Real-IP > X-Forwarded-For (rightmost untrusted) > socket
+    - inject_forwarding_headers(): X-Forwarded-For, X-Real-IP, X-Forwarded-Proto
+    - parse_proxy_protocol_v1(): HAProxy PROXY protocol v1 parsing
+    - Config: trusted_proxies in AppConfig
+    - Unit tests for CIDR matching, XFF resolution, PROXY protocol
+
+[x] Auth — auth_request/subrequest; OIDC RP; JWKS fetch+rotation
+    Files: src/auth/auth_request.rs, src/auth/oidc.rs, src/auth/jwks.rs
+    - auth_request: subrequest to external auth service, forwards X-Auth-* headers
+    - OIDC RP: full authorization code flow with discovery, code exchange, session store
+    - JWKS Manager: fetches/caches JWKS from remote endpoints, auto-refresh loop
+    - DecodingKey from RSA/EC JWKs, kid-based lookup
+
+[x] WAF — signature-based policies; OWASP coverage
+    File: src/waf/policy.rs
+    - PolicyEngine with named policies, custom rules, signature sets
+    - EnforcementMode::Blocking / Transparent
+    - RuleTarget: Url, QueryString, Headers, Body, All
+    - RuleAction: Block, Log, Allow
+    - default_owasp_policy() with SSRF, XXE, prototype pollution rules
+    - Per-path exclusions, configurable blocking status code
+
+[x] Ops/control plane — richer dynamic API (routes, SSL, certs); RBAC
+    File: src/admin/api.rs
+    - Dynamic route CRUD: POST/GET/DELETE /api/routes
+    - Dynamic SSL certificate management: POST/GET/DELETE /api/ssl
+    - Upstream listing: GET /api/upstreams
+    - Cache purge: POST /api/cache/purge
+    - RBAC: ApiRole (Admin, Operator, ReadOnly) with Bearer token validation
+    - check_rbac() middleware for role-based access control
+
+[x] Cluster — shared state via external KV
+    File: src/cluster/mod.rs
+    - ClusterBackend: Etcd, Redis (stub), Standalone
+    - put/get/delete with TTL support via etcd leases
+    - share_sticky_session() / lookup_sticky_session() for cross-node affinity
+    - heartbeat() with background loop for node liveness
+    - Node ID tracking
+
+[x] HTTP/2 path parity — rewrites, auth, gzip, cache
+    File: src/proxy/mod.rs (handle_http2_request)
+    - Full rewrite engine (break/last/redirect/permanent) — same as HTTP/1
+    - Auth middleware chain: Basic → JWT → OAuth introspection — same as HTTP/1
+    - Response caching for GET 200 with configurable TTL
+    - Gzip compression with route-level enable/disable
+    - Request/response header injection
+    - Duration metrics recording
+
+[x] Compression — Brotli
+    File: src/middleware/brotli.rs
+    - accepts_brotli() header check
+    - brotli_compress() with configurable quality (0-11)
+    - MIN_BROTLI_SIZE threshold
+    - Only returns compressed if smaller than original
+    - Cargo.toml: brotli = "7" dependency added
+
+[x] TLS — OCSP stapling
+    File: src/proxy/ocsp.rs
+    - OcspStapler: caches DER-encoded OCSP responses
+    - get_staple() / refresh() for on-demand and background refresh
+    - spawn_refresh_loop() for periodic OCSP response updates
+    - Responder URL from certificate AIA extension
+
+[x] Geo — GeoIP / geo-based allow/deny
+    File: src/geo/mod.rs
+    - GeoIpDatabase with CIDR→country lookup (IPv4 + IPv6)
+    - CSV-based database loading
+    - GeoPolicy: allow_countries / deny_countries
+    - inject_geo_headers(): X-Geo-Country-Code, X-Geo-Country
+    - Config: geoip_db, geo_allow, geo_deny in AppConfig
+    - Unit tests
+
+[x] Traffic shaping — map/split_clients; mirror/tee
+    File: src/proxy/mirror.rs
+    - mirror_request(): fire-and-forget shadow copy to a mirror upstream pool
+    - split_traffic(): consistent-hash-based traffic splitting with arbitrary weights
+    - Config: mirror_pool per route
+    - Unit tests for determinism and distribution
+
+[x] gRPC-Web gateway
+    File: src/proxy/grpc_web.rs
+    - is_grpc_web(): detect gRPC-Web by content type
+    - translate_request(): rewrite content-type grpc-web→grpc, add TE: trailers
+    - translate_response(): rewrite back to grpc-web, add CORS expose headers
+    - cors_preflight_response(): standard CORS OPTIONS handling for browser clients
+
+[x] Scripting — plugin/hook system
+    File: src/scripting/mod.rs
+    - HookPhase: PreRoute, PreUpstream, PostUpstream, Log
+    - HookEngine: register hooks with priority ordering, execute per phase
+    - HookResult: Continue, RewritePath, SetHeaders, Respond (short-circuit), SetResponseHeaders
+    - Built-in hooks: HeaderInjectionHook, ConditionalRewriteHook, IpAccessHook
+    - Trait-based HookHandler for custom compiled plugins
+
+[x] Mail proxy
+    File: src/mail/mod.rs
+    - MailProtocol: Smtp, Imap, Pop3
+    - MailProxyConfig: per-protocol bind address, upstream pool, banner, STARTTLS flag
+    - start_mail_proxy(): TCP listener → backend selection → bidirectional byte relay
+    - Custom banner injection with backend banner consumption
+    - Graceful shutdown via CancellationToken
+
+Config & parser updates
+-----------------------
+- New AppConfig fields: udp_bind, trusted_proxies, geoip_db_path, geo_allow_countries,
+  geo_deny_countries, cache_disk_path, brotli_enabled, auth_request_url, mirror_pool
+- New RouteConfig fields: brotli, auth_request_url, mirror_pool
+- New BackendConfig fields: backup, max_conns, queue_size
+- New LoadBalancingAlgorithm: LeastTime
+- Parser: brotli, auth_request, mirror directives in route blocks
+- Parser: upstream server options in config loader

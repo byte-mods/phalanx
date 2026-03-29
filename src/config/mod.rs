@@ -221,6 +221,14 @@ pub struct AppConfig {
     /// Default TTL in seconds for keyval store entries. 0 = no expiry.
     #[serde(default)]
     pub keyval_ttl_secs: u64,
+    /// Auto-SSL domain to request Let's Encrypt certificates for.
+    pub auto_ssl_domain: Option<String>,
+    /// Contact email for Let's Encrypt registration.
+    pub auto_ssl_email: Option<String>,
+    /// Cache directory for Let's Encrypt certificates.
+    pub auto_ssl_cache_dir: Option<String>,
+    /// Redis connection URL for cluster state sharing.
+    pub redis_url: Option<String>,
 }
 
 impl Default for AppConfig {
@@ -293,6 +301,10 @@ impl Default for AppConfig {
             proxy_proto_v2: false,
             rhai_script: None,
             keyval_ttl_secs: 0,
+            auto_ssl_domain: None,
+            auto_ssl_email: None,
+            auto_ssl_cache_dir: None,
+            redis_url: None,
         }
     }
 }
@@ -453,6 +465,18 @@ pub fn load_config(conf_path: &str) -> AppConfig {
                 }
                 if let Some(v) = route_or_directive_u32(&server.directives, "keyval_ttl_secs") {
                     app_cfg.keyval_ttl_secs = v as u64;
+                }
+                if let Some(v) = server.directives.get("auto_ssl_domain") {
+                    app_cfg.auto_ssl_domain = Some(v.clone());
+                }
+                if let Some(v) = server.directives.get("auto_ssl_email") {
+                    app_cfg.auto_ssl_email = Some(v.clone());
+                }
+                if let Some(v) = server.directives.get("auto_ssl_cache_dir") {
+                    app_cfg.auto_ssl_cache_dir = Some(v.clone());
+                }
+                if let Some(v) = server.directives.get("redis_url") {
+                    app_cfg.redis_url = Some(v.clone());
                 }
 
                 // Map phalanx-style route blocks into our RouteConfig hashmap

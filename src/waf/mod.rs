@@ -4,10 +4,12 @@ use tracing::{debug, warn};
 use crate::keyval::KeyvalStore;
 
 pub mod bot;
+pub mod ml_fraud;
 pub mod policy;
 pub mod reputation;
 pub mod rules;
 
+use self::ml_fraud::MlFraudEngine;
 use self::reputation::IpReputationManager;
 use self::rules::WafRules;
 
@@ -20,10 +22,12 @@ pub enum WafAction {
 #[derive(Clone)]
 pub struct WafEngine {
     rules: Arc<WafRules>,
-    reputation: Arc<IpReputationManager>,
+    pub reputation: Arc<IpReputationManager>,
     pub enabled: bool,
     /// Optional keyval store: if `keyval.get(ip)` returns any value, the IP is banned.
     keyval: Option<Arc<KeyvalStore>>,
+    /// Asynchronous Machine Learning Fraud Detection Engine
+    pub ml_engine: Arc<MlFraudEngine>,
 }
 
 /// Decodes percent-encoded URL sequences (%XX → character).
@@ -58,6 +62,7 @@ impl WafEngine {
             reputation,
             enabled,
             keyval: None,
+            ml_engine: Arc::new(MlFraudEngine::new()),
         }
     }
 

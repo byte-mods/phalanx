@@ -17,6 +17,8 @@ pub struct AdminState {
     pub manager: Arc<UpstreamManager>,
     /// Shared keyval store — injected from main at startup.
     pub keyval: Arc<KeyvalStore>,
+    /// Shared WAF Engine for ML models
+    pub waf: Arc<crate::waf::WafEngine>,
 }
 
 /// Global metrics registry shared across the proxy and admin server.
@@ -278,6 +280,9 @@ pub async fn start_admin_server(bind_addr: String, state: AdminState) {
             .service(keyval_list)
             .service(upstreams_detail)
             .service(config_reload)
+            .service(api::ml_upload)
+            .service(api::ml_logs)
+            .service(api::ml_mode)
     })
     .bind(&bind_addr)
     .expect("Invalid admin bind address")

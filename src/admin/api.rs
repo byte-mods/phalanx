@@ -273,6 +273,58 @@ pub async fn purge_cache(
     }))
 }
 
+// ── ML Fraud Detection API ──
+
+#[derive(Deserialize)]
+pub struct MlModeRequest {
+    pub mode: String,
+}
+
+#[post("/api/ml/upload")]
+pub async fn ml_upload(
+    state: web::Data<crate::admin::AdminState>,
+    body: web::Bytes,
+    _req: actix_web::HttpRequest,
+) -> impl Responder {
+    let _ = std::fs::create_dir_all("models");
+    let model_path = "models/fraud_model.onnx";
+    
+    if let Err(e) = std::fs::write(model_path, body) {
+        return HttpResponse::InternalServerError().json(serde_json::json!({ "error": format!("Failed to write model: {}", e) }));
+    }
+
+    state.waf.ml_engine.load_model(model_path, Arc::clone(&state.waf.reputation)).await;
+
+    HttpResponse::Ok().json(serde_json::json!({
+        "status": "model_loaded",
+        "path": model_path
+    }))
+}
+
+#[get("/api/ml/logs")]
+pub async fn ml_logs(
+    state: web::Data<crate::admin::AdminState>,
+) -> impl Responder {
+    let logs_guard = state.waf.ml_engine.logs.read().await;
+    let logs: Vec<_> = logs_guard.iter().cloned().collect();
+    HttpResponse::Ok().json(serde_json::json!({ "logs": logs }))
+}
+
+#[put("/api/ml/mode")]
+pub async fn ml_mode(
+    state: web::Data<crate::admin::AdminState>,
+    req: web::Json<MlModeRequest>,
+) -> impl Responder {
+    let mode = match req.mode.to_lowercase().as_str() {
+        "active" => crate::waf::ml_fraud::MlFraudMode::Active,
+        "shadow" => crate::waf::ml_fraud::MlFraudMode::Shadow,
+        _ => return HttpResponse::BadRequest().json(serde_json::json!({ "error": "Invalid mode. Use 'shadow' or 'active'." })),
+    };
+
+    state.waf.ml_engine.mode.store(Arc::new(mode));
+    HttpResponse::Ok().json(serde_json::json!({ "status": "mode_updated", "mode": req.mode }))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

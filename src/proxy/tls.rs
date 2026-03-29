@@ -6,6 +6,9 @@ use std::io::BufReader;
 use std::sync::Arc;
 use tokio_rustls::TlsAcceptor;
 use tracing::{error, info, warn};
+use rustls_acme::caches::DirCache;
+use rustls_acme::AcmeConfig;
+use futures_util::StreamExt;
 
 /// Builds a rustls `ServerConfig` from cert and key file paths.
 /// If `ca_cert_path` is provided, enables mTLS client certificate verification.
@@ -96,12 +99,43 @@ fn build_server_config(
 /// Loads TLS configuration and returns a TlsAcceptor.
 /// Called once at startup. Enables mTLS if `tls_ca_cert_path` is configured.
 pub fn load_tls_acceptor(config: &AppConfig) -> Option<TlsAcceptor> {
+    // 1. Auto-SSL via Let's Encrypt takes precedence if configured
+    if let Some(domain) = &config.auto_ssl_domain {
+        info!("Enabling Let's Encrypt Auto-SSL for domain: {}", domain);
+        
+        let mail = config.auto_ssl_email.as_deref().unwrap_or("admin@example.com");
+        let cache_dir = config.auto_ssl_cache_dir.clone().unwrap_or_else(|| {
+            std::env::temp_dir().join("phalanx_acme_cache").to_string_lossy().into_owned()
+        });
+
+        // Chain the builder to avoid type change reassignment errors
+        let mut state = AcmeConfig::new(vec![domain.clone()])
+            .contact(vec![format!("mailto:{}", mail)])
+            .cache(DirCache::new(cache_dir))
+            .state();
+            
+        let acceptor = state.default_rustls_config();
+        
+        // Spawn the ACME background worker task to answer challenges
+        tokio::spawn(async move {
+            while let Some(event) = state.next().await {
+                match event {
+                    Ok(e) => info!("Let's Encrypt ACME event: {:?}", e),
+                    Err(err) => error!("Let's Encrypt ACME error: {:?}", err),
+                }
+            }
+        });
+        
+        return Some(TlsAcceptor::from(acceptor));
+    }
+
+    // 2. Static Certificate Files
     let cert_path = config.tls_cert_path.as_ref()?;
     let key_path = config.tls_key_path.as_ref()?;
     let ca_path = config.tls_ca_cert_path.as_deref();
 
     info!(
-        "Loading TLS certificates from {} and {}{}",
+        "Loading static TLS certificates from {} and {}{}",
         cert_path,
         key_path,
         if ca_path.is_some() {

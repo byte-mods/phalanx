@@ -85,7 +85,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let metrics = Arc::new(admin::ProxyMetrics::new());
 
         // Keyval Store: In-memory DashMap-backed store with TTL (NGINX Plus keyval_zone equivalent).
-        let keyval = Arc::new(keyval::KeyvalStore::new(0));
+        let keyval = keyval::KeyvalStore::new(
+            0,
+            cfg_snapshot.redis_url.as_deref().and_then(|url| redis::Client::open(url).ok()),
+        );
 
         // Response Cache: Moka-based in-memory LFU cache for GET responses.
         let cache = Arc::new(middleware::ResponseCache::new(10_000, 60));
@@ -108,13 +111,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             cfg_snapshot.rate_limit_per_ip_sec.unwrap_or(50),
             cfg_snapshot.rate_limit_burst.unwrap_or(100),
             cfg_snapshot.global_rate_limit_sec,
+            cfg_snapshot.redis_url.as_deref(),
         ));
 
         // Initialize WAF Reputation and Engine
-        let waf_reputation = Arc::new(waf::reputation::IpReputationManager::new(
+        let waf_reputation = waf::reputation::IpReputationManager::new(
             cfg_snapshot.waf_auto_ban_threshold.unwrap_or(15),
             cfg_snapshot.waf_auto_ban_duration.unwrap_or(3600),
-        ));
+            cfg_snapshot.redis_url.as_deref().and_then(|url| redis::Client::open(url).ok()),
+        );
         let waf_engine = Arc::new(
             waf::WafEngine::new(true, waf_reputation).with_keyval(keyval.clone()),
         );
@@ -149,12 +154,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let discovery_admin = Arc::clone(&discovery);
         let manager_admin = Arc::clone(&upstreams);
         let keyval_admin = Arc::clone(&keyval);
+        let waf_admin = Arc::clone(&waf_engine);
         tokio::spawn(async move {
             let admin_state = admin::AdminState {
                 metrics: metrics_admin,
                 discovery: discovery_admin,
                 manager: manager_admin,
                 keyval: keyval_admin,
+                waf: waf_admin,
             };
             admin::start_admin_server(cfg_admin.admin_bind.clone(), admin_state).await;
         });

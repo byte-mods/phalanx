@@ -227,6 +227,34 @@
       </table>
     </div>
   </div>
+
+  <!-- ML Fraud Detection -->
+  <div class="card" style="grid-column: span 2;">
+    <div class="card-header">Fraud Detection (ML)</div>
+    <div class="card-body">
+      <div class="kv-form" style="margin-bottom: 20px;">
+        <input type="file" id="ml-model-file" accept=".onnx" class="kv-input" style="flex: 2" />
+        <button class="btn btn-primary btn-sm" onclick="uploadMlModel()">Upload .ONNX Model</button>
+        <div style="flex: 1; display: flex; align-items: center; justify-content: flex-end; gap: 10px;">
+          <span style="font-size: 0.8rem; color: #94a3b8;">Mode:</span>
+          <select id="ml-mode-select" class="kv-input" style="width: 120px;" onchange="toggleMlMode()">
+            <option value="shadow">Shadow</option>
+            <option value="active">Active</option>
+          </select>
+        </div>
+      </div>
+      <div id="ml-status" style="font-size: 0.8rem; color: #10b981; margin-bottom: 12px; height: 16px;"></div>
+      
+      <table>
+        <thead>
+          <tr><th>Time</th><th>IP</th><th>Path</th><th>Fraud Score</th><th>Flagged</th><th>Action</th></tr>
+        </thead>
+        <tbody id="ml-logs-body">
+          <tr><td colspan="6" style="color:#4b5563">Waiting for logs…</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </div>
 </div>
 
 <script>
@@ -377,10 +405,103 @@ async function reloadConfig() {
   setTimeout(() => { el.textContent = ''; el.style.color = ''; }, 3000);
 }
 
+async function fetchMlLogs() {
+  try {
+    const r = await fetch(BASE + '/api/ml/logs');
+    const d = await r.json();
+    const body = document.getElementById('ml-logs-body');
+    if (!d.logs || d.logs.length === 0) {
+      body.innerHTML = '<tr><td colspan="6" style="color:#4b5563">No ML logs available</td></tr>';
+      return;
+    }
+    
+    // Reverse so latest is on top
+    const logs = [...d.logs].reverse().slice(0, 15);
+    
+    body.innerHTML = logs.map(l => {
+      const timeStr = new Date(l.timestamp * 1000).toLocaleTimeString();
+      const badge = l.flagged 
+        ? '<span class="badge-down" style="background:#ef444422;border-color:#ef444455;color:#ef4444">FLAGGED</span>' 
+        : '<span class="badge-up" style="background:#22c55e22;border-color:#22c55e55;color:#22c55e">PASS</span>';
+      
+      const actionBadge = l.action_taken === "IpBanned" 
+        ? '<span style="color:#f59e0b;font-weight:bold;">BANNED</span>' 
+        : l.action_taken;
+        
+      return `<tr>
+        <td>${timeStr}</td>
+        <td style="font-family:monospace">${escHtml(l.ip)}</td>
+        <td>${escHtml(l.path)}</td>
+        <td style="font-family:monospace">${l.fraud_score.toFixed(4)}</td>
+        <td>${badge}</td>
+        <td>${actionBadge}</td>
+      </tr>`;
+    }).join('');
+  } catch (e) {
+    console.error('ML logs fetch failed:', e);
+  }
+}
+
+async function uploadMlModel() {
+  const fileInput = document.getElementById('ml-model-file');
+  const statusEl = document.getElementById('ml-status');
+  if (!fileInput.files.length) {
+    statusEl.textContent = 'Please select a .ONNX file first.';
+    statusEl.style.color = '#ef4444';
+    return;
+  }
+  
+  const file = fileInput.files[0];
+  const buffer = await file.arrayBuffer();
+  
+  statusEl.textContent = 'Uploading and compiling model...';
+  statusEl.style.color = '#3b82f6';
+  
+  try {
+    const r = await fetch(BASE + '/api/ml/upload', {
+      method: 'POST',
+      body: buffer,
+      headers: { 'Content-Type': 'application/octet-stream' }
+    });
+    const d = await r.json();
+    if (r.ok) {
+        statusEl.textContent = '✓ Model successfully loaded (' + d.path + ')';
+        statusEl.style.color = '#10b981';
+    } else {
+        statusEl.textContent = '✗ ' + d.error;
+        statusEl.style.color = '#ef4444';
+    }
+  } catch(e) {
+    statusEl.textContent = '✗ Upload failed';
+    statusEl.style.color = '#ef4444';
+  }
+}
+
+async function toggleMlMode() {
+  const select = document.getElementById('ml-mode-select');
+  const mode = select.value;
+  const statusEl = document.getElementById('ml-status');
+  
+  try {
+    const r = await fetch(BASE + '/api/ml/mode', {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ mode })
+    });
+    if (r.ok) {
+        statusEl.textContent = '✓ Mode changed to ' + mode.toUpperCase();
+        statusEl.style.color = '#10b981';
+    }
+  } catch(e) {
+    console.error('Mode switch failed', e);
+  }
+}
+
 function refreshAll() {
   fetchStats();
   fetchUpstreams();
   fetchKeyval();
+  fetchMlLogs();
   document.getElementById('refresh-status').textContent =
     'Last updated: ' + new Date().toLocaleTimeString();
 }

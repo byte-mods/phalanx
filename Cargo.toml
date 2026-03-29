@@ -66,3 +66,6 @@ tracing-subscriber = { version = "0.3.22", features = ["env-filter"] }
 tract-onnx = "0.22.0"
 trust-dns-resolver = "0.23.2"
 rhai = { version = "1", features = ["sync"] }
+rustls-acme = { version = "0.15.1", features = ["tokio"] }
+redis = { version = "0.27", features = ["tokio-comp"] }
+webrtc = "0.17.1"
