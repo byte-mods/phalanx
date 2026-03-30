@@ -46,7 +46,7 @@ use uwsgi::serve_uwsgi;
 use crate::admin::ProxyMetrics;
 use crate::ai::AiRouter;
 use crate::config::AppConfig;
-use crate::middleware::ResponseCache;
+use crate::middleware::{AdvancedCache, CacheEntry, build_cache_key};
 use crate::routing::UpstreamManager;
 use crate::telemetry::access_log::{AccessLogEntry, AccessLogger};
 use router::Protocol;
@@ -154,7 +154,7 @@ pub async fn start_proxy(
     _waf: Arc<crate::waf::WafEngine>,
     rate_limiter: Arc<crate::middleware::ratelimit::PhalanxRateLimiter>,
     _ai_engine: Arc<dyn AiRouter>,
-    cache: Arc<ResponseCache>,
+    cache: Arc<AdvancedCache>,
     hook_engine: Arc<crate::scripting::HookEngine>,
     metrics: Arc<ProxyMetrics>,
     access_logger: Arc<AccessLogger>,
@@ -554,7 +554,7 @@ async fn handle_http_request(
     app_config: Arc<ArcSwap<AppConfig>>,
     waf: Arc<crate::waf::WafEngine>,
     ai_engine: Arc<dyn crate::ai::AiRouter>,
-    cache: Arc<ResponseCache>,
+    cache: Arc<AdvancedCache>,
     hook_engine: Arc<crate::scripting::HookEngine>,
     metrics: Arc<ProxyMetrics>,
     access_logger: Arc<AccessLogger>,
@@ -1123,7 +1123,7 @@ async fn handle_http_request(
     // ── Response Cache: lookup for GET requests ──
     let is_get = req.method() == hyper::Method::GET;
     let cache_key = if route_cache && is_get && !is_websocket {
-        let ck = ResponseCache::cache_key("GET", host_name, &path, req.uri().query());
+        let ck = build_cache_key("GET", host_name, &path, req.uri().query(), &[]);
         // Check cache
         if let Some(cached) = cache.get(&ck).await {
             debug!("Cache HIT for {}", ck);
@@ -1419,15 +1419,18 @@ async fn handle_http_request(
             if should_cache {
                 if let Some(ref ck) = cache_key {
                     cache
-                        .insert_with_ttl(
+                        .insert(
                             ck.clone(),
-                            CachedResponse {
+                            CacheEntry {
                                 status: status_code,
                                 body: body_bytes.clone(),
                                 content_type: content_type.clone(),
-                                expires_at: std::time::Instant::now(),
+                                headers: vec![],
+                                created_at: std::time::Instant::now(),
+                                max_age: std::time::Duration::from_secs(route_cache_ttl),
+                                stale_while_revalidate: std::time::Duration::ZERO,
+                                stale_if_error: std::time::Duration::ZERO,
                             },
-                            route_cache_ttl,
                         )
                         .await;
                 }
@@ -1599,7 +1602,7 @@ async fn handle_http2_request(
     app_config: Arc<ArcSwap<AppConfig>>,
     waf: Arc<crate::waf::WafEngine>,
     ai_engine: Arc<dyn crate::ai::AiRouter>,
-    cache: Arc<ResponseCache>,
+    cache: Arc<AdvancedCache>,
     _hook_engine: Arc<crate::scripting::HookEngine>,
     metrics: Arc<ProxyMetrics>,
     access_logger: Arc<AccessLogger>,
@@ -2025,7 +2028,7 @@ async fn handle_http2_request(
     // ── Response Cache: lookup for GET requests ──
     let is_get = method_str == "GET";
     let cache_key = if route_cache && is_get {
-        let ck = ResponseCache::cache_key("GET", host_name, &path, req.uri().query());
+        let ck = build_cache_key("GET", host_name, &path, req.uri().query(), &[]);
         if let Some(cached) = cache.get(&ck).await {
             debug!("H2 Cache HIT for {}", ck);
             metrics.cache_hits_total.with_label_values(&["hit"]).inc();
@@ -2191,15 +2194,18 @@ async fn handle_http2_request(
             if should_cache {
                 if let Some(ref ck) = cache_key {
                     cache
-                        .insert_with_ttl(
+                        .insert(
                             ck.clone(),
-                            CachedResponse {
+                            CacheEntry {
                                 status: status_code,
                                 body: body_bytes.clone(),
                                 content_type: content_type.clone(),
-                                expires_at: std::time::Instant::now(),
+                                headers: vec![],
+                                created_at: std::time::Instant::now(),
+                                max_age: std::time::Duration::from_secs(route_cache_ttl),
+                                stale_while_revalidate: std::time::Duration::ZERO,
+                                stale_if_error: std::time::Duration::ZERO,
                             },
-                            route_cache_ttl,
                         )
                         .await;
                 }

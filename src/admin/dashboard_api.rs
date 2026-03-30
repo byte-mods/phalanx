@@ -191,14 +191,14 @@ mod tests {
         use crate::config::AppConfig;
         use crate::discovery::ServiceDiscovery;
         use crate::keyval::KeyvalStore;
-        use crate::middleware::{ratelimit::PhalanxRateLimiter, ResponseCache};
+        use crate::middleware::{ratelimit::PhalanxRateLimiter, cache::AdvancedCache};
         use crate::routing::UpstreamManager;
         use crate::telemetry::bandwidth::BandwidthTracker;
         use crate::waf::{reputation::IpReputationManager, WafEngine};
 
         let reputation = IpReputationManager::new(5, 3600, None);
         let waf = Arc::new(WafEngine::new(true, Arc::clone(&reputation)));
-        let cache = Arc::new(ResponseCache::new(1000, 60));
+        let cache = Arc::new(AdvancedCache::new(1000, 60, None));
         // Unique path per test to avoid RocksDB lock contention.
         let db_path = format!("/tmp/phalanx_test_dash_{}", id);
         let discovery = Arc::new(ServiceDiscovery::new(&db_path));

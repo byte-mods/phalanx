@@ -82,7 +82,7 @@ limitations under the License.
 
 ## What Is Built
 
-Every item below is fully implemented, compiles, and is covered by tests. **620 tests total (406 unit + 214 integration) — all passing.**
+Every item below is fully implemented, compiles, and is covered by tests. **630 tests total (406 unit + 224 integration) — all passing.**
 
 > **2026-03-30 update:** Per-protocol bandwidth tracking, configurable resource alerts (bandwidth + connection + memory thresholds), and WebRTC per-room bandwidth counters (bytes/packets forwarded, publisher vs subscriber split) are now fully implemented and wired. OCSP stapling, ClusterState, ML Fraud model auto-load, OIDC session auth, and JWKS JWT auth are all wired in `main.rs`.
 
@@ -98,6 +98,9 @@ Every item below is fully implemented, compiles, and is covered by tests. **620 
 | **Rate Limiting** | Per-IP token bucket, global DDoS panic mode, zone-based connection limits, top-N IP leaderboard |
 | **Routing** | Prefix routing, URL rewrite engine, static files, real client IP extraction (XFF / X-Real-IP / PROXY protocol v1/v2) |
 | **Traffic Shaping** | Traffic mirroring/tee (fully wired), consistent-hash splitting, sticky sessions |
+| **Resilience** | Circuit breaker (3-state, exponential backoff), slow-start ramp (linear weight recovery), active + passive health checks, backend request queue |
+| **Performance** | Zero-copy TCP proxy via Linux `splice(2)`; fallback `copy_bidirectional` on non-Linux; L2 disk cache with stale-while-revalidate |
+| **Dynamic Security** | Keyval-backed runtime IP bans (TTL-based); WAF auto-ban feeds back into keyval; external systems can update ban list without restart |
 | **Observability** | Prometheus metrics, OpenTelemetry OTLP traces with W3C `traceparent` injection, structured access logs, admin dashboard |
 | **Bandwidth Monitoring** | Per-protocol atomic counters (bytes_in, bytes_out, requests, active_connections) for HTTP1/2/3, WebSocket, gRPC, TCP, UDP, WebRTC; sorted utilization snapshots; configurable per-protocol thresholds |
 | **Resource Alerts** | Warning/Critical threshold engine for bandwidth and connections per protocol; process memory + open FD monitoring (Linux); rolling 500-entry alert log; optional webhook delivery; background polling every 30 s |
@@ -194,7 +197,7 @@ cargo build --release
 # Debug build
 cargo build
 
-# Run tests (620 total: 406 unit + 214 integration — all passing)
+# Run tests (630 total: 406 unit + 224 integration — all passing)
 cargo test
 
 # Run with default config
@@ -580,7 +583,7 @@ server {
 - XXE payloads (`<!ENTITY`, `SYSTEM "file://`)
 - Prototype pollution (`__proto__`, `constructor.prototype`)
 
-> **Note:** `src/waf/bot.rs` is a stub file; bot detection is implemented via UA-regex patterns in `rules.rs`.
+> **Note:** `src/waf/bot.rs` implements a tiered `BotDetector` with `BotClass` enum (`GoodBot`, `BadBot`, `Unknown`, `Human`), rate-anomaly scoring, and a CAPTCHA challenge stub. Known-bad scanner signatures (sqlmap, nikto, masscan, etc.) are blocked immediately; known-good crawlers (Googlebot, Bingbot) are classified separately. The CAPTCHA integration point exists but requires wiring to an external provider (hCaptcha, Cloudflare Turnstile).
 
 ---
 
@@ -2058,6 +2061,107 @@ The webhook sends a JSON `POST` with the full `AlertRecord` payload to the confi
 
 ---
 
+### 37. Circuit Breaker with Exponential Backoff
+
+The circuit breaker is a per-backend state machine with three states: `CLOSED` (normal), `OPEN` (all traffic rejected), and `HALF_OPEN` (one probe allowed). Configure per backend in `phalanx.conf`:
+
+```nginx
+upstream api {
+    server 10.0.0.1:8080 circuit_breaker=on circuit_initial_backoff=5 circuit_max_backoff=60;
+    server 10.0.0.2:8080 circuit_breaker=on;
+}
+```
+
+**State transitions:**
+
+| Event | Transition |
+|-------|-----------|
+| `max_fails` consecutive failures within `fail_timeout_secs` | `CLOSED → OPEN` |
+| Failed probe in `HALF_OPEN` | `HALF_OPEN → OPEN` (backoff doubles, capped at `circuit_max_backoff_secs`) |
+| Successful probe in `HALF_OPEN` | `HALF_OPEN → CLOSED` (backoff resets) |
+| Active health check detects backend UP | any → `CLOSED` |
+
+**Backoff schedule** (default: initial=5s, max=60s): `5 → 10 → 20 → 40 → 60 → 60 → …`
+
+Implementation: `src/routing/mod.rs` — `trip_circuit()`, `record_circuit_success()`, `is_circuit_closed()`.
+
+---
+
+### 38. Slow-Start Ramp for Recovering Backends
+
+After a backend comes back online (detected by active health check), Phalanx linearly increases its effective weight from 1 → full weight over `slow_start_secs`. This prevents overwhelming a freshly-restarted backend with full traffic immediately.
+
+```nginx
+upstream api {
+    server 10.0.0.1:8080 weight=10 slow_start=30s;
+}
+```
+
+During the ramp:
+```
+effective_weight = max(1, floor(weight * elapsed_secs / slow_start_secs))
+```
+
+After `slow_start_secs` seconds, the backend receives its full configured weight. Implementation: `src/routing/mod.rs` — `effective_weight()`.
+
+---
+
+### 39. Active Health Checks
+
+Active health checks run in a background loop probing each backend independently of incoming traffic.
+
+```nginx
+upstream api {
+    server 10.0.0.1:8080 health_check_path=/health health_check_status=200 max_fails=3 fail_timeout=30;
+}
+```
+
+- **TCP connect check** (default): establishes a TCP connection; success = backend is UP
+- **HTTP GET check** (`health_check_path`): sends GET to the path; checks response status against `health_check_status`
+- **Passive check**: counts 5xx/timeout responses; trips circuit after `max_fails` within `fail_timeout_secs`
+
+When a backend recovers (DOWN → UP), `record_recovery()` stamps the timestamp for slow-start and closes the circuit breaker. Implementation: `src/routing/mod.rs`.
+
+---
+
+### 40. Zero-Copy File Proxying (Linux sendfile / splice)
+
+On Linux, raw TCP proxy connections use `splice(2)` via two pipes for true zero-copy bidirectional streaming. No data is copied into userspace.
+
+```
+Client → [pipe] → splice → [pipe] → Backend
+```
+
+On macOS/non-Linux, a fallback `copy_bidirectional_fallback()` using Tokio's `AsyncRead`/`AsyncWrite` is used automatically.
+
+The zero-copy path is activated in:
+- `src/proxy/tcp.rs` — raw TCP proxy sessions
+- `src/proxy/zero_copy.rs` — `splice_bidirectional()` (Linux) and `copy_bidirectional_fallback()` (all platforms)
+
+No configuration needed — platform detection is automatic at compile time via `#[cfg(target_os = "linux")]`.
+
+---
+
+### 41. Keyval ↔ WAF Dynamic Ban Integration
+
+The WAF's ban list is backed by the Keyval store, enabling runtime IP bans without config reload:
+
+```bash
+# Ban an IP for 1 hour
+curl -X POST http://127.0.0.1:9099/api/keyval \
+  -H "Content-Type: application/json" \
+  -d '{"key": "ban:10.0.0.42", "value": "1", "ttl_secs": 3600}'
+
+# The WAF checks this key on every request:
+# src/waf/mod.rs — WafEngine.with_keyval(keyval) sets up the integration
+```
+
+When `ban:<ip>` exists in keyval, the WAF blocks the IP with a `403 Forbidden`. The entry auto-expires after `ttl_secs`. The WAF also auto-populates bans via `IpReputationManager` after `waf_auto_ban_threshold` strikes, writing them back to keyval with a TTL of `waf_auto_ban_duration` seconds.
+
+This means external systems (CI/CD, SIEM, threat intel feeds) can dynamically update the blocklist without restarting Phalanx.
+
+---
+
 ## Testing Guide
 
 All test scripts live in `scripts/`. No external test framework is required for Rust tests; Python tests need `requests` and optionally `pytest` and `locust`.
@@ -2067,7 +2171,7 @@ All test scripts live in `scripts/`. No external test framework is required for 
 ### Rust Tests
 
 ```bash
-# All 620 tests (406 unit + 214 integration)
+# All 630 tests (406 unit + 224 integration)
 cargo test
 
 # Only unit tests

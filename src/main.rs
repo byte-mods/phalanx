@@ -90,8 +90,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             cfg_snapshot.redis_url.as_deref().and_then(|url| redis::Client::open(url).ok()),
         );
 
-        // Response Cache: Moka-based in-memory LFU cache for GET responses.
-        let cache = Arc::new(middleware::ResponseCache::new(10_000, 60));
+        // Response Cache: L1 in-memory (Moka LFU) + optional L2 disk cache.
+        let cache = Arc::new(middleware::cache::AdvancedCache::new(
+            10_000,
+            60,
+            cfg_snapshot.cache_disk_path.as_deref(),
+        ));
 
         // Access Logger: Writes formatted access log entries to disk.
         let access_log_path = cfg_snapshot

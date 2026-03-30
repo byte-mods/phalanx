@@ -25,7 +25,7 @@ use tracing::{debug, error, info, warn};
 use crate::admin::ProxyMetrics;
 use crate::ai::AiRouter;
 use crate::config::AppConfig;
-use crate::middleware::{CachedResponse, ResponseCache};
+use crate::middleware::{AdvancedCache, CacheEntry, build_cache_key};
 use crate::routing::UpstreamManager;
 
 /// Starts the HTTP/3 QUIC server on the configured UDP bind address.
@@ -34,7 +34,7 @@ pub async fn start_http3_proxy(
     app_config: Arc<AppConfig>,
     upstreams: Arc<UpstreamManager>,
     metrics: Arc<ProxyMetrics>,
-    cache: Arc<ResponseCache>,
+    cache: Arc<AdvancedCache>,
     ai_engine: Arc<dyn AiRouter>,
     shutdown: CancellationToken,
 ) {
@@ -123,7 +123,7 @@ async fn serve_h3_connection(
     upstreams: Arc<UpstreamManager>,
     app_config: Arc<AppConfig>,
     metrics: Arc<ProxyMetrics>,
-    cache: Arc<ResponseCache>,
+    cache: Arc<AdvancedCache>,
     ai_engine: Arc<dyn AiRouter>,
 ) {
     loop {
@@ -166,7 +166,7 @@ async fn handle_h3_request(
     upstreams: Arc<UpstreamManager>,
     app_config: Arc<AppConfig>,
     metrics: Arc<ProxyMetrics>,
-    cache: Arc<ResponseCache>,
+    cache: Arc<AdvancedCache>,
     ai_engine: Arc<dyn AiRouter>,
 ) {
     let path = req.uri().path().to_string();
@@ -183,12 +183,7 @@ async fn handle_h3_request(
 
     // Serve from cache for GET requests
     if method == hyper::Method::GET {
-        let cache_key = ResponseCache::cache_key(
-            "GET",
-            host,
-            &path,
-            query.as_deref(),
-        );
+        let cache_key = build_cache_key("GET", host, &path, query.as_deref(), &[]);
         if let Some(cached) = cache.get(&cache_key).await {
             let response = hyper::Response::builder()
                 .status(cached.status)
@@ -327,17 +322,20 @@ async fn handle_h3_request(
 
     // Cache GET 200 responses
     if method == hyper::Method::GET && status == StatusCode::OK {
-        let cache_key = ResponseCache::cache_key("GET", host, &path, query.as_deref());
+        let cache_key = build_cache_key("GET", host, &path, query.as_deref(), &[]);
         cache
-            .insert_with_ttl(
+            .insert(
                 cache_key,
-                CachedResponse {
+                CacheEntry {
                     status: status_u16,
                     body: Bytes::copy_from_slice(&body_bytes),
                     content_type: content_type.clone(),
-                    expires_at: std::time::Instant::now(),
+                    headers: vec![],
+                    created_at: std::time::Instant::now(),
+                    max_age: std::time::Duration::from_secs(60),
+                    stale_while_revalidate: std::time::Duration::ZERO,
+                    stale_if_error: std::time::Duration::ZERO,
                 },
-                60,
             )
             .await;
     }

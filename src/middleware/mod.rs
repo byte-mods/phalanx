@@ -4,6 +4,8 @@ pub mod compression;
 pub mod connlimit;
 pub mod ratelimit;
 
+pub use cache::{AdvancedCache, CacheEntry, build_cache_key};
+
 use moka::future::Cache;
 use std::time::{Duration, Instant};
 use tracing::debug;

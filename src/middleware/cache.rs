@@ -205,6 +205,20 @@ impl AdvancedCache {
         self.memory.run_pending_tasks().await;
     }
 
+    /// Removes all entries from memory and disk cache.
+    pub async fn purge_all(&self) {
+        self.memory.invalidate_all();
+        self.memory.run_pending_tasks().await;
+
+        if let Some(ref dp) = self.disk_path {
+            if let Ok(mut entries) = tokio::fs::read_dir(dp).await {
+                while let Ok(Some(entry)) = entries.next_entry().await {
+                    let _ = tokio::fs::remove_file(entry.path()).await;
+                }
+            }
+        }
+    }
+
     // ── Disk I/O helpers ──
 
     fn disk_entry_path(&self, base: &Path, key: &str) -> PathBuf {

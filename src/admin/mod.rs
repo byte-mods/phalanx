@@ -21,8 +21,8 @@ pub struct AdminState {
     pub keyval: Arc<KeyvalStore>,
     /// Shared WAF Engine for ML models
     pub waf: Arc<crate::waf::WafEngine>,
-    /// Shared response cache for purge operations
-    pub cache: Arc<crate::middleware::ResponseCache>,
+    /// Shared response cache for purge operations (L1 memory + optional L2 disk)
+    pub cache: Arc<crate::middleware::cache::AdvancedCache>,
     /// Rate limiter (for top-IP dashboard panel and request counting)
     pub rate_limiter: Arc<crate::middleware::ratelimit::PhalanxRateLimiter>,
     /// Per-protocol bandwidth counters
