@@ -286,6 +286,18 @@ pub struct AppConfig {
     #[serde(default)]
     pub node_id: Option<String>,
 
+    // ── Gossip Protocol ─────────────────────────────────────────────────────
+    /// UDP bind address for gossip protocol (e.g., "0.0.0.0:7946").
+    /// When set, enables gossip-based cluster state sync.
+    #[serde(default)]
+    pub gossip_bind: Option<String>,
+    /// Comma-separated list of seed peer addresses for gossip protocol.
+    #[serde(default)]
+    pub gossip_seed_peers: Option<String>,
+    /// Gossip round interval in milliseconds. Default: 1000.
+    #[serde(default)]
+    pub gossip_interval_ms: Option<u64>,
+
     // ── ML Fraud Detection ───────────────────────────────────────────────────
     /// Path to an ONNX model file for ML-based fraud detection.
     /// When set, the ML fraud engine is started at launch.
@@ -294,6 +306,41 @@ pub struct AppConfig {
     /// ML fraud detection mode: "shadow" (log only) or "active" (auto-ban). Default: shadow.
     #[serde(default)]
     pub ml_fraud_mode: Option<String>,
+
+    // ── CAPTCHA Bot Challenge ───────────────────────────────────────────────
+    /// CAPTCHA site key (provider-specific). When set, enables bot CAPTCHA challenges.
+    #[serde(default)]
+    pub captcha_site_key: Option<String>,
+    /// CAPTCHA secret key for server-side verification.
+    #[serde(default)]
+    pub captcha_secret_key: Option<String>,
+    /// CAPTCHA provider: "hcaptcha" (default), "turnstile", "recaptcha".
+    #[serde(default)]
+    pub captcha_provider: Option<String>,
+    /// Rate threshold (req/s) above which unknown bots get CAPTCHA challenge. Default: 5.0.
+    #[serde(default)]
+    pub captcha_challenge_threshold: Option<f64>,
+
+    // ── Proxy-Wasm Plugins ──────────────────────────────────────────────────
+    /// Path to a JSON file containing Wasm plugin configurations.
+    #[serde(default)]
+    pub wasm_plugin_config_path: Option<String>,
+
+    // ── Kubernetes Ingress Controller ───────────────────────────────────────
+    /// Enable Kubernetes ingress controller mode.
+    #[serde(default)]
+    pub k8s_ingress_enabled: bool,
+    /// Ingress class name to watch. Default: "phalanx".
+    #[serde(default)]
+    pub k8s_ingress_class: Option<String>,
+
+    // ── Global Server Load Balancing ────────────────────────────────────────
+    /// GSLB routing policy: "geographic", "latency", "weighted", "geo_latency".
+    #[serde(default)]
+    pub gslb_policy: Option<String>,
+    /// Maximum latency (ms) before a DC is considered unhealthy. Default: 500.
+    #[serde(default)]
+    pub gslb_max_latency_ms: Option<f64>,
 }
 
 impl Default for AppConfig {
@@ -378,8 +425,20 @@ impl Default for AppConfig {
             ocsp_responder_url: None,
             etcd_endpoints: None,
             node_id: None,
+            gossip_bind: None,
+            gossip_seed_peers: None,
+            gossip_interval_ms: None,
             ml_fraud_model_path: None,
             ml_fraud_mode: None,
+            captcha_site_key: None,
+            captcha_secret_key: None,
+            captcha_provider: None,
+            captcha_challenge_threshold: None,
+            wasm_plugin_config_path: None,
+            k8s_ingress_enabled: false,
+            k8s_ingress_class: None,
+            gslb_policy: None,
+            gslb_max_latency_ms: None,
         }
     }
 }
@@ -562,6 +621,17 @@ pub fn load_config(conf_path: &str) -> AppConfig {
                 if let Some(v) = server.directives.get("node_id") {
                     app_cfg.node_id = Some(v.clone());
                 }
+                if let Some(v) = server.directives.get("gossip_bind") {
+                    app_cfg.gossip_bind = Some(v.clone());
+                }
+                if let Some(v) = server.directives.get("gossip_seed_peers") {
+                    app_cfg.gossip_seed_peers = Some(v.clone());
+                }
+                if let Some(v) = server.directives.get("gossip_interval_ms") {
+                    if let Ok(val) = v.parse::<u64>() {
+                        app_cfg.gossip_interval_ms = Some(val);
+                    }
+                }
                 if let Some(v) = server.directives.get("ml_fraud_model_path") {
                     app_cfg.ml_fraud_model_path = Some(v.clone());
                 }
@@ -582,6 +652,37 @@ pub fn load_config(conf_path: &str) -> AppConfig {
                 }
                 if let Some(v) = server.directives.get("waf_policy_path") {
                     app_cfg.waf_policy_path = Some(v.clone());
+                }
+                if let Some(v) = server.directives.get("captcha_site_key") {
+                    app_cfg.captcha_site_key = Some(v.clone());
+                }
+                if let Some(v) = server.directives.get("captcha_secret_key") {
+                    app_cfg.captcha_secret_key = Some(v.clone());
+                }
+                if let Some(v) = server.directives.get("captcha_provider") {
+                    app_cfg.captcha_provider = Some(v.clone());
+                }
+                if let Some(v) = server.directives.get("captcha_challenge_threshold") {
+                    if let Ok(val) = v.parse::<f64>() {
+                        app_cfg.captcha_challenge_threshold = Some(val);
+                    }
+                }
+                if let Some(v) = server.directives.get("wasm_plugin_config") {
+                    app_cfg.wasm_plugin_config_path = Some(v.clone());
+                }
+                if let Some(v) = server.directives.get("k8s_ingress_enabled") {
+                    app_cfg.k8s_ingress_enabled = v == "true" || v == "on";
+                }
+                if let Some(v) = server.directives.get("k8s_ingress_class") {
+                    app_cfg.k8s_ingress_class = Some(v.clone());
+                }
+                if let Some(v) = server.directives.get("gslb_policy") {
+                    app_cfg.gslb_policy = Some(v.clone());
+                }
+                if let Some(v) = server.directives.get("gslb_max_latency_ms") {
+                    if let Ok(val) = v.parse::<f64>() {
+                        app_cfg.gslb_max_latency_ms = Some(val);
+                    }
                 }
 
                 // Map phalanx-style route blocks into our RouteConfig hashmap

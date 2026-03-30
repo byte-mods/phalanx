@@ -324,7 +324,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             });
         let _cluster_state = std::sync::Arc::new({
             use cluster::{ClusterBackend, ClusterState};
-            let backend = if let Some(endpoints_str) = cfg_snapshot.etcd_endpoints.as_deref() {
+            let backend = if let Some(ref gossip_addr) = cfg_snapshot.gossip_bind {
+                let seed_peers: Vec<String> = cfg_snapshot
+                    .gossip_seed_peers
+                    .as_deref()
+                    .map(|s| s.split(',').map(|p| p.trim().to_string()).collect())
+                    .unwrap_or_default();
+                ClusterBackend::Gossip {
+                    bind_addr: gossip_addr.clone(),
+                    seed_peers,
+                }
+            } else if let Some(endpoints_str) = cfg_snapshot.etcd_endpoints.as_deref() {
                 let endpoints: Vec<String> = endpoints_str
                     .split(',')
                     .map(|s| s.trim().to_string())

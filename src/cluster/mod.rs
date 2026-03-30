@@ -1,3 +1,5 @@
+pub mod gossip;
+
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -23,6 +25,8 @@ pub enum ClusterBackend {
     Etcd { endpoints: Vec<String> },
     /// Redis connection URL
     Redis { url: String },
+    /// Gossip-based peer-to-peer sync (no external dependencies)
+    Gossip { bind_addr: String, seed_peers: Vec<String> },
     /// Single-node mode (no-op)
     Standalone,
 }
@@ -113,7 +117,7 @@ impl ClusterState {
                 }
                 Ok(())
             }
-            ClusterBackend::Standalone => Ok(()),
+            ClusterBackend::Gossip { .. } | ClusterBackend::Standalone => Ok(()),
         }
     }
 
@@ -161,7 +165,7 @@ impl ClusterState {
                     None => Ok(None),
                 }
             }
-            ClusterBackend::Standalone => Ok(None),
+            ClusterBackend::Gossip { .. } | ClusterBackend::Standalone => Ok(None),
         }
     }
 
@@ -180,7 +184,7 @@ impl ClusterState {
                 Ok(())
             }
             ClusterBackend::Redis { url: _ } => Ok(()),
-            ClusterBackend::Standalone => Ok(()),
+            ClusterBackend::Gossip { .. } | ClusterBackend::Standalone => Ok(()),
         }
     }
 

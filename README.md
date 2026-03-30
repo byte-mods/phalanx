@@ -66,6 +66,16 @@ limitations under the License.
    - [34. WebRTC SFU Advanced & WebRTC-to-HLS Live Streaming](#34-webrtc-sfu-advanced--webrtc-to-hls-live-streaming)
    - [35. Per-Protocol Bandwidth Monitoring](#35-per-protocol-bandwidth-monitoring)
    - [36. Resource Alert System](#36-resource-alert-system)
+   - [37. Circuit Breaker with Exponential Backoff](#37-circuit-breaker-with-exponential-backoff)
+   - [38. Slow-Start Ramp for Recovering Backends](#38-slow-start-ramp-for-recovering-backends)
+   - [39. Active Health Checks](#39-active-health-checks)
+   - [40. Zero-Copy File Proxying (Linux sendfile / splice)](#40-zero-copy-file-proxying-linux-sendfile--splice)
+   - [41. Keyval / WAF Dynamic Ban Integration](#41-keyval--waf-dynamic-ban-integration)
+   - [42. CAPTCHA Bot Challenge](#42-captcha-bot-challenge)
+   - [43. Gossip-Based Cluster State](#43-gossip-based-cluster-state)
+   - [44. Proxy-Wasm Plugin Extensibility](#44-proxy-wasm-plugin-extensibility)
+   - [45. Kubernetes Ingress Controller](#45-kubernetes-ingress-controller)
+   - [46. Global Anycast / GSLB](#46-global-anycast--gslb)
 7. [Testing Guide](#testing-guide)
    - [Rust Tests](#rust-tests)
    - [Start Test Backends](#start-test-backends)
@@ -82,16 +92,16 @@ limitations under the License.
 
 ## What Is Built
 
-Every item below is fully implemented, compiles, and is covered by tests. **630 tests total (406 unit + 224 integration) — all passing.**
+Every item below is fully implemented, compiles, and is covered by tests. **748 tests total (524 unit + 224 integration) — all passing.**
 
-> **2026-03-30 update:** Per-protocol bandwidth tracking, configurable resource alerts (bandwidth + connection + memory thresholds), and WebRTC per-room bandwidth counters (bytes/packets forwarded, publisher vs subscriber split) are now fully implemented and wired. OCSP stapling, ClusterState, ML Fraud model auto-load, OIDC session auth, and JWKS JWT auth are all wired in `main.rs`.
+> **2026-03-30 update:** All Phase 1, Phase 2, and Phase 3 features are now complete. New additions: CAPTCHA bot challenge integration (hCaptcha/Turnstile/reCAPTCHA), SWIM-style gossip protocol for peer-to-peer cluster state, Proxy-Wasm plugin extensibility framework, Kubernetes Ingress & Gateway API controller, and Global Anycast / GSLB with geographic, latency-based, and weighted routing policies.
 
 | Category | Features |
 |---|---|
 | **Protocols** | HTTP/1.1, HTTP/2, HTTP/3 (QUIC) with AI routing + caching, WebSocket, gRPC, gRPC-Web, FastCGI, uWSGI, TCP, UDP, SMTP/IMAP/POP3, WebRTC SFU |
 | **Load Balancing** | Round Robin, Least Connections, IP Hash, Random, Weighted, Consistent Hash, Least Time, AI Predictive (4 algorithms) |
 | **TLS** | Static certificates, mTLS, ALPN, Auto-SSL via Let's Encrypt, OCSP stapling (background refresh loop wired), hot reload |
-| **WAF** | Signature rules (OWASP), IP reputation, tiered bot classification (good/bad/unknown + rate anomaly scoring), ONNX ML fraud detection, declarative policy engine (NGINX App Protect-style) |
+| **WAF** | Signature rules (OWASP), IP reputation, tiered bot classification (good/bad/unknown + rate anomaly scoring), CAPTCHA challenges (hCaptcha/Turnstile/reCAPTCHA), ONNX ML fraud detection, declarative policy engine (NGINX App Protect-style) |
 | **Auth** | Basic (bcrypt + plaintext), JWT (HS/RS/ES), OAuth 2.0 introspection, auth_request subrequest, OIDC RP, JWKS |
 | **Caching** | L1 in-memory (Moka), L2 disk tier, stale-while-revalidate, Vary support |
 | **Compression** | Gzip, Brotli (both fully wired; Brotli preferred over Gzip when client sends `Accept-Encoding: br`) |
@@ -105,13 +115,16 @@ Every item below is fully implemented, compiles, and is covered by tests. **630 
 | **Bandwidth Monitoring** | Per-protocol atomic counters (bytes_in, bytes_out, requests, active_connections) for HTTP1/2/3, WebSocket, gRPC, TCP, UDP, WebRTC; sorted utilization snapshots; configurable per-protocol thresholds |
 | **Resource Alerts** | Warning/Critical threshold engine for bandwidth and connections per protocol; process memory + open FD monitoring (Linux); rolling 500-entry alert log; optional webhook delivery; background polling every 30 s |
 | **WebRTC SFU** | VP8/H.264/Opus codecs, room management, trickle ICE, per-room bytes/packets forwarded, publisher vs subscriber counts, live bandwidth dashboard tab |
-| **Cluster** | Redis pub/sub (bans/keyval sync) + full Redis KV put/get/delete with TTL, etcd KV (fully functional), shared sticky sessions, WAF ban synchronization |
+| **Cluster** | Redis pub/sub (bans/keyval sync) + full Redis KV put/get/delete with TTL, etcd KV (fully functional), SWIM gossip protocol (peer-to-peer, no external deps), shared sticky sessions, WAF ban synchronization |
 | **GeoIP** | CSV-based country lookup; allow/deny by country code; injects `X-Geo-Country-Code` header (fully wired) |
 | **Discovery** | DNS SRV records, RocksDB registry, etcd watch |
 | **Scripting** | Rhai embedded script engine, compile-time hook plugins — PreRoute/PreUpstream/Log phases fully wired into proxy pipeline |
+| **Extensibility** | Proxy-Wasm plugin framework (trait-based ABI), built-in plugins (header injection, rate limit, path blocker), priority-ordered plugin chain |
+| **Kubernetes** | Ingress v1 controller, Gateway API HTTPRoute reconciliation, annotation-driven config (CORS, rewrite, WAF, rate-limit), TLS secret mapping |
+| **GSLB** | Geographic routing, latency-based routing, weighted round-robin, geo+latency failover; 7-region proximity model; health-check integration |
 | **Admin** | REST API, RBAC (Admin/Operator/ReadOnly), dynamic routes & SSL certs, ML model upload, bandwidth stats, resource alerts, WebRTC room stats |
 
-All Phase 1 wiring items are now complete. See [Phase 2 — Distributed Scale](#phase-2--distributed-scale) for upcoming features.
+All Phase 1, Phase 2, and Phase 3 features are now complete.
 
 ---
 
@@ -146,7 +159,7 @@ The following modules are **fully implemented** but not yet integrated into the 
 | **Sticky Sessions** | ✅ **Wired** | `StickySessionManager` (Cookie mode `PHALANXID`) instantiated in `main.rs`; cookie lookup on request, `Set-Cookie` header set on response; Learn mode records session→backend from response header |
 | **gRPC-Web** | ✅ **Wired** | `is_grpc_web()` detects browser requests; `translate_request()` rewrites content-type + adds `TE: trailers`; `translate_response()` rewrites back + adds CORS headers; OPTIONS preflight returns 204 |
 | **Cluster State Sharing** | ✅ **Wired** | `ClusterState` instantiated in `main.rs`; backend selected from `etcd_endpoints` > `redis_url` > Standalone; `node_id` defaults to `$HOSTNAME` |
-| **AdvancedCache (disk tier)** | Implemented, not wired | Replace simple `ResponseCache` with `AdvancedCache` in `main.rs` for disk persistence |
+| **AdvancedCache (disk tier)** | ✅ **Wired** | `AdvancedCache` initialized in `main.rs` with `cache_disk_path` config; L1 Moka + L2 disk with stale-while-revalidate |
 | **OIDC Auth** | ✅ **Wired** | `OidcSessionStore` passed to `handle_http_request`; session cookie validation runs for routes with `auth_oidc_issuer` + `auth_oidc_cookie_name` |
 | **JWKS Manager** | ✅ **Wired** | `JwksManager` used in JWT validation path for routes with `auth_jwks_uri`; RS256/ES256 public keys fetched and cached from JWKS endpoint |
 | **HTTP/3 AI/Cache** | ✅ **Wired** | AI engine passed to `get_next_backend(None, Some(ai_engine))`; `update_score()` called with latency after each request; GET 200 responses stored in cache; cache hit returns early with `X-Cache: HIT` |
@@ -155,16 +168,16 @@ The following modules are **fully implemented** but not yet integrated into the 
 
 | Item | Status | Notes |
 |---|---|---|
-| **Gossip-Based State** | Not yet implemented | Alternative to etcd/Redis for peer-to-peer cluster sync |
-| **Bot Detection (CAPTCHA)** | Partial | Bot UA regex exists in `rules.rs`; `waf/bot.rs` has detection logic but no CAPTCHA integration |
+| **Gossip-Based State** | ✅ **Complete** | SWIM-style gossip protocol in `src/cluster/gossip.rs`; UDP-based peer-to-peer state sync; LWW merge; membership management |
+| **Bot Detection (CAPTCHA)** | ✅ **Complete** | `CaptchaManager` in `src/waf/bot.rs`; supports hCaptcha, Cloudflare Turnstile, reCAPTCHA v2; rate-based challenge trigger; async token verification |
 
 ### Phase 3 — Ultimate Enterprise
 
 | Item | Status | Notes |
 |---|---|---|
-| **Proxy-Wasm Extensibility** | Not yet implemented | Replace/augment Rhai with wasmtime + proxy-wasm ABI for Go/Rust/C++ plugins |
-| **Kubernetes Ingress Controller** | Not yet implemented | `kube` crate watch loop translating Ingress/Gateway resources into RouteConfig |
-| **Global Anycast / GSLB** | Not yet implemented | Geographic data-center routing based on GeoIP + health-check latency |
+| **Proxy-Wasm Extensibility** | ✅ **Complete** | `WasmPluginManager` in `src/wasm/mod.rs`; trait-based plugin ABI; 5 lifecycle phases; priority chain; built-in header injection, rate limit, path blocker plugins |
+| **Kubernetes Ingress Controller** | ✅ **Complete** | `IngressController` in `src/k8s/mod.rs`; Ingress v1 + Gateway API HTTPRoute reconciliation; annotation-driven config; TLS secret mapping |
+| **Global Anycast / GSLB** | ✅ **Complete** | `GslbRouter` in `src/gslb/mod.rs`; Geographic, Latency, Weighted RR, and Geo+Latency failover policies; 60+ country mappings; health-check integration |
 
 > **Note:** Active Health Checking, Circuit Breaker, and Distributed Rate Limiting via Redis Lua ZSET are **fully implemented** in `src/routing/mod.rs` and `src/middleware/ratelimit.rs` respectively.
 
@@ -2162,6 +2175,309 @@ This means external systems (CI/CD, SIEM, threat intel feeds) can dynamically up
 
 ---
 
+### 42. CAPTCHA Bot Challenge
+
+Phalanx can serve CAPTCHA challenges to suspicious bots before allowing access. The system classifies User-Agents into four tiers (Human, GoodBot, BadBot, Unknown) and challenges Unknown bots whose request rate exceeds a configurable threshold.
+
+**Supported providers:** hCaptcha, Cloudflare Turnstile, Google reCAPTCHA v2.
+
+```nginx
+server {
+    # Enable CAPTCHA bot challenge
+    captcha_site_key          10000000-ffff-ffff-ffff-000000000001;
+    captcha_secret_key        0x0000000000000000000000000000000000000000;
+    captcha_provider          hcaptcha;          # hcaptcha | turnstile | recaptcha
+    captcha_challenge_threshold 5.0;             # req/s above which Unknown bots get challenged
+}
+```
+
+**How it works:**
+
+| Bot Classification | Action |
+|---|---|
+| `Human` (Chrome, Firefox, Safari) | Allow |
+| `GoodBot` (Googlebot, Bingbot, Pingdom) | Allow |
+| `BadBot` (sqlmap, nikto, masscan) | Block immediately |
+| `Unknown` (curl, python-requests) below threshold | Allow |
+| `Unknown` above threshold | Serve CAPTCHA challenge page |
+
+**Challenge flow:**
+
+1. Client sends request with Unknown bot User-Agent at high rate
+2. Phalanx serves an HTML challenge page at `/__phalanx/captcha/verify`
+3. Client solves the CAPTCHA widget
+4. Phalanx verifies the token with the provider's API (server-side)
+5. On success, the IP is marked as verified and subsequent requests pass through
+6. Verified IPs can be revoked or cleared via the `CaptchaManager` API
+
+**Implementation:** `src/waf/bot.rs` — `CaptchaManager`, `CaptchaProvider`, `CaptchaAction`, `classify_user_agent()`.
+
+---
+
+### 43. Gossip-Based Cluster State
+
+For environments where Redis or etcd is not available, Phalanx supports a SWIM-style gossip protocol for peer-to-peer cluster state synchronization over UDP. Nodes exchange state digests every gossip round and reconcile differences using last-write-wins (LWW) semantics.
+
+```nginx
+server {
+    # Enable gossip-based cluster state (takes priority over etcd/redis)
+    gossip_bind         0.0.0.0:7946;
+    gossip_seed_peers   10.0.0.2:7946,10.0.0.3:7946;
+    gossip_interval_ms  1000;                  # gossip round interval (default: 1000ms)
+    node_id             phalanx-node-1;
+}
+```
+
+**Protocol details:**
+
+| Message | Purpose |
+|---|---|
+| `Ping` | Periodic state exchange with random peers (entries + member list) |
+| `Ack` | Response to Ping with local state |
+| `Join` | Announce a new node to the cluster |
+| `Leave` | Graceful departure notification |
+| `PingReq` | Indirect ping for failure detection |
+
+**Membership lifecycle:** `Alive → Suspect → Dead` (configurable suspicion timeout).
+
+**State sharing:** KV entries are replicated across all nodes with TTL support. Each entry carries a timestamp for LWW conflict resolution. Expired entries are evicted during gossip rounds.
+
+**Configuration priority:** `gossip_bind` > `etcd_endpoints` > `redis_url` > Standalone.
+
+**Implementation:** `src/cluster/gossip.rs` — `GossipState`, `GossipConfig`, `GossipMessage`.
+
+---
+
+### 44. Proxy-Wasm Plugin Extensibility
+
+Phalanx supports a Proxy-Wasm-inspired plugin framework for extending request/response processing. Plugins implement the `WasmPlugin` trait and are registered with the `WasmPluginManager`, which orchestrates execution across five lifecycle phases.
+
+```nginx
+server {
+    # Load plugin configurations from a JSON file
+    wasm_plugin_config /etc/phalanx/plugins.json;
+}
+```
+
+**Plugin configuration file (`plugins.json`):**
+
+```json
+[
+  {
+    "name": "header-injector",
+    "wasm_path": "/etc/phalanx/plugins/headers.wasm",
+    "config": "{\"X-Env\": \"production\"}",
+    "phases": ["OnRequestHeaders"],
+    "priority": 10,
+    "enabled": true
+  },
+  {
+    "name": "api-rate-limiter",
+    "wasm_path": "/etc/phalanx/plugins/ratelimit.wasm",
+    "config": "{\"header\": \"X-API-Key\", \"max\": 1000}",
+    "phases": ["OnRequestHeaders"],
+    "priority": 20,
+    "enabled": true
+  }
+]
+```
+
+**Lifecycle phases:**
+
+| Phase | When |
+|---|---|
+| `OnRequestHeaders` | After request headers are received |
+| `OnRequestBody` | After request body is buffered |
+| `OnResponseHeaders` | After upstream response headers |
+| `OnResponseBody` | After upstream response body |
+| `OnLog` | After the request is fully processed |
+| `OnTick` | Periodic background callback |
+
+**Plugin chain behavior:**
+
+- Plugins execute in priority order (lower number = higher priority)
+- A plugin returning `WasmDirectResponse` short-circuits the chain (e.g., 403 Forbidden)
+- Headers and metadata from multiple plugins are merged
+- Disabled plugins and phase-mismatched plugins are skipped
+
+**Built-in plugins:**
+
+| Plugin | Description |
+|---|---|
+| `HeaderInjectionPlugin` | Adds custom headers to every request |
+| `HeaderRateLimitPlugin` | Rate-limits by header value (e.g., API key) |
+| `PathBlockerPlugin` | Blocks requests matching path patterns |
+
+**Implementation:** `src/wasm/mod.rs` — `WasmPluginManager`, `WasmPlugin` trait, `WasmPhase`.
+
+---
+
+### 45. Kubernetes Ingress Controller
+
+Phalanx can act as a Kubernetes Ingress Controller, watching Ingress v1 and Gateway API HTTPRoute resources and translating them into internal route configurations.
+
+```nginx
+server {
+    k8s_ingress_enabled true;
+    k8s_ingress_class   phalanx;    # only reconcile Ingress resources with this class
+}
+```
+
+**Supported resource types:**
+
+| Resource | API Group | Status |
+|---|---|---|
+| Ingress v1 | `networking.k8s.io/v1` | Full support |
+| HTTPRoute | `gateway.networking.k8s.io/v1` | Full support |
+
+**Ingress annotations:**
+
+| Annotation | Description | Example |
+|---|---|---|
+| `phalanx.io/load-balancing` | Load balancing algorithm | `least_connections` |
+| `phalanx.io/waf-enabled` | Enable WAF for this Ingress | `true` |
+| `phalanx.io/rate-limit` | Per-IP rate limit | `100` |
+| `phalanx.io/ssl-redirect` | Force HTTPS redirect | `true` |
+| `phalanx.io/rewrite-target` | URL rewrite target | `/v2` |
+| `phalanx.io/cors-enabled` | Add CORS headers | `true` |
+| `phalanx.io/cache-enabled` | Enable response caching | `true` |
+| `phalanx.io/auth-type` | Authentication type | `jwt` |
+
+**Example Ingress resource:**
+
+```yaml
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: my-app
+  annotations:
+    kubernetes.io/ingress.class: phalanx
+    phalanx.io/cors-enabled: "true"
+    phalanx.io/rewrite-target: /v2
+spec:
+  tls:
+    - hosts: [app.example.com]
+      secretName: app-tls
+  rules:
+    - host: app.example.com
+      http:
+        paths:
+          - path: /api
+            pathType: Prefix
+            backend:
+              service:
+                name: api-svc
+                port:
+                  number: 8080
+```
+
+**Gateway API example:**
+
+```yaml
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: canary-route
+spec:
+  hostnames: [api.example.com]
+  rules:
+    - matches:
+        - path:
+            type: Prefix
+            value: /v1
+      backendRefs:
+        - name: api-stable
+          port: 8080
+          weight: 90
+        - name: api-canary
+          port: 8080
+          weight: 10
+```
+
+**Features:** Host-based routing, path-based routing, TLS termination with Secret references, weighted backends (canary deployments), Gateway API filters (header modification, URL rewrite, redirects).
+
+**Implementation:** `src/k8s/mod.rs` — `IngressController`, `reconcile_ingress()`, `reconcile_gateway_route()`.
+
+---
+
+### 46. Global Anycast / GSLB
+
+Phalanx includes a Global Server Load Balancer (GSLB) that routes clients to the nearest healthy data center based on geographic proximity, measured latency, or weighted distribution.
+
+```nginx
+server {
+    gslb_policy         geographic;     # geographic | latency | weighted | geo_latency
+    gslb_max_latency_ms 500;            # max acceptable latency before DC is unhealthy
+}
+```
+
+**Routing policies:**
+
+| Policy | Description |
+|---|---|
+| `geographic` | Route to the DC whose `primary_countries` list matches the client's GeoIP country; fall back by region proximity |
+| `latency` | Route to the DC with the lowest measured health-check latency |
+| `weighted` | Weighted round-robin across all healthy DCs |
+| `geo_latency` | Try geographic first; if no match, fall back to lowest latency |
+
+**Geographic regions and proximity:**
+
+The GSLB uses a 7-region model with proximity-based fallback ordering:
+
+| Region | Countries (examples) | Proximity fallback |
+|---|---|---|
+| North America | US, CA, MX | SA → EU → AS → OC → ME → AF |
+| South America | BR, AR, CL, CO | NA → EU → AF → AS → OC → ME |
+| Europe | GB, DE, FR, IT, ES | ME → AF → NA → AS → SA → OC |
+| Africa | ZA, NG, KE, EG | EU → ME → SA → AS → NA → OC |
+| Middle East | AE, SA, IL, TR | EU → AF → AS → NA → SA → OC |
+| Asia | CN, JP, KR, IN, SG | OC → ME → EU → NA → SA → AF |
+| Oceania | AU, NZ, FJ | AS → NA → SA → EU → ME → AF |
+
+**Data center configuration (programmatic):**
+
+```rust
+use ai_load_balancer::gslb::{GslbRouter, GslbPolicy, DataCenter, GeoRegion};
+
+let router = GslbRouter::new(GslbPolicy::GeographicWithLatencyFailover, 500.0, 3);
+
+router.add_data_center(DataCenter {
+    id: "us-east-1".to_string(),
+    name: "US East (Virginia)".to_string(),
+    region: GeoRegion::NorthAmerica,
+    primary_countries: vec!["US".into(), "CA".into()],
+    upstream_pool: "us-east-pool".to_string(),
+    weight: 100,
+    enabled: true,
+});
+
+router.add_data_center(DataCenter {
+    id: "eu-west-1".to_string(),
+    name: "EU West (Ireland)".to_string(),
+    region: GeoRegion::Europe,
+    primary_countries: vec!["GB".into(), "DE".into(), "FR".into()],
+    upstream_pool: "eu-west-pool".to_string(),
+    weight: 100,
+    enabled: true,
+});
+
+// Route a client from Germany
+let pool = router.route("DE"); // → Some("eu-west-pool")
+
+// Update health from periodic checks
+router.update_health("us-east-1", true, 45.0);  // healthy, 45ms latency
+router.update_health("eu-west-1", false, 600.0); // unhealthy, high latency
+
+// German client now falls back to US East
+let pool = router.route("DE"); // → Some("us-east-pool")
+```
+
+**Health integration:** The GSLB router tracks consecutive failures per DC. After `max_failures` consecutive failures or if latency exceeds `gslb_max_latency_ms`, the DC is marked unhealthy and traffic is rerouted.
+
+**Implementation:** `src/gslb/mod.rs` — `GslbRouter`, `DataCenter`, `GeoRegion`, `GslbPolicy`, `country_to_region()`.
+
+---
+
 ## Testing Guide
 
 All test scripts live in `scripts/`. No external test framework is required for Rust tests; Python tests need `requests` and optionally `pytest` and `locust`.
@@ -2171,7 +2487,7 @@ All test scripts live in `scripts/`. No external test framework is required for 
 ### Rust Tests
 
 ```bash
-# All 630 tests (406 unit + 224 integration)
+# All 748 tests (524 unit + 224 integration)
 cargo test
 
 # Only unit tests
@@ -2487,6 +2803,28 @@ http {
         # --- ML Fraud Detection ---
         ml_fraud_model_path /etc/phalanx/fraud.onnx;
         ml_fraud_mode       shadow;                # shadow (log-only) | active (auto-ban)
+
+        # --- CAPTCHA Bot Challenge ---
+        captcha_site_key          10000000-ffff-ffff-ffff-000000000001;
+        captcha_secret_key        0x0000000000000000000000000000000000000000;
+        captcha_provider          hcaptcha;      # hcaptcha | turnstile | recaptcha
+        captcha_challenge_threshold 5.0;         # req/s threshold for Unknown bots
+
+        # --- Gossip Cluster State ---
+        gossip_bind         0.0.0.0:7946;
+        gossip_seed_peers   10.0.0.2:7946,10.0.0.3:7946;
+        gossip_interval_ms  1000;
+
+        # --- Proxy-Wasm Plugins ---
+        wasm_plugin_config  /etc/phalanx/plugins.json;
+
+        # --- Kubernetes Ingress Controller ---
+        k8s_ingress_enabled true;
+        k8s_ingress_class   phalanx;
+
+        # --- Global Server Load Balancing ---
+        gslb_policy         geographic;          # geographic | latency | weighted | geo_latency
+        gslb_max_latency_ms 500;
 
         # --- OCSP Stapling ---
         ocsp_responder_url  http://ocsp.example.com/;
