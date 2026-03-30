@@ -1,4 +1,5 @@
 pub mod access_log;
+pub mod bandwidth;
 pub mod otel;
 
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};

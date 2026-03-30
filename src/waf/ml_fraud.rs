@@ -200,3 +200,115 @@ impl Default for MlFraudEngine {
         Self::new()
     }
 }
+
+// ─── Tests ───────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_ml_fraud_mode_defaults_to_shadow() {
+        let engine = MlFraudEngine::new();
+        assert_eq!(**engine.mode.load(), MlFraudMode::Shadow);
+    }
+
+    #[test]
+    fn test_ml_event_creation() {
+        let event = MlEvent {
+            ip: "192.168.1.1".to_string(),
+            method: "POST".to_string(),
+            path: "/api/login".to_string(),
+            query: Some("redirect=/home".to_string()),
+            timestamp: 1234567890,
+            header_count: 8,
+            user_agent_len: 50,
+            body_len: 128,
+            body_snippet: "username=admin".to_string(),
+        };
+        assert_eq!(event.ip, "192.168.1.1");
+        assert_eq!(event.method, "POST");
+        assert_eq!(event.header_count, 8);
+    }
+
+    #[test]
+    fn test_ml_log_entry_serialization() {
+        let entry = MlLogEntry {
+            timestamp: 1234567890,
+            ip: "10.0.0.5".to_string(),
+            path: "/api/submit".to_string(),
+            payload_snippet: "data=...".to_string(),
+            fraud_score: 0.87,
+            flagged: true,
+            action_taken: "ShadowFlag".to_string(),
+        };
+        let json = serde_json::to_string(&entry).unwrap();
+        assert!(json.contains("0.87"));
+        assert!(json.contains("ShadowFlag"));
+    }
+
+    #[test]
+    fn test_queue_inspection_does_not_panic_when_no_model() {
+        let engine = MlFraudEngine::new();
+        let event = MlEvent {
+            ip: "1.2.3.4".to_string(),
+            method: "GET".to_string(),
+            path: "/".to_string(),
+            query: None,
+            timestamp: 0,
+            header_count: 0,
+            user_agent_len: 0,
+            body_len: 0,
+            body_snippet: String::new(),
+        };
+        // Should not panic even though no model is loaded
+        engine.queue_inspection(event);
+    }
+
+    #[test]
+    fn test_mode_can_be_changed_to_active() {
+        let engine = MlFraudEngine::new();
+        assert_eq!(**engine.mode.load(), MlFraudMode::Shadow);
+
+        // Swap to Active mode
+        engine.mode.store(Arc::new(MlFraudMode::Active));
+        assert_eq!(**engine.mode.load(), MlFraudMode::Active);
+    }
+
+    #[tokio::test]
+    async fn test_logs_start_empty() {
+        let engine = MlFraudEngine::new();
+        // Accessing logs through the RwLock should work
+        let logs = engine.logs.read().await;
+        assert_eq!(logs.len(), 0);
+    }
+
+    #[test]
+    fn test_ml_event_query_optional() {
+        let event_no_query = MlEvent {
+            ip: "1.1.1.1".to_string(),
+            method: "GET".to_string(),
+            path: "/".to_string(),
+            query: None,
+            timestamp: 0,
+            header_count: 0,
+            user_agent_len: 0,
+            body_len: 0,
+            body_snippet: String::new(),
+        };
+        assert!(event_no_query.query.is_none());
+
+        let event_with_query = MlEvent {
+            ip: "1.1.1.1".to_string(),
+            method: "GET".to_string(),
+            path: "/search".to_string(),
+            query: Some("q=test".to_string()),
+            timestamp: 0,
+            header_count: 0,
+            user_agent_len: 0,
+            body_len: 0,
+            body_snippet: String::new(),
+        };
+        assert_eq!(event_with_query.query, Some("q=test".to_string()));
+    }
+}

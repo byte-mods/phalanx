@@ -105,15 +105,9 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
         == 0
 }
 
-/// Minimal bcrypt password verification without pulling in the bcrypt crate.
-/// Delegates to the `bcrypt` crate if it were added; here we use a simple
-/// timing-safe comparison stub that works with plaintext-stored bcrypt strings.
-///
-/// For production use, add `bcrypt = "0.15"` to Cargo.toml and replace this.
+/// Verifies a password against a bcrypt hash using the `bcrypt` crate.
 fn bcrypt_verify(password: &str, hash: &str) -> bool {
-    // Stub: for now treat as plaintext comparison (replace with bcrypt::verify in production)
-    // bcrypt::verify(password, hash).unwrap_or(false)
-    constant_time_eq(password.as_bytes(), hash.as_bytes())
+    bcrypt::verify(password, hash).unwrap_or(false)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

@@ -120,9 +120,24 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             cfg_snapshot.waf_auto_ban_duration.unwrap_or(3600),
             cfg_snapshot.redis_url.as_deref().and_then(|url| redis::Client::open(url).ok()),
         );
-        let waf_engine = Arc::new(
-            waf::WafEngine::new(true, waf_reputation).with_keyval(keyval.clone()),
-        );
+        let waf_base = waf::WafEngine::new(true, waf_reputation).with_keyval(keyval.clone());
+        // Load declarative WAF policy if configured
+        let waf_base = if let Some(ref policy_path) = cfg_snapshot.waf_policy_path {
+            let mut policy_engine = waf::policy::PolicyEngine::new();
+            match policy_engine.load_from_file(policy_path) {
+                Ok(()) => {
+                    tracing::info!("WAF policy loaded from {}", policy_path);
+                    waf_base.with_policy_engine(policy_engine)
+                }
+                Err(e) => {
+                    tracing::warn!("WAF policy load failed from {}: {}", policy_path, e);
+                    waf_base
+                }
+            }
+        } else {
+            waf_base
+        };
+        let waf_engine = Arc::new(waf_base);
 
         // Service Discovery: DNS SRV records
         for (pool_name, pool_config) in &cfg_snapshot.upstreams {
@@ -149,12 +164,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             cfg_snapshot.ai_thompson_threshold_ms.unwrap_or(100.0),
         );
 
+        // Per-protocol bandwidth tracker and resource alert engine
+        let bandwidth_tracker = telemetry::bandwidth::BandwidthTracker::new();
+        let alert_engine = admin::alerts::AlertEngine::new(Arc::clone(&bandwidth_tracker));
+        // Start background alert polling every 30 seconds
+        Arc::clone(&alert_engine).spawn_background_check(30);
+
         let cfg_admin = Arc::clone(&cfg_snapshot);
         let metrics_admin = Arc::clone(&metrics);
         let discovery_admin = Arc::clone(&discovery);
         let manager_admin = Arc::clone(&upstreams);
         let keyval_admin = Arc::clone(&keyval);
         let waf_admin = Arc::clone(&waf_engine);
+        let cache_admin = Arc::clone(&cache);
+        let rate_limiter_admin = Arc::clone(&rate_limiter);
+        let bandwidth_admin = Arc::clone(&bandwidth_tracker);
+        let alert_admin = Arc::clone(&alert_engine);
         tokio::spawn(async move {
             let admin_state = admin::AdminState {
                 metrics: metrics_admin,
@@ -162,6 +187,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 manager: manager_admin,
                 keyval: keyval_admin,
                 waf: waf_admin,
+                cache: cache_admin,
+                rate_limiter: rate_limiter_admin,
+                bandwidth: bandwidth_admin,
+                alert_engine: alert_admin,
             };
             admin::start_admin_server(cfg_admin.admin_bind.clone(), admin_state).await;
         });
@@ -173,6 +202,42 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         tokio::spawn(async move {
             proxy::tcp::start_tcp_proxy(&cfg_tcp.tcp_bind, upstreams_tcp, shutdown_tcp).await;
         });
+
+        // Start the UDP Stream Proxy (opt-in: requires `udp_bind` in phalanx.conf)
+        if let Some(ref udp_addr) = cfg_snapshot.udp_bind {
+            let udp_addr = udp_addr.clone();
+            let upstreams_udp = Arc::clone(&upstreams);
+            let shutdown_udp = shutdown_token.clone();
+            tokio::spawn(async move {
+                proxy::udp::start_udp_proxy(&udp_addr, upstreams_udp, shutdown_udp).await;
+            });
+        }
+
+        // Mail Proxy (opt-in: requires smtp_bind / imap_bind / pop3_bind in phalanx.conf)
+        let mail_pool = cfg_snapshot
+            .mail_upstream_pool
+            .clone()
+            .unwrap_or_else(|| "default".to_string());
+        for (proto, bind_opt) in [
+            (mail::MailProtocol::Smtp, cfg_snapshot.smtp_bind.clone()),
+            (mail::MailProtocol::Imap, cfg_snapshot.imap_bind.clone()),
+            (mail::MailProtocol::Pop3, cfg_snapshot.pop3_bind.clone()),
+        ] {
+            if let Some(bind_addr) = bind_opt {
+                let mail_cfg = mail::MailProxyConfig {
+                    protocol: proto,
+                    bind_addr,
+                    upstream_pool: mail_pool.clone(),
+                    banner: None,
+                    starttls: false,
+                };
+                let upstreams_mail = Arc::clone(&upstreams);
+                let shutdown_mail = shutdown_token.clone();
+                tokio::spawn(async move {
+                    mail::start_mail_proxy(mail_cfg, upstreams_mail, shutdown_mail).await;
+                });
+            }
+        }
 
         // Start the HTTP/3 QUIC Server (opt-in: requires `listen_quic` in phalanx.conf)
         if let Some(ref quic_bind) = cfg_snapshot.quic_bind {
@@ -197,11 +262,108 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             });
         }
 
-        // Start the Main Protocol Multiplexer Proxy (Sniffs HTTP/gRPC/TCP on the primary port)
+        // GeoIP Database (opt-in: requires `geoip_db_path` in phalanx.conf)
+        let geo_db = if let Some(ref db_path) = cfg_snapshot.geoip_db_path {
+            let mut db = geo::GeoIpDatabase::new();
+            match db.load_csv(db_path) {
+                Ok(()) => {
+                    tracing::info!("GeoIP database loaded from {}", db_path);
+                    Some(db)
+                }
+                Err(e) => {
+                    tracing::warn!("GeoIP database failed to load from {}: {}", db_path, e);
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        let geo_db: Arc<Option<geo::GeoIpDatabase>> = Arc::new(geo_db);
+        let geo_policy = Arc::new(geo::GeoPolicy {
+            allow_countries: cfg_snapshot.geo_allow_countries.clone(),
+            deny_countries: cfg_snapshot.geo_deny_countries.clone(),
+        });
+
+        // Hook engine (pre-populated from rhai_script if configured)
         let hook_engine = Arc::new(scripting::HookEngine::new());
-        // Load global/route-level rhai scripts if configured in cfg_snapshot...
-        // For now, pass a default empty engine just to make it compile.
-        
+
+        // Sticky session manager: Cookie mode by default (opt-in per session)
+        let sticky = Arc::new(Some(proxy::sticky::StickySessionManager::new(
+            proxy::sticky::StickyMode::Cookie {
+                name: "PHALANXID".to_string(),
+                path: "/".to_string(),
+                http_only: true,
+                secure: cfg_snapshot.tls_cert_path.is_some(),
+                max_age: 3600,
+            },
+        )));
+
+        // Zone-based concurrent request limiter (tracks per-IP active requests)
+        let zone_limiter = Arc::new(middleware::connlimit::ZoneLimiter::new(
+            "per_ip",
+            1_000_000, // use PhalanxRateLimiter for actual rate; zone tracks concurrency
+            1_000_000,
+            0, // 0 = unlimited concurrent connections by default
+        ));
+
+        // OIDC session store (shared across all connections)
+        let oidc_sessions = auth::oidc::new_session_store();
+
+        // ClusterState: shared KV across Phalanx nodes via Redis or etcd.
+        // Enables distributed rate limiting, sticky sessions, and leader election.
+        let node_id = cfg_snapshot
+            .node_id
+            .clone()
+            .unwrap_or_else(|| {
+                std::env::var("HOSTNAME")
+                    .unwrap_or_else(|_| "phalanx-node-1".to_string())
+            });
+        let _cluster_state = std::sync::Arc::new({
+            use cluster::{ClusterBackend, ClusterState};
+            let backend = if let Some(endpoints_str) = cfg_snapshot.etcd_endpoints.as_deref() {
+                let endpoints: Vec<String> = endpoints_str
+                    .split(',')
+                    .map(|s| s.trim().to_string())
+                    .collect();
+                ClusterBackend::Etcd { endpoints }
+            } else if let Some(redis_url) = cfg_snapshot.redis_url.as_deref() {
+                ClusterBackend::Redis { url: redis_url.to_string() }
+            } else {
+                ClusterBackend::Standalone
+            };
+            ClusterState::new(backend, node_id)
+        });
+
+        // OCSP Stapling: fetch certificate revocation status and staple to TLS handshake.
+        // Started only when TLS is configured; improves handshake latency and privacy.
+        if cfg_snapshot.tls_cert_path.is_some() {
+            let cert_der = cfg_snapshot
+                .tls_cert_path
+                .as_deref()
+                .and_then(|p| std::fs::read(p).ok())
+                .unwrap_or_default();
+            let ocsp_stapler = std::sync::Arc::new(proxy::ocsp::OcspStapler::new(
+                cert_der,
+                None,
+                cfg_snapshot.ocsp_responder_url.clone(),
+            ));
+            ocsp_stapler.spawn_refresh_loop(std::time::Duration::from_secs(3600));
+            tracing::info!("OCSP stapling started");
+        }
+
+        // ML Fraud Detection: load ONNX model and start background inference worker.
+        // Mode: "shadow" = log only (default), "active" = auto-ban flagged IPs.
+        if let Some(ref model_path) = cfg_snapshot.ml_fraud_model_path {
+            let ml_engine = std::sync::Arc::new(waf::ml_fraud::MlFraudEngine::new());
+            let mode_str = cfg_snapshot.ml_fraud_mode.as_deref().unwrap_or("shadow");
+            if mode_str == "active" {
+                ml_engine.mode.store(std::sync::Arc::new(waf::ml_fraud::MlFraudMode::Active));
+            }
+            let ml_reputation = std::sync::Arc::clone(&waf_engine.as_ref().reputation);
+            ml_engine.load_model(model_path, ml_reputation).await;
+            tracing::info!("ML Fraud Engine started in {} mode from {}", mode_str, model_path);
+        }
+
         let cfg_proxy = Arc::clone(&cfg_snapshot);
         proxy::start_proxy(
             &cfg_proxy.proxy_bind,
@@ -215,7 +377,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             hook_engine.clone(),
             metrics.clone(),
             access_logger.clone(),
+            geo_db.clone(),
+            geo_policy.clone(),
+            sticky.clone(),
+            zone_limiter.clone(),
             shutdown_token.clone(),
+            oidc_sessions,
         )
         .await;
     });

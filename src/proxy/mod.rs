@@ -158,7 +158,12 @@ pub async fn start_proxy(
     hook_engine: Arc<crate::scripting::HookEngine>,
     metrics: Arc<ProxyMetrics>,
     access_logger: Arc<AccessLogger>,
+    geo_db: Arc<Option<crate::geo::GeoIpDatabase>>,
+    geo_policy: Arc<crate::geo::GeoPolicy>,
+    sticky: Arc<Option<crate::proxy::sticky::StickySessionManager>>,
+    zone_limiter: Arc<crate::middleware::connlimit::ZoneLimiter>,
     shutdown: CancellationToken,
+    oidc_sessions: crate::auth::oidc::OidcSessionStore,
 ) {
     let addr: SocketAddr = bind_addr.parse().expect("Invalid proxy bind address");
     let listener = TcpListener::bind(&addr).await.unwrap();
@@ -193,6 +198,11 @@ pub async fn start_proxy(
         let hook_clone = Arc::clone(&hook_engine);
         let metrics_clone = Arc::clone(&metrics);
         let logger_clone = Arc::clone(&access_logger);
+        let geo_db_clone = Arc::clone(&geo_db);
+        let geo_policy_clone = Arc::clone(&geo_policy);
+        let sticky_clone = Arc::clone(&sticky);
+        let zone_clone = Arc::clone(&zone_limiter);
+        let oidc_clone = Arc::clone(&oidc_sessions);
 
         // Spawn a new green thread per connection (Tokio task)
         tokio::spawn(async move {
@@ -273,6 +283,7 @@ pub async fn start_proxy(
             match proto {
                 Protocol::Http1 => {
                     let io = TokioIo::new(peekable_stream);
+                    let oidc_h1 = Arc::clone(&oidc_clone);
                     let svc = service_fn(move |req| {
                         let upts = Arc::clone(&upstreams_clone);
                         let cfg = Arc::clone(&config_clone);
@@ -282,6 +293,11 @@ pub async fn start_proxy(
                         let hook_svc = Arc::clone(&hook_clone);
                         let metrics_svc = Arc::clone(&metrics_clone);
                         let logger_svc = Arc::clone(&logger_clone);
+                        let geo_db_svc = Arc::clone(&geo_db_clone);
+                        let geo_policy_svc = Arc::clone(&geo_policy_clone);
+                        let sticky_svc = Arc::clone(&sticky_clone);
+                        let zone_svc = Arc::clone(&zone_clone);
+                        let oidc_svc = Arc::clone(&oidc_h1);
                         async move {
                             handle_http_request(
                                 req,
@@ -294,6 +310,11 @@ pub async fn start_proxy(
                                 hook_svc,
                                 metrics_svc,
                                 logger_svc,
+                                geo_db_svc,
+                                geo_policy_svc,
+                                sticky_svc,
+                                zone_svc,
+                                oidc_svc,
                             )
                             .await
                         }
@@ -306,6 +327,7 @@ pub async fn start_proxy(
                 }
                 Protocol::Http2 => {
                     let io = TokioIo::new(peekable_stream);
+                    let oidc_h2 = Arc::clone(&oidc_clone);
                     let svc = service_fn(move |req| {
                         let upts = Arc::clone(&upstreams_clone);
                         let cfg = Arc::clone(&config_clone);
@@ -315,6 +337,11 @@ pub async fn start_proxy(
                         let hook_svc = Arc::clone(&hook_clone);
                         let metrics_svc = Arc::clone(&metrics_clone);
                         let logger_svc = Arc::clone(&logger_clone);
+                        let geo_db_svc = Arc::clone(&geo_db_clone);
+                        let geo_policy_svc = Arc::clone(&geo_policy_clone);
+                        let sticky_svc = Arc::clone(&sticky_clone);
+                        let zone_svc = Arc::clone(&zone_clone);
+                        let oidc_svc = Arc::clone(&oidc_h2);
                         async move {
                             handle_http2_request(
                                 req,
@@ -327,6 +354,11 @@ pub async fn start_proxy(
                                 hook_svc,
                                 metrics_svc,
                                 logger_svc,
+                                geo_db_svc,
+                                geo_policy_svc,
+                                sticky_svc,
+                                zone_svc,
+                                oidc_svc,
                             )
                             .await
                         }
@@ -354,15 +386,21 @@ pub async fn start_proxy(
                                 let is_h2 = alpn.as_deref() == Some(b"h2");
 
                                 if is_h2 {
+                                    let oidc_tls_h2 = Arc::clone(&oidc_clone);
                                     let svc = service_fn(move |req| {
                                         let upts = Arc::clone(&upstreams_clone);
                                         let cfg = Arc::clone(&config_clone);
                                         let waf_svc = Arc::clone(&waf_spawn_clone);
                                         let ai_svc = Arc::clone(&ai_spawn_clone);
                                         let cache_svc = Arc::clone(&cache_clone);
-                        let hook_svc = Arc::clone(&hook_clone);
+                                        let hook_svc = Arc::clone(&hook_clone);
                                         let metrics_svc = Arc::clone(&metrics_clone);
                                         let logger_svc = Arc::clone(&logger_clone);
+                                        let geo_db_svc = Arc::clone(&geo_db_clone);
+                                        let geo_policy_svc = Arc::clone(&geo_policy_clone);
+                                        let sticky_svc = Arc::clone(&sticky_clone);
+                                        let zone_svc = Arc::clone(&zone_clone);
+                                        let oidc_svc = Arc::clone(&oidc_tls_h2);
                                         async move {
                                             handle_http2_request(
                                                 req,
@@ -372,9 +410,14 @@ pub async fn start_proxy(
                                                 waf_svc,
                                                 ai_svc,
                                                 cache_svc,
-                                hook_svc,
+                                                hook_svc,
                                                 metrics_svc,
                                                 logger_svc,
+                                                geo_db_svc,
+                                                geo_policy_svc,
+                                                sticky_svc,
+                                                zone_svc,
+                                                oidc_svc,
                                             )
                                             .await
                                         }
@@ -388,15 +431,21 @@ pub async fn start_proxy(
                                         debug!("Error serving TLS HTTP/2 connection: {:?}", e);
                                     }
                                 } else {
+                                    let oidc_tls_h1 = Arc::clone(&oidc_clone);
                                     let svc = service_fn(move |req| {
                                         let upts = Arc::clone(&upstreams_clone);
                                         let cfg = Arc::clone(&config_clone);
                                         let waf_svc = Arc::clone(&waf_spawn_clone);
                                         let ai_svc = Arc::clone(&ai_spawn_clone);
                                         let cache_svc = Arc::clone(&cache_clone);
-                        let hook_svc = Arc::clone(&hook_clone);
+                                        let hook_svc = Arc::clone(&hook_clone);
                                         let metrics_svc = Arc::clone(&metrics_clone);
                                         let logger_svc = Arc::clone(&logger_clone);
+                                        let geo_db_svc = Arc::clone(&geo_db_clone);
+                                        let geo_policy_svc = Arc::clone(&geo_policy_clone);
+                                        let sticky_svc = Arc::clone(&sticky_clone);
+                                        let zone_svc = Arc::clone(&zone_clone);
+                                        let oidc_svc = Arc::clone(&oidc_tls_h1);
                                         async move {
                                             handle_http_request(
                                                 req,
@@ -406,9 +455,14 @@ pub async fn start_proxy(
                                                 waf_svc,
                                                 ai_svc,
                                                 cache_svc,
-                                hook_svc,
+                                                hook_svc,
                                                 metrics_svc,
                                                 logger_svc,
+                                                geo_db_svc,
+                                                geo_policy_svc,
+                                                sticky_svc,
+                                                zone_svc,
+                                                oidc_svc,
                                             )
                                             .await
                                         }
@@ -504,6 +558,11 @@ async fn handle_http_request(
     hook_engine: Arc<crate::scripting::HookEngine>,
     metrics: Arc<ProxyMetrics>,
     access_logger: Arc<AccessLogger>,
+    geo_db: Arc<Option<crate::geo::GeoIpDatabase>>,
+    geo_policy: Arc<crate::geo::GeoPolicy>,
+    sticky: Arc<Option<crate::proxy::sticky::StickySessionManager>>,
+    zone_limiter: Arc<crate::middleware::connlimit::ZoneLimiter>,
+    oidc_sessions: crate::auth::oidc::OidcSessionStore,
 ) -> Result<Response<BoxBody<Bytes, hyper::Error>>, hyper::Error> {
     let app_config = app_config.load_full();
 
@@ -514,8 +573,72 @@ async fn handle_http_request(
     let start_time = std::time::Instant::now();
     let method_str = req.method().to_string();
 
-    // 0. WAF Inspection
-    let ip_str = _peer.ip().to_string();
+    // 0. Resolve real client IP (respects X-Forwarded-For from trusted proxies)
+    let trusted_proxies = realip::TrustedProxies::from_cidrs(&app_config.trusted_proxies);
+    let real_ip = realip::resolve_client_ip(&_peer, req.headers(), &trusted_proxies);
+    let ip_str = real_ip.to_string();
+
+    // Zone-based concurrent request limit (RAII guard: releases slot on any exit path)
+    let _zone_guard = {
+        if !zone_limiter.acquire_connection(&ip_str) {
+            return Ok(empty_response(hyper::StatusCode::SERVICE_UNAVAILABLE));
+        }
+        crate::middleware::connlimit::ConnectionGuard::new(Arc::clone(&zone_limiter), ip_str.clone())
+    };
+
+    // gRPC-Web detection (must happen before into_parts())
+    let is_grpc_web_req = grpc_web::is_grpc_web(&req);
+    let is_grpc_web_text = req
+        .headers()
+        .get(hyper::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .map(|ct| ct.starts_with("application/grpc-web-text"))
+        .unwrap_or(false);
+
+    // PreRoute hook phase: may rewrite path, inject headers, or short-circuit
+    if hook_engine.has_hooks(crate::scripting::HookPhase::PreRoute) {
+        let hook_ctx = crate::scripting::HookContext {
+            client_ip: ip_str.clone(),
+            method: method_str.clone(),
+            path: path.clone(),
+            query: req.uri().query().map(str::to_string),
+            headers: req
+                .headers()
+                .iter()
+                .filter_map(|(k, v)| v.to_str().ok().map(|v| (k.to_string(), v.to_string())))
+                .collect(),
+            status: None,
+            response_headers: Default::default(),
+        };
+        for result in hook_engine.execute(crate::scripting::HookPhase::PreRoute, &hook_ctx) {
+            match result {
+                crate::scripting::HookResult::Respond { status, body, .. } => {
+                    let sc = hyper::StatusCode::from_u16(status)
+                        .unwrap_or(hyper::StatusCode::INTERNAL_SERVER_ERROR);
+                    return Ok(Response::builder()
+                        .status(sc)
+                        .body(Full::new(Bytes::from(body)).map_err(|never| match never {}).boxed())
+                        .unwrap());
+                }
+                crate::scripting::HookResult::RewritePath(new_path) => {
+                    path = new_path;
+                }
+                crate::scripting::HookResult::SetHeaders(hdrs) => {
+                    for (k, v) in hdrs {
+                        if let (Ok(hk), Ok(hv)) = (
+                            hyper::header::HeaderName::from_bytes(k.as_bytes()),
+                            hyper::header::HeaderValue::from_str(&v),
+                        ) {
+                            req.headers_mut().insert(hk, hv);
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    // WAF Inspection
     let query = req.uri().query();
     let user_agent = req
         .headers()
@@ -523,12 +646,12 @@ async fn handle_http_request(
         .and_then(|v| v.to_str().ok());
 
     // Capture Accept-Encoding before WAF check (needed later for compression)
-    // Will be AND-ed with route.gzip config flag below.
-    let client_accepts_gzip = compression::accepts_gzip(
-        req.headers()
-            .get(hyper::header::ACCEPT_ENCODING)
-            .and_then(|v| v.to_str().ok()),
-    );
+    let accept_encoding = req
+        .headers()
+        .get(hyper::header::ACCEPT_ENCODING)
+        .and_then(|v| v.to_str().ok());
+    let client_accepts_gzip = compression::accepts_gzip(accept_encoding);
+    let client_accepts_brotli = crate::middleware::brotli::accepts_brotli(accept_encoding);
 
     let waf_enabled = app_config.waf_enabled.unwrap_or(false);
     if waf_enabled {
@@ -538,6 +661,22 @@ async fn handle_http_request(
             metrics.waf_blocks_total.with_label_values(&[&reason]).inc();
             return Ok(empty_response(hyper::StatusCode::FORBIDDEN));
         }
+    }
+
+    // GeoIP check (enforces allow/deny country policy and injects X-Geo-* headers)
+    if let Some(ref db) = *geo_db {
+        if let Some(geo_result) = db.lookup(&real_ip) {
+            if !geo_policy.is_allowed(&geo_result.country_code) {
+                warn!("GeoIP blocked request from {} (country: {})", ip_str, geo_result.country_code);
+                return Ok(empty_response(hyper::StatusCode::FORBIDDEN));
+            }
+            crate::geo::inject_geo_headers(req.headers_mut(), &geo_result);
+        }
+    }
+
+    // gRPC-Web CORS preflight: return 204 No Content with CORS headers for OPTIONS
+    if *req.method() == hyper::Method::OPTIONS && is_grpc_web_req {
+        return Ok(grpc_web::cors_preflight_response());
     }
 
     // Check for WebSocket upgrade request
@@ -583,7 +722,21 @@ async fn handle_http_request(
     };
     waf.ml_engine.queue_inspection(ml_event);
 
+    // Save request metadata for traffic mirroring (fire-and-forget after response)
+    let mirror_req_headers = parts.headers.clone();
+    let mirror_req_body = body_bytes.clone();
+    let mirror_req_uri = parts.uri.to_string();
+    let mirror_req_method = parts.method.to_string();
+
     let mut req = Request::from_parts(parts, Full::new(body_bytes));
+
+    // gRPC-Web: rewrite content-type to application/grpc and add TE: trailers
+    if is_grpc_web_req {
+        req = grpc_web::translate_request(req);
+    }
+
+    // Inject X-Forwarded-For, X-Real-IP, X-Forwarded-Proto headers into upstream request
+    realip::inject_forwarding_headers(req.headers_mut(), &real_ip, false);
 
     // ── Rewrite Engine ────────────────────────────────────────────────────────
     // Apply rewrite rules for the matched route BEFORE final dispatch.
@@ -754,6 +907,114 @@ async fn handle_http_request(
                 }
             }
         }
+        // 4. JWKS-based JWT Auth (dynamic public key lookup)
+        else if let Some(ref jwks_uri) = r_config.auth_jwks_uri {
+            use std::sync::OnceLock;
+            static JWKS_MGR: OnceLock<Arc<crate::auth::jwks::JwksManager>> = OnceLock::new();
+            let mgr = JWKS_MGR.get_or_init(|| Arc::new(crate::auth::jwks::JwksManager::new()));
+            if let Some(token) = crate::auth::jwt::extract_bearer_token(req.headers()) {
+                let parts: Vec<&str> = token.split('.').collect();
+                let kid = if parts.len() >= 1 {
+                    use base64::Engine;
+                    base64::engine::general_purpose::URL_SAFE_NO_PAD
+                        .decode(parts[0])
+                        .ok()
+                        .and_then(|h| serde_json::from_slice::<serde_json::Value>(&h).ok())
+                        .and_then(|v| v.get("kid").and_then(|k| k.as_str()).map(String::from))
+                } else {
+                    None
+                };
+                let auth_result = if let Some(kid_str) = kid {
+                    match mgr.find_key(jwks_uri, &kid_str).await {
+                        Some(jwk) => match crate::auth::jwks::JwksManager::decoding_key_from_jwk(&jwk) {
+                            Ok((decoding_key, algo)) => {
+                                use jsonwebtoken::{Validation, decode};
+                                use crate::auth::jwt::Claims;
+                                let mut validation = Validation::new(algo);
+                                validation.validate_aud = false;
+                                match decode::<Claims>(token, &decoding_key, &validation) {
+                                    Ok(data) => {
+                                        for (k, v) in crate::auth::jwt::claims_to_headers(&data.claims) {
+                                            if let (Ok(name), Ok(val)) = (
+                                                hyper::header::HeaderName::from_bytes(k.as_bytes()),
+                                                v.parse::<hyper::header::HeaderValue>(),
+                                            ) {
+                                                req.headers_mut().insert(name, val);
+                                            }
+                                        }
+                                        AuthResult::Allowed
+                                    }
+                                    Err(_) => AuthResult::Denied(hyper::StatusCode::UNAUTHORIZED, "JWKS JWT validation failed"),
+                                }
+                            }
+                            Err(_) => AuthResult::Denied(hyper::StatusCode::UNAUTHORIZED, "JWKS key build error"),
+                        },
+                        None => AuthResult::Denied(hyper::StatusCode::UNAUTHORIZED, "JWKS key not found"),
+                    }
+                } else {
+                    AuthResult::Denied(hyper::StatusCode::UNAUTHORIZED, "Missing kid in JWT header")
+                };
+                if let AuthResult::Denied(status, msg) = auth_result {
+                    let mut resp = Response::new(
+                        http_body_util::Full::new(Bytes::from(msg))
+                            .map_err(|_| unreachable!())
+                            .boxed(),
+                    );
+                    *resp.status_mut() = status;
+                    resp.headers_mut()
+                        .insert(hyper::header::WWW_AUTHENTICATE, "Bearer".parse().unwrap());
+                    return Ok(resp);
+                }
+            } else {
+                let mut resp = Response::new(
+                    http_body_util::Full::new(Bytes::from("Missing Bearer token"))
+                        .map_err(|_| unreachable!())
+                        .boxed(),
+                );
+                *resp.status_mut() = hyper::StatusCode::UNAUTHORIZED;
+                resp.headers_mut()
+                    .insert(hyper::header::WWW_AUTHENTICATE, "Bearer".parse().unwrap());
+                return Ok(resp);
+            }
+        }
+        // 5. OIDC session check
+        else if let Some(ref cookie_name) = r_config.auth_oidc_cookie_name {
+            let (result, session) = crate::auth::oidc::check_session(req.headers(), cookie_name, &oidc_sessions);
+            match result {
+                AuthResult::Allowed => {
+                    if let Some(s) = session {
+                        if let Ok(val) = s.sub.parse::<hyper::header::HeaderValue>() {
+                            req.headers_mut().insert(
+                                hyper::header::HeaderName::from_static("x-auth-sub"), val);
+                        }
+                        if let Some(email) = s.email {
+                            if let Ok(val) = email.parse::<hyper::header::HeaderValue>() {
+                                req.headers_mut().insert(
+                                    hyper::header::HeaderName::from_static("x-auth-email"), val);
+                            }
+                        }
+                    }
+                }
+                AuthResult::Denied(status, msg) => {
+                    if let Some(ref _issuer) = r_config.auth_oidc_issuer {
+                        let mut resp = Response::new(
+                            http_body_util::Full::new(Bytes::from("Authentication required"))
+                                .map_err(|_| unreachable!())
+                                .boxed(),
+                        );
+                        *resp.status_mut() = status;
+                        return Ok(resp);
+                    }
+                    let mut resp = Response::new(
+                        http_body_util::Full::new(Bytes::from(msg))
+                            .map_err(|_| unreachable!())
+                            .boxed(),
+                    );
+                    *resp.status_mut() = status;
+                    return Ok(resp);
+                }
+            }
+        }
     }
 
     // Extract Host Header to fallback if no specific path match is found
@@ -841,17 +1102,23 @@ async fn handle_http_request(
         None => host_name.to_string(),
     };
 
-    // ── Resolve gzip + cache flags from matched route config ──
-    let (route_gzip, route_gzip_min, route_cache, route_cache_ttl) = match route {
+    // ── Resolve gzip + brotli + cache + mirror flags from matched route config ──
+    let (route_gzip, route_gzip_min, route_cache, route_cache_ttl, route_brotli, route_mirror) = match route {
         Some((_, r)) => (
             r.gzip,
             r.gzip_min_length,
             r.proxy_cache,
             r.proxy_cache_valid_secs,
+            r.brotli,
+            r.mirror_pool.clone(),
         ),
-        None => (false, 1024, false, 60),
+        None => (false, 1024, false, 60, false, None),
     };
     let accepts_gzip = client_accepts_gzip && route_gzip;
+    // Brotli is preferred over gzip when both client and route/global config agree
+    let accepts_brotli = client_accepts_brotli && (route_brotli || app_config.brotli_enabled);
+    // Mirror pool: route-level overrides global
+    let mirror_pool = route_mirror.or_else(|| app_config.mirror_pool.clone());
 
     // ── Response Cache: lookup for GET requests ──
     let is_get = req.method() == hyper::Method::GET;
@@ -889,17 +1156,93 @@ async fn handle_http_request(
         None
     };
 
-    // 2. Fetch healthy backend from pool manager
+    // PreUpstream hook: may add headers to the request or short-circuit before backend dispatch
+    if hook_engine.has_hooks(crate::scripting::HookPhase::PreUpstream) {
+        let hook_ctx = crate::scripting::HookContext {
+            client_ip: ip_str.clone(),
+            method: method_str.clone(),
+            path: path.clone(),
+            query: req.uri().query().map(str::to_string),
+            headers: req
+                .headers()
+                .iter()
+                .filter_map(|(k, v)| v.to_str().ok().map(|v| (k.to_string(), v.to_string())))
+                .collect(),
+            status: None,
+            response_headers: Default::default(),
+        };
+        for result in hook_engine.execute(crate::scripting::HookPhase::PreUpstream, &hook_ctx) {
+            match result {
+                crate::scripting::HookResult::Respond { status, body, .. } => {
+                    let sc = hyper::StatusCode::from_u16(status)
+                        .unwrap_or(hyper::StatusCode::INTERNAL_SERVER_ERROR);
+                    return Ok(Response::builder()
+                        .status(sc)
+                        .body(
+                            Full::new(Bytes::from(body))
+                                .map_err(|never| match never {})
+                                .boxed(),
+                        )
+                        .unwrap());
+                }
+                crate::scripting::HookResult::SetHeaders(hdrs) => {
+                    for (k, v) in hdrs {
+                        if let (Ok(hk), Ok(hv)) = (
+                            hyper::header::HeaderName::from_bytes(k.as_bytes()),
+                            hyper::header::HeaderValue::from_str(&v),
+                        ) {
+                            req.headers_mut().insert(hk, hv);
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    // 2. Fetch healthy backend from pool manager, respecting sticky session preference
     let pool = upstreams
         .get_pool(pool_name.as_str())
         .or_else(|| upstreams.get_pool("default"));
 
-    let backend = match &pool {
-        Some(p) => match p.get_next_backend(Some(&_peer.ip()), Some(Arc::clone(&ai_engine))) {
+    let backend = {
+        let p = match &pool {
+            Some(p) => p,
+            None => return Ok(empty_response(hyper::StatusCode::NOT_FOUND)),
+        };
+        // Sticky session: look up preferred backend from request cookie
+        let sticky_preferred = if let Some(ref mgr) = *sticky {
+            let cookie_hdr = req
+                .headers()
+                .get(hyper::header::COOKIE)
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("");
+            mgr.extract_from_cookie(cookie_hdr)
+                .and_then(|key| match mgr.mode() {
+                    crate::proxy::sticky::StickyMode::Cookie { .. } => {
+                        crate::proxy::sticky::base64_decode_addr(&key)
+                    }
+                    _ => mgr.lookup(&key),
+                })
+                .and_then(|addr| {
+                    p.backends
+                        .load()
+                        .iter()
+                        .find(|b| {
+                            b.config.address == addr
+                                && b.is_healthy.load(Ordering::Acquire)
+                        })
+                        .cloned()
+                })
+        } else {
+            None
+        };
+        match sticky_preferred
+            .or_else(|| p.get_next_backend(Some(&_peer.ip()), Some(Arc::clone(&ai_engine))))
+        {
             Some(b) => b,
             None => return Ok(empty_response(hyper::StatusCode::BAD_GATEWAY)),
-        },
-        None => return Ok(empty_response(hyper::StatusCode::NOT_FOUND)),
+        }
     };
 
     // 3. Request Header Injection Phase (from config)
@@ -1066,9 +1409,11 @@ async fn handle_http_request(
             };
 
             let body_len = body_bytes.len();
-            let should_compress = should_compress
-                && body_len
-                    >= route_gzip_min.max(crate::middleware::compression::MIN_COMPRESS_SIZE);
+            let min_size = route_gzip_min.max(crate::middleware::compression::MIN_COMPRESS_SIZE);
+            let should_compress = should_compress && body_len >= min_size;
+            let should_brotli = accepts_brotli
+                && compression::is_compressible(Some(&content_type))
+                && body_len >= crate::middleware::brotli::MIN_BROTLI_SIZE;
 
             // ── Cache Store: cache GET 200 responses ──
             if should_cache {
@@ -1088,15 +1433,33 @@ async fn handle_http_request(
                 }
             }
 
-            // ── Compression: gzip ──
-            let (final_body, is_compressed) = if should_compress {
+            // ── Traffic Mirroring: fire-and-forget copy to shadow pool ──
+            if let Some(ref mp_name) = mirror_pool {
+                mirror::mirror_request(
+                    &mirror_req_method,
+                    &mirror_req_uri,
+                    mirror_req_headers,
+                    mirror_req_body,
+                    mp_name.clone(),
+                    Arc::clone(&upstreams),
+                );
+            }
+
+            // ── Compression: prefer Brotli > Gzip ──
+            let (final_body, content_encoding) = if should_brotli {
+                match crate::middleware::brotli::brotli_compress(&body_bytes, 6) {
+                    Some(compressed) => (compressed, "br"),
+                    None => (body_bytes, ""),
+                }
+            } else if should_compress {
                 match compression::gzip_compress(&body_bytes) {
-                    Some(compressed) => (compressed, true),
-                    None => (body_bytes, false),
+                    Some(compressed) => (compressed, "gzip"),
+                    None => (body_bytes, ""),
                 }
             } else {
-                (body_bytes, false)
+                (body_bytes, "")
             };
+            let is_compressed = !content_encoding.is_empty();
 
             // Build final response
             let mut final_resp = Response::builder()
@@ -1116,7 +1479,7 @@ async fn handle_http_request(
             if is_compressed {
                 final_resp.headers_mut().insert(
                     hyper::header::CONTENT_ENCODING,
-                    hyper::header::HeaderValue::from_static("gzip"),
+                    hyper::header::HeaderValue::from_static(content_encoding),
                 );
                 final_resp.headers_mut().insert(
                     hyper::header::HeaderName::from_static("vary"),
@@ -1125,6 +1488,32 @@ async fn handle_http_request(
                 final_resp
                     .headers_mut()
                     .remove(hyper::header::CONTENT_LENGTH);
+            }
+
+            // gRPC-Web: rewrite response content-type back to grpc-web and add CORS headers
+            if is_grpc_web_req {
+                final_resp = grpc_web::translate_response(final_resp, is_grpc_web_text);
+            }
+
+            // Sticky session: set cookie (Cookie mode) or learn from response header (Learn mode)
+            if let Some(ref mgr) = *sticky {
+                match mgr.mode() {
+                    crate::proxy::sticky::StickyMode::Cookie { .. } => {
+                        if let Some(cookie_val) = mgr.set_cookie_header(&backend_addr) {
+                            if let Ok(hv) = hyper::header::HeaderValue::from_str(&cookie_val) {
+                                final_resp.headers_mut().insert(hyper::header::SET_COOKIE, hv);
+                            }
+                        }
+                    }
+                    crate::proxy::sticky::StickyMode::Learn { .. } => {
+                        if let Some(session_key) =
+                            mgr.extract_from_response_header(final_resp.headers())
+                        {
+                            mgr.learn(session_key, backend_addr.clone());
+                        }
+                    }
+                    _ => {}
+                }
             }
 
             // Return backend socket to keepalive pool when possible.
@@ -1148,9 +1537,9 @@ async fn handle_http_request(
             // Structured Access Log
             access_logger.log(AccessLogEntry {
                 timestamp: chrono_timestamp(),
-                client_ip: ip_str,
-                method: method_str,
-                path,
+                client_ip: ip_str.clone(),
+                method: method_str.clone(),
+                path: path.clone(),
                 status: status_code,
                 latency_ms: latency,
                 backend: backend_addr,
@@ -1159,6 +1548,20 @@ async fn handle_http_request(
                 referer: String::new(),
                 user_agent: String::new(),
             });
+
+            // Log hook: post-response auditing (fire-and-forget, non-blocking)
+            if hook_engine.has_hooks(crate::scripting::HookPhase::Log) {
+                let log_ctx = crate::scripting::HookContext {
+                    client_ip: ip_str,
+                    method: method_str,
+                    path,
+                    query: None,
+                    headers: Default::default(),
+                    status: Some(status_code),
+                    response_headers: Default::default(),
+                };
+                hook_engine.execute(crate::scripting::HookPhase::Log, &log_ctx);
+            }
 
             Ok(final_resp)
         }
@@ -1197,9 +1600,14 @@ async fn handle_http2_request(
     waf: Arc<crate::waf::WafEngine>,
     ai_engine: Arc<dyn crate::ai::AiRouter>,
     cache: Arc<ResponseCache>,
-    hook_engine: Arc<crate::scripting::HookEngine>,
+    _hook_engine: Arc<crate::scripting::HookEngine>,
     metrics: Arc<ProxyMetrics>,
     access_logger: Arc<AccessLogger>,
+    _geo_db: Arc<Option<crate::geo::GeoIpDatabase>>,
+    _geo_policy: Arc<crate::geo::GeoPolicy>,
+    _sticky: Arc<Option<crate::proxy::sticky::StickySessionManager>>,
+    _zone_limiter: Arc<crate::middleware::connlimit::ZoneLimiter>,
+    oidc_sessions: crate::auth::oidc::OidcSessionStore,
 ) -> Result<Response<BoxBody<Bytes, hyper::Error>>, hyper::Error> {
     let app_config = app_config.load_full();
 
@@ -1409,6 +1817,114 @@ async fn handle_http2_request(
                     *resp.status_mut() = status;
                     resp.headers_mut()
                         .insert(hyper::header::WWW_AUTHENTICATE, "Bearer".parse().unwrap());
+                    return Ok(resp);
+                }
+            }
+        }
+        // 4. JWKS-based JWT Auth (dynamic public key lookup)
+        else if let Some(ref jwks_uri) = r_config.auth_jwks_uri {
+            use std::sync::OnceLock;
+            static JWKS_MGR_H2: OnceLock<Arc<crate::auth::jwks::JwksManager>> = OnceLock::new();
+            let mgr = JWKS_MGR_H2.get_or_init(|| Arc::new(crate::auth::jwks::JwksManager::new()));
+            if let Some(token) = crate::auth::jwt::extract_bearer_token(req.headers()) {
+                let parts: Vec<&str> = token.split('.').collect();
+                let kid = if parts.len() >= 1 {
+                    use base64::Engine;
+                    base64::engine::general_purpose::URL_SAFE_NO_PAD
+                        .decode(parts[0])
+                        .ok()
+                        .and_then(|h| serde_json::from_slice::<serde_json::Value>(&h).ok())
+                        .and_then(|v| v.get("kid").and_then(|k| k.as_str()).map(String::from))
+                } else {
+                    None
+                };
+                let auth_result = if let Some(kid_str) = kid {
+                    match mgr.find_key(jwks_uri, &kid_str).await {
+                        Some(jwk) => match crate::auth::jwks::JwksManager::decoding_key_from_jwk(&jwk) {
+                            Ok((decoding_key, algo)) => {
+                                use jsonwebtoken::{Validation, decode};
+                                use crate::auth::jwt::Claims;
+                                let mut validation = Validation::new(algo);
+                                validation.validate_aud = false;
+                                match decode::<Claims>(token, &decoding_key, &validation) {
+                                    Ok(data) => {
+                                        for (k, v) in crate::auth::jwt::claims_to_headers(&data.claims) {
+                                            if let (Ok(name), Ok(val)) = (
+                                                hyper::header::HeaderName::from_bytes(k.as_bytes()),
+                                                v.parse::<hyper::header::HeaderValue>(),
+                                            ) {
+                                                req.headers_mut().insert(name, val);
+                                            }
+                                        }
+                                        AuthResult::Allowed
+                                    }
+                                    Err(_) => AuthResult::Denied(hyper::StatusCode::UNAUTHORIZED, "JWKS JWT validation failed"),
+                                }
+                            }
+                            Err(_) => AuthResult::Denied(hyper::StatusCode::UNAUTHORIZED, "JWKS key build error"),
+                        },
+                        None => AuthResult::Denied(hyper::StatusCode::UNAUTHORIZED, "JWKS key not found"),
+                    }
+                } else {
+                    AuthResult::Denied(hyper::StatusCode::UNAUTHORIZED, "Missing kid in JWT header")
+                };
+                if let AuthResult::Denied(status, msg) = auth_result {
+                    let mut resp = Response::new(
+                        http_body_util::Full::new(Bytes::from(msg))
+                            .map_err(|_| unreachable!())
+                            .boxed(),
+                    );
+                    *resp.status_mut() = status;
+                    resp.headers_mut()
+                        .insert(hyper::header::WWW_AUTHENTICATE, "Bearer".parse().unwrap());
+                    return Ok(resp);
+                }
+            } else {
+                let mut resp = Response::new(
+                    http_body_util::Full::new(Bytes::from("Missing Bearer token"))
+                        .map_err(|_| unreachable!())
+                        .boxed(),
+                );
+                *resp.status_mut() = hyper::StatusCode::UNAUTHORIZED;
+                resp.headers_mut()
+                    .insert(hyper::header::WWW_AUTHENTICATE, "Bearer".parse().unwrap());
+                return Ok(resp);
+            }
+        }
+        // 5. OIDC session check
+        else if let Some(ref cookie_name) = r_config.auth_oidc_cookie_name {
+            let (result, session) = crate::auth::oidc::check_session(req.headers(), cookie_name, &oidc_sessions);
+            match result {
+                AuthResult::Allowed => {
+                    if let Some(s) = session {
+                        if let Ok(val) = s.sub.parse::<hyper::header::HeaderValue>() {
+                            req.headers_mut().insert(
+                                hyper::header::HeaderName::from_static("x-auth-sub"), val);
+                        }
+                        if let Some(email) = s.email {
+                            if let Ok(val) = email.parse::<hyper::header::HeaderValue>() {
+                                req.headers_mut().insert(
+                                    hyper::header::HeaderName::from_static("x-auth-email"), val);
+                            }
+                        }
+                    }
+                }
+                AuthResult::Denied(status, msg) => {
+                    if let Some(ref _issuer) = r_config.auth_oidc_issuer {
+                        let mut resp = Response::new(
+                            http_body_util::Full::new(Bytes::from("Authentication required"))
+                                .map_err(|_| unreachable!())
+                                .boxed(),
+                        );
+                        *resp.status_mut() = status;
+                        return Ok(resp);
+                    }
+                    let mut resp = Response::new(
+                        http_body_util::Full::new(Bytes::from(msg))
+                            .map_err(|_| unreachable!())
+                            .boxed(),
+                    );
+                    *resp.status_mut() = status;
                     return Ok(resp);
                 }
             }

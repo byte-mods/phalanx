@@ -24,9 +24,12 @@
 //! ```
 
 use dashmap::DashMap;
-use std::sync::Arc;
+use std::sync::{
+    Arc,
+    atomic::{AtomicU64, Ordering},
+};
 use tokio::sync::broadcast;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, info, warn};
 use webrtc::{
     api::{
         APIBuilder,
@@ -71,6 +74,13 @@ pub struct SfuTrack {
     pub mime: String,
 }
 
+/// Per-participant media stats snapshot.
+#[derive(Clone, serde::Serialize)]
+pub struct ParticipantStats {
+    pub peer_id: String,
+    pub role: String, // "publisher" or "subscriber"
+}
+
 /// A logical group of publishers and subscribers sharing the same media.
 pub struct SfuRoom {
     pub id: String,
@@ -80,6 +90,12 @@ pub struct SfuRoom {
     pub track_tx: broadcast::Sender<SfuTrack>,
     /// Active peer connections (publishers + subscribers).
     pub peers: DashMap<String, Arc<RTCPeerConnection>>,
+    /// Total RTP bytes forwarded through this room.
+    pub bytes_forwarded: Arc<AtomicU64>,
+    /// Total RTP packets forwarded.
+    pub packets_forwarded: Arc<AtomicU64>,
+    /// Publisher peer IDs (subset of peers).
+    pub publishers: DashMap<String, ()>,
 }
 
 impl SfuRoom {
@@ -90,7 +106,25 @@ impl SfuRoom {
             tracks: DashMap::new(),
             track_tx,
             peers: DashMap::new(),
+            bytes_forwarded: Arc::new(AtomicU64::new(0)),
+            packets_forwarded: Arc::new(AtomicU64::new(0)),
+            publishers: DashMap::new(),
         })
+    }
+
+    /// Total participants (publishers + subscribers).
+    pub fn participant_count(&self) -> usize {
+        self.peers.len()
+    }
+
+    /// Publisher count.
+    pub fn publisher_count(&self) -> usize {
+        self.publishers.len()
+    }
+
+    /// Subscriber count (total peers minus publishers).
+    pub fn subscriber_count(&self) -> usize {
+        self.peers.len().saturating_sub(self.publishers.len())
     }
 }
 
@@ -115,15 +149,20 @@ impl SfuState {
             .clone()
     }
 
-    /// List all active rooms with their track counts.
+    /// List all active rooms with their track and bandwidth stats.
     pub fn list_rooms(&self) -> Vec<serde_json::Value> {
         self.rooms
             .iter()
             .map(|entry| {
+                let room = entry.value();
                 serde_json::json!({
                     "id": entry.key(),
-                    "track_count": entry.value().tracks.len(),
-                    "peer_count": entry.value().peers.len(),
+                    "track_count": room.tracks.len(),
+                    "peer_count": room.participant_count(),
+                    "publishers": room.publisher_count(),
+                    "subscribers": room.subscriber_count(),
+                    "bytes_forwarded": room.bytes_forwarded.load(Ordering::Relaxed),
+                    "packets_forwarded": room.packets_forwarded.load(Ordering::Relaxed),
                 })
             })
             .collect()
@@ -239,8 +278,9 @@ pub async fn handle_publish(
             .map_err(|e| format!("Failed to create peer connection: {}", e))?,
     );
 
-    // Store the peer connection so we can manage its lifecycle
+    // Store the peer connection and mark as publisher
     room.peers.insert(peer_id.clone(), Arc::clone(&peer_connection));
+    room.publishers.insert(peer_id.clone(), ());
 
     // Clone room for the on_track callback
     let room_for_track = Arc::clone(&room);
@@ -281,9 +321,15 @@ pub async fn handle_publish(
                 let mut rtp_buf = vec![0u8; 1500];
                 loop {
                     match track.read(&mut rtp_buf).await {
-                        Ok((pkt_len, _attr)) => {
-                            if let Err(e) = local_track.write(&rtp_buf[..pkt_len.payload_offset..pkt_len.payload_offset + pkt_len.payload_size]).await {
+                        Ok((packet, _attr)) => {
+                            // Estimate size: 12-byte fixed RTP header + payload
+                            let pkt_len = (packet.payload.len() as u64) + 12;
+                            // Write the buffer content - the packet's payload is stored in rtp_buf
+                            if let Err(e) = local_track.write(&rtp_buf).await {
                                 debug!("RTP write to local track failed (ssrc={}): {}", ssrc, e);
+                            } else {
+                                room.bytes_forwarded.fetch_add(pkt_len, Ordering::Relaxed);
+                                room.packets_forwarded.fetch_add(1, Ordering::Relaxed);
                             }
                         }
                         Err(e) => {
@@ -309,6 +355,7 @@ pub async fn handle_publish(
                 || state == RTCPeerConnectionState::Closed
             {
                 room.peers.remove(&peer_id);
+                room.publishers.remove(&peer_id);
                 info!("Publisher peer {} removed from room.", peer_id);
             }
         })

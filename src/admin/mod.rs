@@ -1,4 +1,6 @@
+pub mod alerts;
 pub mod api;
+pub mod dashboard_api;
 
 use crate::discovery::{DiscoveredBackend, ServiceDiscovery};
 use crate::keyval::{KeyvalGetResponse, KeyvalListEntry, KeyvalSetRequest, KeyvalStore};
@@ -19,6 +21,14 @@ pub struct AdminState {
     pub keyval: Arc<KeyvalStore>,
     /// Shared WAF Engine for ML models
     pub waf: Arc<crate::waf::WafEngine>,
+    /// Shared response cache for purge operations
+    pub cache: Arc<crate::middleware::ResponseCache>,
+    /// Rate limiter (for top-IP dashboard panel and request counting)
+    pub rate_limiter: Arc<crate::middleware::ratelimit::PhalanxRateLimiter>,
+    /// Per-protocol bandwidth counters
+    pub bandwidth: Arc<crate::telemetry::bandwidth::BandwidthTracker>,
+    /// Resource alert engine
+    pub alert_engine: Arc<alerts::AlertEngine>,
 }
 
 /// Global metrics registry shared across the proxy and admin server.
@@ -263,11 +273,34 @@ async fn remove_backend(
 pub async fn start_admin_server(bind_addr: String, state: AdminState) {
     info!("Admin API listening on http://{}", bind_addr);
 
+    let rate_limiter = Arc::clone(&state.rate_limiter);
     let admin_state = web::Data::new(state);
+
+    // Dashboard state shares the same inner data via Arc clones
+    let dash_state: web::Data<dashboard_api::DashboardState> = {
+        let s = admin_state.as_ref();
+        web::Data::new(dashboard_api::DashboardState {
+            base: AdminState {
+                metrics: Arc::clone(&s.metrics),
+                discovery: Arc::clone(&s.discovery),
+                manager: Arc::clone(&s.manager),
+                keyval: Arc::clone(&s.keyval),
+                waf: Arc::clone(&s.waf),
+                cache: Arc::clone(&s.cache),
+                rate_limiter: Arc::clone(&s.rate_limiter),
+                bandwidth: Arc::clone(&s.bandwidth),
+                alert_engine: Arc::clone(&s.alert_engine),
+            },
+            rate_limiter,
+            bandwidth: Arc::clone(&s.bandwidth),
+            alert_engine: Arc::clone(&s.alert_engine),
+        })
+    };
 
     let server = HttpServer::new(move || {
         App::new()
             .app_data(admin_state.clone())
+            .app_data(dash_state.clone())
             .service(health)
             .service(metrics_endpoint)
             .service(api_stats)
@@ -283,6 +316,19 @@ pub async fn start_admin_server(bind_addr: String, state: AdminState) {
             .service(api::ml_upload)
             .service(api::ml_logs)
             .service(api::ml_mode)
+            .service(cache_purge)
+            // Dashboard API endpoints
+            .service(dashboard_api::list_bans)
+            .service(dashboard_api::manual_ban)
+            .service(dashboard_api::unban_ip)
+            .service(dashboard_api::list_attacks)
+            .service(dashboard_api::list_strikes)
+            .service(dashboard_api::top_rate_ips)
+            .service(dashboard_api::cluster_nodes)
+            .service(dashboard_api::cache_stats)
+            .service(dashboard_api::bandwidth_stats)
+            .service(dashboard_api::list_alerts)
+            .service(dashboard_api::trigger_alert_check)
     })
     .bind(&bind_addr)
     .expect("Invalid admin bind address")
@@ -291,6 +337,32 @@ pub async fn start_admin_server(bind_addr: String, state: AdminState) {
     if let Err(e) = server.await {
         tracing::error!("Admin server error: {}", e);
     }
+}
+
+// ─── Cache Purge Endpoint ─────────────────────────────────────────────────────
+
+#[derive(serde::Deserialize)]
+struct PurgeBody {
+    key: Option<String>,
+    prefix: Option<String>,
+}
+
+#[post("/api/cache/purge")]
+async fn cache_purge(
+    state: web::Data<AdminState>,
+    body: web::Json<PurgeBody>,
+) -> impl Responder {
+    let purged = if let Some(ref key) = body.key {
+        let removed = state.cache.purge(key).await;
+        serde_json::json!({ "status": "ok", "key": key, "removed": removed })
+    } else if let Some(ref prefix) = body.prefix {
+        let count = state.cache.purge_prefix(prefix).await;
+        serde_json::json!({ "status": "ok", "prefix": prefix, "removed_approx": count })
+    } else {
+        state.cache.purge_all().await;
+        serde_json::json!({ "status": "ok", "action": "purge_all" })
+    };
+    HttpResponse::Ok().json(purged)
 }
 
 // ─── Keyval Endpoints ─────────────────────────────────────────────────────────

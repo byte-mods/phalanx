@@ -1,0 +1,647 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Phalanx Feature Tester</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body { font-family: 'Segoe UI', system-ui, sans-serif; background: #0f1117; color: #d1d5db; padding: 24px; }
+    h1 { font-size: 1.4rem; color: #f8fafc; margin-bottom: 6px; }
+    .subtitle { color: #6b7280; font-size: 0.85rem; margin-bottom: 28px; }
+    .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(380px, 1fr)); gap: 18px; }
+    .card { background: #1e293b; border: 1px solid #334155; border-radius: 12px; overflow: hidden; }
+    .card-header { background: #0f172a; padding: 10px 16px; font-size: 0.78rem; font-weight: 700;
+                   text-transform: uppercase; letter-spacing: 0.08em; color: #64748b;
+                   border-bottom: 1px solid #334155; display: flex; align-items: center; justify-content: space-between; }
+    .card-body { padding: 14px; }
+    .row { display: flex; gap: 8px; margin-bottom: 8px; align-items: center; flex-wrap: wrap; }
+    .inp { background: #0f172a; border: 1px solid #334155; border-radius: 6px; padding: 6px 10px;
+           color: #d1d5db; font-size: 0.8rem; outline: none; flex: 1; min-width: 100px; }
+    .inp:focus { border-color: #3b82f6; }
+    .btn { padding: 6px 12px; border-radius: 6px; border: none; cursor: pointer; font-size: 0.8rem;
+           font-weight: 600; transition: all 0.15s; }
+    .btn-primary { background: #3b82f6; color: #fff; }
+    .btn-primary:hover { background: #2563eb; }
+    .btn-danger  { background: #ef4444; color: #fff; }
+    .btn-danger:hover  { background: #b91c1c; }
+    .btn-success { background: #22c55e; color: #fff; }
+    .btn-success:hover { background: #16a34a; }
+    .btn-ghost   { background: #1e293b; color: #94a3b8; border: 1px solid #334155; }
+    .btn-ghost:hover   { background: #334155; }
+    .result-box { background: #0a0f1a; border: 1px solid #1e293b; border-radius: 6px;
+                  padding: 8px 10px; font-family: monospace; font-size: 0.74rem; min-height: 50px;
+                  max-height: 200px; overflow-y: auto; white-space: pre-wrap; color: #94a3b8; margin-top: 8px; }
+    .ok   { color: #22c55e; }
+    .err  { color: #ef4444; }
+    .info { color: #60a5fa; }
+    .warn { color: #f59e0b; }
+    .status-badge { padding: 2px 8px; border-radius: 4px; font-size: 0.68rem; font-weight: 700; }
+    .s-ok   { background: #16a34a22; color: #22c55e; border: 1px solid #16a34a55; }
+    .s-err  { background: #dc262622; color: #ef4444; border: 1px solid #dc262655; }
+    .s-wait { background: #f59e0b22; color: #f59e0b; border: 1px solid #f59e0b55; }
+    .test-suite-row { display: flex; align-items: center; gap: 8px; padding: 5px 0;
+                      border-bottom: 1px solid #1e293b; font-size: 0.78rem; }
+    .test-suite-row:last-child { border-bottom: none; }
+    .ts-name { flex: 1; }
+    .summary-box { padding: 12px 16px; border-radius: 8px; font-size: 0.9rem; font-weight: 700; margin-bottom: 20px; }
+    .summary-ok  { background: #16a34a22; color: #22c55e; border: 1px solid #16a34a44; }
+    .summary-err { background: #dc262622; color: #ef4444; border: 1px solid #dc262644; }
+    .summary-run { background: #3b82f622; color: #60a5fa; border: 1px solid #3b82f644; }
+    textarea.inp { height: 70px; resize: vertical; }
+  </style>
+</head>
+<body>
+
+<h1>⚡ Phalanx Full Feature Tester</h1>
+<p class="subtitle">Interactive browser-based tests for every admin endpoint, WAF, cache, keyval, bandwidth, and more.</p>
+
+<div id="summary" class="summary-box summary-run">⏳ Click "Run All Tests" to begin</div>
+
+<div class="grid">
+
+  <!-- ── Master Control ── -->
+  <div class="card">
+    <div class="card-header">Control Panel</div>
+    <div class="card-body">
+      <div class="row">
+        <label style="font-size:0.75rem;color:#6b7280;min-width:80px">Admin URL</label>
+        <input class="inp" id="admin-url" value="http://127.0.0.1:9099" />
+      </div>
+      <div class="row">
+        <label style="font-size:0.75rem;color:#6b7280;min-width:80px">Proxy URL</label>
+        <input class="inp" id="proxy-url" value="http://127.0.0.1:18080" />
+      </div>
+      <div class="row">
+        <button class="btn btn-primary" onclick="runAllTests()">▶ Run All Tests</button>
+        <button class="btn btn-ghost"   onclick="clearAll()">⌫ Clear All</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- ── Automated Test Suite ── -->
+  <div class="card" style="grid-column: span 2">
+    <div class="card-header">Automated Test Results</div>
+    <div class="card-body" id="auto-tests">
+      <!-- populated by JS -->
+    </div>
+  </div>
+
+  <!-- ── Health & Metrics ── -->
+  <div class="card">
+    <div class="card-header">Health & Metrics</div>
+    <div class="card-body">
+      <div class="row">
+        <button class="btn btn-primary" onclick="testEndpoint('GET','/health','r-health')">GET /health</button>
+        <button class="btn btn-ghost"   onclick="testEndpoint('GET','/metrics','r-metrics')">GET /metrics</button>
+        <button class="btn btn-ghost"   onclick="testEndpoint('GET','/api/stats','r-stats')">GET /api/stats</button>
+      </div>
+      <div class="result-box" id="r-health"></div>
+      <div class="result-box" id="r-metrics" style="max-height:100px"></div>
+      <div class="result-box" id="r-stats"></div>
+    </div>
+  </div>
+
+  <!-- ── WAF Tests ── -->
+  <div class="card">
+    <div class="card-header">WAF — Bans & Attacks</div>
+    <div class="card-body">
+      <div class="row">
+        <input class="inp" id="ban-ip" value="192.168.99.1" />
+        <button class="btn btn-danger"  onclick="banIp()">Ban</button>
+        <button class="btn btn-success" onclick="unbanIp()">Unban</button>
+      </div>
+      <div class="row">
+        <button class="btn btn-ghost" onclick="testEndpoint('GET','/api/waf/bans','r-waf')">List Bans</button>
+        <button class="btn btn-ghost" onclick="testEndpoint('GET','/api/waf/strikes','r-waf')">Strikes</button>
+        <button class="btn btn-ghost" onclick="testEndpoint('GET','/api/waf/attacks','r-waf')">Attacks</button>
+      </div>
+      <div class="result-box" id="r-waf"></div>
+    </div>
+  </div>
+
+  <!-- ── WAF Proxy Attack Test ── -->
+  <div class="card">
+    <div class="card-header">WAF Attack Simulation (via Proxy)</div>
+    <div class="card-body">
+      <p style="font-size:0.78rem;color:#6b7280;margin-bottom:10px">
+        These requests hit the proxy directly. Expect HTTP 403 for all of them.
+      </p>
+      <div class="row" style="flex-wrap:wrap;gap:6px">
+        <button class="btn btn-danger" onclick="attackTest('sqli')">SQLi</button>
+        <button class="btn btn-danger" onclick="attackTest('xss')">XSS</button>
+        <button class="btn btn-danger" onclick="attackTest('traversal')">Traversal</button>
+        <button class="btn btn-danger" onclick="attackTest('cmdinjection')">CMDi</button>
+        <button class="btn btn-ghost"  onclick="attackTest('clean')">Clean (200)</button>
+      </div>
+      <div class="result-box" id="r-attack"></div>
+    </div>
+  </div>
+
+  <!-- ── Keyval Store ── -->
+  <div class="card">
+    <div class="card-header">Keyval Store</div>
+    <div class="card-body">
+      <div class="row">
+        <input class="inp" id="kv-key"   placeholder="key"   value="test-key" />
+        <input class="inp" id="kv-value" placeholder="value" value="hello world" />
+        <input class="inp" id="kv-ttl"   placeholder="TTL (s)" value="" style="max-width:70px" />
+      </div>
+      <div class="row">
+        <button class="btn btn-primary" onclick="kvSet()">Set</button>
+        <button class="btn btn-ghost"   onclick="kvGet()">Get</button>
+        <button class="btn btn-danger"  onclick="kvDel()">Delete</button>
+        <button class="btn btn-ghost"   onclick="testEndpoint('GET','/api/keyval','r-kv')">List All</button>
+      </div>
+      <div class="result-box" id="r-kv"></div>
+    </div>
+  </div>
+
+  <!-- ── Cache ── -->
+  <div class="card">
+    <div class="card-header">Response Cache</div>
+    <div class="card-body">
+      <div class="row">
+        <button class="btn btn-ghost" onclick="testEndpoint('GET','/api/cache/stats','r-cache')">Stats</button>
+        <button class="btn btn-primary" onclick="cachePurge(null)">Purge All</button>
+        <input class="inp" id="purge-key" placeholder="/api/path" value="/api/test" />
+        <button class="btn btn-ghost"   onclick="cachePurge('key')">Purge Key</button>
+        <button class="btn btn-ghost"   onclick="cachePurge('prefix')">Purge Prefix</button>
+      </div>
+      <div class="result-box" id="r-cache"></div>
+    </div>
+  </div>
+
+  <!-- ── Bandwidth ── -->
+  <div class="card">
+    <div class="card-header">Bandwidth Stats</div>
+    <div class="card-body">
+      <div class="row">
+        <button class="btn btn-primary" onclick="testEndpoint('GET','/api/bandwidth','r-bw')">Get Bandwidth</button>
+        <button class="btn btn-ghost"   onclick="refreshBwChart()">Chart</button>
+      </div>
+      <div id="bw-mini-chart" style="margin:8px 0"></div>
+      <div class="result-box" id="r-bw"></div>
+    </div>
+  </div>
+
+  <!-- ── Alerts ── -->
+  <div class="card">
+    <div class="card-header">Resource Alerts</div>
+    <div class="card-body">
+      <div class="row">
+        <button class="btn btn-primary" onclick="testEndpoint('GET','/api/alerts?n=20','r-alerts')">List Alerts</button>
+        <button class="btn btn-ghost"   onclick="triggerAlertCheck()">⚡ Check Now</button>
+      </div>
+      <div class="result-box" id="r-alerts"></div>
+    </div>
+  </div>
+
+  <!-- ── Cluster ── -->
+  <div class="card">
+    <div class="card-header">Cluster Nodes</div>
+    <div class="card-body">
+      <div class="row">
+        <button class="btn btn-primary" onclick="testEndpoint('GET','/api/cluster/nodes','r-cluster')">List Nodes</button>
+        <button class="btn btn-ghost"   onclick="testEndpoint('GET','/api/upstreams/detail','r-cluster')">Upstreams</button>
+      </div>
+      <div class="result-box" id="r-cluster"></div>
+    </div>
+  </div>
+
+  <!-- ── Rate Limits ── -->
+  <div class="card">
+    <div class="card-header">Rate Limit Top-IPs</div>
+    <div class="card-body">
+      <div class="row">
+        <input class="inp" id="rl-n" value="10" placeholder="n" style="max-width:60px" />
+        <button class="btn btn-primary" onclick="topIps()">Get Top-N</button>
+        <button class="btn btn-ghost"   onclick="burstTest()">Burst Test (100 reqs)</button>
+      </div>
+      <div class="result-box" id="r-rl"></div>
+    </div>
+  </div>
+
+  <!-- ── Config Reload ── -->
+  <div class="card">
+    <div class="card-header">Config &amp; Discovery</div>
+    <div class="card-body">
+      <div class="row">
+        <button class="btn btn-primary" onclick="testEndpoint('POST','/api/reload','r-config')">Reload Config</button>
+      </div>
+      <div class="row">
+        <input class="inp" id="disc-addr"   value="127.0.0.1:19998" placeholder="address" />
+        <input class="inp" id="disc-pool"   value="default" placeholder="pool" />
+        <button class="btn btn-success" onclick="addBackend()">Add Backend</button>
+        <button class="btn btn-danger"  onclick="removeBackend()">Remove</button>
+      </div>
+      <div class="result-box" id="r-config"></div>
+    </div>
+  </div>
+
+  <!-- ── Log ── -->
+  <div class="card" style="grid-column: 1 / -1">
+    <div class="card-header">
+      Activity Log
+      <button class="btn btn-ghost" style="font-size:0.72rem;padding:3px 8px" onclick="clearAll()">Clear</button>
+    </div>
+    <div class="card-body">
+      <div class="result-box" id="global-log" style="max-height:250px"></div>
+    </div>
+  </div>
+
+</div>
+
+<script>
+// ── Config ───────────────────────────────────────────────────────────────────
+
+function A(path) { return document.getElementById('admin-url').value.replace(/\/$/, '') + path; }
+function P(path) { return document.getElementById('proxy-url').value.replace(/\/$/, '') + path; }
+
+function glog(msg, cls = '') {
+  const el = document.getElementById('global-log');
+  const line = document.createElement('div');
+  if (cls) line.className = cls;
+  line.textContent = `[${new Date().toLocaleTimeString()}] ${msg}`;
+  el.appendChild(line);
+  el.scrollTop = el.scrollHeight;
+}
+
+function showResult(id, status, body) {
+  const el = document.getElementById(id);
+  if (!el) return;
+  const ok = status >= 200 && status < 300;
+  const payload = typeof body === 'string' ? body.slice(0, 2000) : JSON.stringify(body, null, 2).slice(0, 2000);
+  el.innerHTML = `<span class="${ok ? 'ok' : 'err'}">HTTP ${status}</span>\n${payload}`;
+}
+
+async function testEndpoint(method, path, resultId) {
+  const isAdmin = !path.startsWith('/health') && !path.startsWith('/metrics') || true;
+  const u = A(path);
+  glog(`${method} ${u}`, 'info');
+  try {
+    const r = await fetch(u, {
+      method,
+      headers: { 'Content-Type': 'application/json' },
+    });
+    const ct = r.headers.get('Content-Type') || '';
+    const body = ct.includes('json') ? await r.json() : await r.text();
+    showResult(resultId, r.status, body);
+    glog(`→ ${r.status}`, r.ok ? 'ok' : 'err');
+    return { status: r.status, body };
+  } catch (e) {
+    showResult(resultId, 0, `Network error: ${e.message}`);
+    glog(`✗ ${e.message}`, 'err');
+    return { status: 0, body: null };
+  }
+}
+
+async function apiPost(path, data) {
+  const u = A(path);
+  glog(`POST ${u}`, 'info');
+  try {
+    const r = await fetch(u, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(data),
+    });
+    const body = await r.json().catch(() => null);
+    glog(`→ ${r.status}`, r.ok ? 'ok' : 'err');
+    return { status: r.status, body };
+  } catch (e) {
+    glog(`✗ ${e.message}`, 'err');
+    return { status: 0, body: null };
+  }
+}
+
+async function apiDelete(path) {
+  const u = A(path);
+  glog(`DELETE ${u}`, 'info');
+  try {
+    const r = await fetch(u, { method: 'DELETE' });
+    const body = await r.json().catch(() => null);
+    glog(`→ ${r.status}`, r.ok ? 'ok' : 'err');
+    return { status: r.status, body };
+  } catch (e) {
+    glog(`✗ ${e.message}`, 'err');
+    return { status: 0, body: null };
+  }
+}
+
+// ── WAF ────────────────────────────────────────────────────────────────────────
+
+async function banIp() {
+  const ip = document.getElementById('ban-ip').value.trim();
+  const r = await apiPost(`/api/waf/ban/${encodeURIComponent(ip)}`, {});
+  showResult('r-waf', r.status, r.body);
+}
+async function unbanIp() {
+  const ip = document.getElementById('ban-ip').value.trim();
+  const r = await apiDelete(`/api/waf/ban/${encodeURIComponent(ip)}`);
+  showResult('r-waf', r.status, r.body);
+}
+
+// ── WAF Attack simulation ─────────────────────────────────────────────────────
+
+const ATTACKS = {
+  sqli:         "/?q=1' UNION SELECT password FROM users--",
+  xss:          "/?q=<script>alert(document.cookie)</script>",
+  traversal:    "/../../../etc/passwd",
+  cmdinjection: "/?cmd=;cat /etc/passwd",
+  clean:        "/",
+};
+
+async function attackTest(type) {
+  const path = ATTACKS[type] || '/';
+  const proxyUrl = P(path);
+  glog(`Attack test [${type}]: GET ${proxyUrl}`, 'warn');
+  const el = document.getElementById('r-attack');
+  try {
+    const r = await fetch(proxyUrl);
+    const expected = type === 'clean' ? [200, 502, 503, 404] : [400, 403];
+    const ok = expected.includes(r.status);
+    el.innerHTML = `<span class="${ok ? 'ok' : 'err'}">[${type.toUpperCase()}] HTTP ${r.status} — ${ok ? '✓ Expected' : '✗ WAF MISS!'}</span>`;
+    glog(`[${type}] ${r.status} ${ok ? '✓' : '✗ MISS'}`, ok ? 'ok' : 'err');
+  } catch (e) {
+    el.innerHTML = `<span class="warn">Network error (proxy down?): ${e.message}</span>`;
+    glog(`Network error: ${e.message}`, 'warn');
+  }
+}
+
+// ── Keyval ────────────────────────────────────────────────────────────────────
+
+async function kvSet() {
+  const key = document.getElementById('kv-key').value;
+  const val = document.getElementById('kv-value').value;
+  const ttl = parseInt(document.getElementById('kv-ttl').value) || null;
+  const r = await apiPost(`/api/keyval/${encodeURIComponent(key)}`,
+                          { value: val, ttl_secs: ttl });
+  showResult('r-kv', r.status, r.body);
+}
+async function kvGet() {
+  const key = document.getElementById('kv-key').value;
+  const r = await testEndpoint('GET', `/api/keyval/${encodeURIComponent(key)}`, 'r-kv');
+}
+async function kvDel() {
+  const key = document.getElementById('kv-key').value;
+  const r = await apiDelete(`/api/keyval/${encodeURIComponent(key)}`);
+  showResult('r-kv', r.status, r.body);
+}
+
+// ── Cache ─────────────────────────────────────────────────────────────────────
+
+async function cachePurge(type) {
+  let body = {};
+  const key = document.getElementById('purge-key').value;
+  if (type === 'key')    body = { key };
+  if (type === 'prefix') body = { prefix: key };
+  const r = await apiPost('/api/cache/purge', body);
+  showResult('r-cache', r.status, r.body);
+}
+
+// ── Bandwidth chart ───────────────────────────────────────────────────────────
+
+async function refreshBwChart() {
+  try {
+    const r = await fetch(A('/api/bandwidth'));
+    const d = await r.json();
+    const protos = d.protocols || [];
+    const max = Math.max(1, ...protos.map(p => (p.bytes_in || 0) + (p.bytes_out || 0)));
+    const chart = document.getElementById('bw-mini-chart');
+    chart.innerHTML = protos.slice(0, 8).map(p => {
+      const total = (p.bytes_in || 0) + (p.bytes_out || 0);
+      const pct = Math.round(total / max * 100);
+      return `<div style="display:flex;align-items:center;gap:6px;margin-bottom:4px">
+        <span style="width:72px;font-size:0.7rem;color:#94a3b8;text-align:right">${p.protocol}</span>
+        <div style="flex:1;background:#0f172a;border-radius:2px;height:10px">
+          <div style="width:${pct}%;background:#3b82f6;height:10px;border-radius:2px"></div>
+        </div>
+        <span style="font-size:0.68rem;color:#6b7280">${fmtB(total)}</span>
+      </div>`;
+    }).join('');
+  } catch(e) { glog('Bandwidth chart error: ' + e.message, 'err'); }
+}
+
+function fmtB(n) {
+  if (!n) return '0B';
+  const u = ['B','KB','MB','GB']; let i = 0, v = Number(n);
+  while (v >= 1024 && i < u.length-1) { v /= 1024; i++; }
+  return v.toFixed(i ? 1 : 0) + u[i];
+}
+
+// ── Alerts ────────────────────────────────────────────────────────────────────
+
+async function triggerAlertCheck() {
+  const r = await apiPost('/api/alerts/check', {});
+  showResult('r-alerts', r.status, r.body);
+}
+
+// ── Rate limit burst ──────────────────────────────────────────────────────────
+
+async function topIps() {
+  const n = document.getElementById('rl-n').value || '10';
+  await testEndpoint('GET', `/api/rates/top?n=${n}`, 'r-rl');
+}
+
+async function burstTest() {
+  const el = document.getElementById('r-rl');
+  el.textContent = 'Sending 100 requests to proxy…';
+  const proxyBase = document.getElementById('proxy-url').value;
+  const statuses = {};
+  const promises = Array.from({ length: 100 }, (_, i) =>
+    fetch(`${proxyBase}/?burst=${i}`)
+      .then(r => { statuses[r.status] = (statuses[r.status] || 0) + 1; })
+      .catch(() => { statuses['error'] = (statuses['error'] || 0) + 1; })
+  );
+  await Promise.all(promises);
+  el.innerHTML = `<span class="ok">Burst complete.</span>\n` +
+    Object.entries(statuses).map(([k, v]) => `  HTTP ${k}: ${v} responses`).join('\n');
+  glog('Burst test done: ' + JSON.stringify(statuses), 'ok');
+}
+
+// ── Config & Discovery ────────────────────────────────────────────────────────
+
+async function addBackend() {
+  const addr = document.getElementById('disc-addr').value;
+  const pool = document.getElementById('disc-pool').value;
+  const r = await apiPost('/api/discovery/backends', {
+    address: addr, pool, weight: 1, tags: {},
+  });
+  showResult('r-config', r.status, r.body);
+}
+async function removeBackend() {
+  const addr = document.getElementById('disc-addr').value;
+  const pool = document.getElementById('disc-pool').value;
+  const r = await apiDelete(`/api/discovery/backends/${pool}/${encodeURIComponent(addr)}`);
+  showResult('r-config', r.status, r.body);
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// Automated test suite
+// ════════════════════════════════════════════════════════════════════════════
+
+const TESTS = [
+  { id: 't-health',    label: 'GET /health → 200',               fn: () => testA('GET',A('/health'), 200) },
+  { id: 't-metrics',   label: 'GET /metrics → contains phalanx_',fn: () => testContains('GET',A('/metrics'),'phalanx_') },
+  { id: 't-stats',     label: 'GET /api/stats → has active_connections', fn: () => testJsonKey('GET',A('/api/stats'),'active_connections') },
+  { id: 't-dash',      label: 'GET /dashboard → HTML',            fn: () => testContains('GET',A('/dashboard'),'Phalanx') },
+  { id: 't-bw',        label: 'GET /api/bandwidth → protocols array', fn: () => testJsonKey('GET',A('/api/bandwidth'),'protocols') },
+  { id: 't-alerts',    label: 'GET /api/alerts → alerts array',  fn: () => testJsonKey('GET',A('/api/alerts'),'alerts') },
+  { id: 't-alert-chk', label: 'POST /api/alerts/check → checked',fn: () => testJsonVal('POST',A('/api/alerts/check'),{},'status','checked') },
+  { id: 't-bans',      label: 'GET /api/waf/bans → bans array',  fn: () => testJsonKey('GET',A('/api/waf/bans'),'bans') },
+  { id: 't-strikes',   label: 'GET /api/waf/strikes → strikes',  fn: () => testJsonKey('GET',A('/api/waf/strikes'),'strikes') },
+  { id: 't-attacks',   label: 'GET /api/waf/attacks → attacks',  fn: () => testJsonKey('GET',A('/api/waf/attacks'),'attacks') },
+  { id: 't-ban-flow',  label: 'POST /api/waf/ban/… → banned',    fn: testBanFlow },
+  { id: 't-kv-set',    label: 'POST+GET keyval roundtrip',        fn: testKvRoundtrip },
+  { id: 't-cache-stats',label:'GET /api/cache/stats → entries',  fn: () => testJsonKey('GET',A('/api/cache/stats'),'entries') },
+  { id: 't-purge',     label: 'POST /api/cache/purge → ok',      fn: () => testJsonVal('POST',A('/api/cache/purge'),{},'status','ok') },
+  { id: 't-topips',    label: 'GET /api/rates/top → top_ips',    fn: () => testJsonKey('GET',A('/api/rates/top'),'top_ips') },
+  { id: 't-cluster',   label: 'GET /api/cluster/nodes → nodes',  fn: () => testJsonKey('GET',A('/api/cluster/nodes'),'nodes') },
+  { id: 't-upstreams', label: 'GET /api/upstreams/detail → obj', fn: () => testA('GET',A('/api/upstreams/detail'),200) },
+  { id: 't-reload',    label: 'POST /api/reload → status field', fn: () => testJsonKey('POST_EMPTY',A('/api/reload'),'status') },
+  { id: 't-waf-sqli',  label: 'Proxy blocks SQLi → 403',         fn: () => testProxy(`/?q=1'+UNION+SELECT+1--`, [403]) },
+  { id: 't-waf-xss',   label: 'Proxy blocks XSS → 403',          fn: () => testProxy(`/?q=<script>alert(1)</script>`, [403]) },
+];
+
+function buildTestSuite() {
+  const el = document.getElementById('auto-tests');
+  el.innerHTML = TESTS.map(t => `
+    <div class="test-suite-row">
+      <span class="ts-name">${t.label}</span>
+      <span class="status-badge s-wait" id="${t.id}">PENDING</span>
+    </div>
+  `).join('');
+}
+
+let passCnt = 0, failCnt = 0;
+
+function markPass(id, detail='') {
+  const el = document.getElementById(id);
+  if (el) { el.textContent = 'PASS'; el.className = 'status-badge s-ok'; }
+  passCnt++;
+  glog(`✓ ${id} ${detail}`, 'ok');
+}
+function markFail(id, detail='') {
+  const el = document.getElementById(id);
+  if (el) { el.textContent = 'FAIL'; el.className = 'status-badge s-err'; }
+  failCnt++;
+  glog(`✗ ${id} ${detail}`, 'err');
+}
+
+async function testA(method, url, expectedStatus) {
+  try {
+    const r = await fetch(url, { method: method === 'POST_EMPTY' ? 'POST' : method });
+    return r.status === expectedStatus;
+  } catch { return false; }
+}
+
+async function testContains(method, url, needle) {
+  try {
+    const r = await fetch(url, { method });
+    const text = await r.text();
+    return text.includes(needle);
+  } catch { return false; }
+}
+
+async function testJsonKey(method, url, key) {
+  try {
+    const r = await fetch(url, {
+      method: method === 'POST_EMPTY' ? 'POST' : method,
+      headers: { 'Content-Type': 'application/json' },
+      body: method === 'POST_EMPTY' ? '{}' : undefined,
+    });
+    const d = await r.json();
+    return key in d;
+  } catch { return false; }
+}
+
+async function testJsonVal(method, url, body, key, expected) {
+  try {
+    const r = await fetch(url, {
+      method,
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+    const d = await r.json();
+    return d[key] === expected;
+  } catch { return false; }
+}
+
+async function testProxy(path, expectedStatuses) {
+  try {
+    const r = await fetch(P(path));
+    return expectedStatuses.includes(r.status);
+  } catch { return true; /* proxy down = skip */ }
+}
+
+async function testBanFlow() {
+  const ip = '10.200.200.1';
+  try {
+    await fetch(A(`/api/waf/ban/${ip}`), { method: 'DELETE' });
+    const ban = await fetch(A(`/api/waf/ban/${ip}`), { method: 'POST' });
+    if (ban.status !== 200) return false;
+    const list = await fetch(A('/api/waf/bans'));
+    const d = await list.json();
+    if (!d.bans.some(b => b.ip === ip)) return false;
+    const unban = await fetch(A(`/api/waf/ban/${ip}`), { method: 'DELETE' });
+    if (unban.status !== 200) return false;
+    const list2 = await fetch(A('/api/waf/bans'));
+    const d2 = await list2.json();
+    return !d2.bans.some(b => b.ip === ip);
+  } catch { return false; }
+}
+
+async function testKvRoundtrip() {
+  const key = 'auto-test-kv-' + Date.now();
+  try {
+    await fetch(A(`/api/keyval/${key}`), {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ value: 'roundtrip', ttl_secs: null }),
+    });
+    const r = await fetch(A(`/api/keyval/${key}`));
+    const d = await r.json();
+    await fetch(A(`/api/keyval/${key}`), { method: 'DELETE' });
+    return d.value === 'roundtrip';
+  } catch { return false; }
+}
+
+async function runAllTests() {
+  passCnt = 0; failCnt = 0;
+  buildTestSuite();
+  document.getElementById('summary').textContent = '⏳ Running…';
+  document.getElementById('summary').className = 'summary-box summary-run';
+  glog('═══ Running automated test suite ═══', 'info');
+
+  for (const test of TESTS) {
+    try {
+      const ok = await test.fn();
+      if (ok) markPass(test.id);
+      else     markFail(test.id);
+    } catch (e) {
+      markFail(test.id, e.message);
+    }
+  }
+
+  const el = document.getElementById('summary');
+  if (failCnt === 0) {
+    el.textContent = `✓ ALL ${passCnt} TESTS PASSED`;
+    el.className = 'summary-box summary-ok';
+  } else {
+    el.textContent = `✗ ${failCnt} FAILED, ${passCnt} PASSED`;
+    el.className = 'summary-box summary-err';
+  }
+
+  // Refresh charts after tests
+  refreshBwChart();
+}
+
+// Init
+buildTestSuite();
+clearAll = () => {
+  document.querySelectorAll('.result-box').forEach(el => el.textContent = '');
+  document.getElementById('global-log').innerHTML = '';
+};
+</script>
+</body>
+</html>

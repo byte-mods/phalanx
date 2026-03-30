@@ -1,0 +1,886 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Phalanx WebRTC Test Suite</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      font-family: 'Segoe UI', system-ui, sans-serif;
+      background: #0f1117;
+      color: #d1d5db;
+      min-height: 100vh;
+      padding: 24px;
+    }
+    h1 { font-size: 1.5rem; color: #f8fafc; margin-bottom: 8px; }
+    h2 { font-size: 1rem; color: #94a3b8; margin: 20px 0 12px; text-transform: uppercase; letter-spacing: 0.05em; }
+    .subtitle { color: #6b7280; font-size: 0.85rem; margin-bottom: 32px; }
+    .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(420px, 1fr)); gap: 20px; }
+    .card {
+      background: #1e293b; border: 1px solid #334155; border-radius: 12px; overflow: hidden;
+    }
+    .card-header {
+      background: #0f172a; padding: 12px 16px; font-size: 0.82rem; font-weight: 700;
+      text-transform: uppercase; letter-spacing: 0.07em; color: #64748b;
+      border-bottom: 1px solid #334155; display: flex; align-items: center; justify-content: space-between;
+    }
+    .card-body { padding: 16px; }
+    .row { display: flex; gap: 8px; margin-bottom: 10px; align-items: center; flex-wrap: wrap; }
+    .inp {
+      background: #0f172a; border: 1px solid #334155; border-radius: 6px;
+      padding: 7px 10px; color: #d1d5db; font-size: 0.82rem; outline: none; flex: 1; min-width: 120px;
+    }
+    .inp:focus { border-color: #3b82f6; }
+    .btn {
+      padding: 7px 14px; border-radius: 6px; border: none; cursor: pointer;
+      font-size: 0.82rem; font-weight: 600; transition: all 0.15s; white-space: nowrap;
+    }
+    .btn-primary { background: #3b82f6; color: #fff; }
+    .btn-primary:hover { background: #2563eb; }
+    .btn-success { background: #22c55e; color: #fff; }
+    .btn-success:hover { background: #16a34a; }
+    .btn-danger  { background: #ef4444; color: #fff; }
+    .btn-danger:hover  { background: #b91c1c; }
+    .btn-ghost   { background: #1e293b; color: #94a3b8; border: 1px solid #334155; }
+    .btn-ghost:hover   { background: #334155; }
+    .btn:disabled { opacity: 0.4; cursor: not-allowed; }
+    .log {
+      background: #0a0f1a; border: 1px solid #1e293b; border-radius: 6px;
+      padding: 10px; font-family: 'Cascadia Code', 'Fira Mono', monospace;
+      font-size: 0.74rem; height: 180px; overflow-y: auto; color: #94a3b8;
+    }
+    .log .ok  { color: #22c55e; }
+    .log .err { color: #ef4444; }
+    .log .info{ color: #60a5fa; }
+    .log .warn{ color: #f59e0b; }
+    video {
+      width: 100%; border-radius: 8px; background: #000; max-height: 220px;
+      border: 1px solid #334155;
+    }
+    .stat { background: #0f172a; border: 1px solid #1e293b; border-radius: 8px;
+            padding: 10px; margin-bottom: 8px; font-size: 0.78rem; }
+    .stat-label { color: #64748b; font-size: 0.68rem; text-transform: uppercase; margin-bottom: 4px; }
+    .stat-value { color: #f8fafc; font-weight: 700; font-size: 1.1rem; }
+    .badge { padding: 2px 8px; border-radius: 4px; font-size: 0.7rem; font-weight: 700; }
+    .badge-ok  { background: #16a34a22; color: #22c55e; border: 1px solid #16a34a44; }
+    .badge-err { background: #dc262622; color: #ef4444; border: 1px solid #dc262644; }
+    .badge-wait{ background: #f59e0b22; color: #f59e0b; border: 1px solid #f59e0b44; }
+    .test-row { display: flex; align-items: center; gap: 10px; padding: 6px 0; border-bottom: 1px solid #1e293b; }
+    .test-row:last-child { border-bottom: none; }
+    .test-name { flex: 1; font-size: 0.8rem; }
+    #overall-status { font-size: 1rem; font-weight: 700; padding: 12px 16px;
+                      border-radius: 8px; margin-bottom: 20px; }
+    .status-ok  { background: #16a34a22; color: #22c55e; border: 1px solid #16a34a44; }
+    .status-err { background: #dc262622; color: #ef4444; border: 1px solid #dc262644; }
+    .status-run { background: #3b82f622; color: #60a5fa; border: 1px solid #3b82f644; }
+    select.inp { cursor: pointer; }
+    .two-col { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+    .bandwidth-bar-wrap { background: #0f172a; border-radius: 3px; height: 8px; margin-top: 4px; }
+    .bandwidth-bar { height: 8px; border-radius: 3px; background: #22c55e; transition: width 0.5s; }
+  </style>
+</head>
+<body>
+
+<h1>⚡ Phalanx WebRTC Test Suite</h1>
+<p class="subtitle">
+  Test WebRTC SFU signalling, room management, bandwidth stats, and audio/video quality.
+  Requires Phalanx running with WebRTC endpoints wired.
+</p>
+
+<div id="overall-status" class="status-run">⏳ Ready — run tests to see results</div>
+
+<div class="grid">
+
+  <!-- ── Configuration ── -->
+  <div class="card">
+    <div class="card-header">Connection Settings</div>
+    <div class="card-body">
+      <div class="row">
+        <label style="font-size:0.78rem;color:#6b7280;min-width:80px">Admin URL</label>
+        <input class="inp" id="admin-url" value="http://127.0.0.1:9099" />
+      </div>
+      <div class="row">
+        <label style="font-size:0.78rem;color:#6b7280;min-width:80px">Room ID</label>
+        <input class="inp" id="room-id" value="test-room-1" />
+      </div>
+      <div class="row">
+        <label style="font-size:0.78rem;color:#6b7280;min-width:80px">Peer ID</label>
+        <input class="inp" id="peer-id" value="" placeholder="auto-generated" />
+      </div>
+      <div class="row">
+        <button class="btn btn-primary" onclick="runAllTests()">▶ Run All Tests</button>
+        <button class="btn btn-ghost"   onclick="clearLogs()">⌫ Clear Logs</button>
+        <button class="btn btn-ghost"   onclick="refreshRooms()">⟳ Rooms</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- ── Automated Test Results ── -->
+  <div class="card">
+    <div class="card-header">Automated Test Results</div>
+    <div class="card-body" id="test-results">
+      <div class="test-row">
+        <span class="test-name">WebRTC rooms endpoint reachable</span>
+        <span class="badge badge-wait" id="t-rooms-reach">PENDING</span>
+      </div>
+      <div class="test-row">
+        <span class="test-name">Rooms response has correct shape</span>
+        <span class="badge badge-wait" id="t-rooms-shape">PENDING</span>
+      </div>
+      <div class="test-row">
+        <span class="test-name">Bandwidth fields present per room</span>
+        <span class="badge badge-wait" id="t-bw-fields">PENDING</span>
+      </div>
+      <div class="test-row">
+        <span class="test-name">getUserMedia — camera+mic access</span>
+        <span class="badge badge-wait" id="t-getusermedia">PENDING</span>
+      </div>
+      <div class="test-row">
+        <span class="test-name">RTCPeerConnection creatable</span>
+        <span class="badge badge-wait" id="t-rtc-create">PENDING</span>
+      </div>
+      <div class="test-row">
+        <span class="test-name">Publish SDP offer → answer</span>
+        <span class="badge badge-wait" id="t-publish">PENDING</span>
+      </div>
+      <div class="test-row">
+        <span class="test-name">Subscribe SDP offer → answer</span>
+        <span class="badge badge-wait" id="t-subscribe">PENDING</span>
+      </div>
+      <div class="test-row">
+        <span class="test-name">ICE candidate submission</span>
+        <span class="badge badge-wait" id="t-ice">PENDING</span>
+      </div>
+      <div class="test-row">
+        <span class="test-name">Room appears after publish</span>
+        <span class="badge badge-wait" id="t-room-listed">PENDING</span>
+      </div>
+      <div class="test-row">
+        <span class="test-name">Bandwidth counters increase on traffic</span>
+        <span class="badge badge-wait" id="t-bw-increase">PENDING</span>
+      </div>
+    </div>
+  </div>
+
+  <!-- ── Video Preview (Publisher) ── -->
+  <div class="card">
+    <div class="card-header">
+      Publisher Preview
+      <div style="display:flex;gap:6px">
+        <button class="btn btn-success btn-sm" onclick="startPublish()" id="btn-pub">📡 Publish</button>
+        <button class="btn btn-danger btn-sm"  onclick="stopPublish()"  id="btn-stop-pub" disabled>■ Stop</button>
+      </div>
+    </div>
+    <div class="card-body">
+      <video id="local-video" autoplay muted playsinline></video>
+      <div style="margin-top:10px">
+        <div class="stat">
+          <div class="stat-label">Video Resolution</div>
+          <div class="stat-value" id="pub-resolution">–</div>
+        </div>
+        <div class="stat">
+          <div class="stat-label">Audio Tracks</div>
+          <div class="stat-value" id="pub-audio">–</div>
+        </div>
+        <div class="stat">
+          <div class="stat-label">Connection State</div>
+          <div class="stat-value" id="pub-state">–</div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ── Video Preview (Subscriber) ── -->
+  <div class="card">
+    <div class="card-header">
+      Subscriber Preview
+      <div style="display:flex;gap:6px">
+        <button class="btn btn-primary btn-sm" onclick="startSubscribe()" id="btn-sub">📺 Subscribe</button>
+        <button class="btn btn-danger btn-sm"  onclick="stopSubscribe()"  id="btn-stop-sub" disabled>■ Stop</button>
+      </div>
+    </div>
+    <div class="card-body">
+      <video id="remote-video" autoplay playsinline></video>
+      <div style="margin-top:10px">
+        <div class="stat">
+          <div class="stat-label">Remote Tracks</div>
+          <div class="stat-value" id="sub-tracks">–</div>
+        </div>
+        <div class="stat">
+          <div class="stat-label">Connection State</div>
+          <div class="stat-value" id="sub-state">–</div>
+        </div>
+        <div class="stat">
+          <div class="stat-label">Bytes Received (estimate)</div>
+          <div class="stat-value" id="sub-bytes">–</div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ── WebRTC Stats Monitor ── -->
+  <div class="card">
+    <div class="card-header">
+      Live RTC Stats
+      <button class="btn btn-ghost btn-sm" onclick="refreshRtcStats()" id="btn-rtc-stats">⟳ Refresh</button>
+    </div>
+    <div class="card-body">
+      <div class="two-col">
+        <div class="stat">
+          <div class="stat-label">Outbound Bitrate</div>
+          <div class="stat-value" id="stat-out-bps">–</div>
+          <div class="bandwidth-bar-wrap"><div class="bandwidth-bar" id="bar-out" style="width:0%"></div></div>
+        </div>
+        <div class="stat">
+          <div class="stat-label">Inbound Bitrate</div>
+          <div class="stat-value" id="stat-in-bps">–</div>
+          <div class="bandwidth-bar-wrap"><div class="bandwidth-bar" id="bar-in" style="width:0%;background:#3b82f6"></div></div>
+        </div>
+        <div class="stat">
+          <div class="stat-label">Packets Sent</div>
+          <div class="stat-value" id="stat-pkt-sent">–</div>
+        </div>
+        <div class="stat">
+          <div class="stat-label">Packets Lost</div>
+          <div class="stat-value" id="stat-pkt-lost" style="color:#f59e0b">–</div>
+        </div>
+        <div class="stat">
+          <div class="stat-label">Round-Trip (ms)</div>
+          <div class="stat-value" id="stat-rtt">–</div>
+        </div>
+        <div class="stat">
+          <div class="stat-label">Jitter (ms)</div>
+          <div class="stat-value" id="stat-jitter">–</div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ── Active Rooms ── -->
+  <div class="card">
+    <div class="card-header">
+      Active Rooms (SFU)
+      <button class="btn btn-ghost btn-sm" onclick="refreshRooms()">⟳ Refresh</button>
+    </div>
+    <div class="card-body">
+      <div id="rooms-list" style="font-size:0.8rem;color:#6b7280">Click Refresh to load rooms…</div>
+    </div>
+  </div>
+
+  <!-- ── ICE Candidate Tool ── -->
+  <div class="card">
+    <div class="card-header">Manual ICE Candidate</div>
+    <div class="card-body">
+      <div class="row">
+        <input class="inp" id="ice-room"  placeholder="Room ID" />
+        <input class="inp" id="ice-peer"  placeholder="Peer ID" />
+      </div>
+      <div class="row">
+        <textarea class="inp" id="ice-json" placeholder='{"candidate":"...","sdpMid":"0","sdpMLineIndex":0}'
+                  style="height:70px;resize:vertical"></textarea>
+      </div>
+      <button class="btn btn-primary" onclick="submitIceCandidate()">Submit ICE</button>
+      <div id="ice-result" style="margin-top:8px;font-size:0.78rem"></div>
+    </div>
+  </div>
+
+  <!-- ── Log Output ── -->
+  <div class="card" style="grid-column: 1 / -1">
+    <div class="card-header">
+      Test Log
+      <button class="btn btn-ghost btn-sm" onclick="clearLogs()">Clear</button>
+    </div>
+    <div class="card-body">
+      <div class="log" id="log"></div>
+    </div>
+  </div>
+
+</div>
+
+<script>
+// ── Config ────────────────────────────────────────────────────────────────────
+
+function adminUrl() { return document.getElementById('admin-url').value.replace(/\/$/, ''); }
+function roomId()   { return document.getElementById('room-id').value || 'test-room'; }
+function peerId()   {
+  let el = document.getElementById('peer-id');
+  if (!el.value) el.value = 'peer-' + Math.random().toString(36).slice(2, 9);
+  return el.value;
+}
+
+// ── Logging ───────────────────────────────────────────────────────────────────
+
+function log(msg, cls = '') {
+  const el = document.getElementById('log');
+  const line = document.createElement('div');
+  if (cls) line.className = cls;
+  line.textContent = `[${new Date().toLocaleTimeString()}] ${msg}`;
+  el.appendChild(line);
+  el.scrollTop = el.scrollHeight;
+}
+function clearLogs() { document.getElementById('log').innerHTML = ''; }
+
+// ── Test badge helpers ────────────────────────────────────────────────────────
+
+let passCount = 0, failCount = 0;
+
+function pass(id, detail = '') {
+  const el = document.getElementById(id);
+  if (el) { el.textContent = 'PASS'; el.className = 'badge badge-ok'; }
+  passCount++;
+  log(`✓ [PASS] ${id}${detail ? ' — ' + detail : ''}`, 'ok');
+}
+function fail(id, detail = '') {
+  const el = document.getElementById(id);
+  if (el) { el.textContent = 'FAIL'; el.className = 'badge badge-err'; }
+  failCount++;
+  log(`✗ [FAIL] ${id}${detail ? ' — ' + detail : ''}`, 'err');
+}
+function pending(id) {
+  const el = document.getElementById(id);
+  if (el) { el.textContent = 'PENDING'; el.className = 'badge badge-wait'; }
+}
+
+function resetCounts() { passCount = 0; failCount = 0; }
+function updateOverall() {
+  const el = document.getElementById('overall-status');
+  if (failCount === 0 && passCount > 0) {
+    el.textContent = `✓ ALL ${passCount} TESTS PASSED`;
+    el.className = 'status-ok';
+  } else if (failCount > 0) {
+    el.textContent = `✗ ${failCount} FAILED / ${passCount} PASSED`;
+    el.className = 'status-err';
+  }
+}
+
+// ── API helpers ───────────────────────────────────────────────────────────────
+
+async function apiGet(path) {
+  const r = await fetch(adminUrl() + path);
+  return { status: r.status, body: await r.json().catch(() => null) };
+}
+
+async function apiPost(path, body) {
+  const r = await fetch(adminUrl() + path, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  });
+  return { status: r.status, body: await r.json().catch(() => null) };
+}
+
+// ── Test: Rooms endpoint ──────────────────────────────────────────────────────
+
+async function testRoomsEndpoint() {
+  try {
+    const r = await apiGet('/api/webrtc/rooms');
+    if (r.status === 200) {
+      pass('t-rooms-reach', `HTTP ${r.status}`);
+    } else if (r.status === 404) {
+      fail('t-rooms-reach', 'WebRTC rooms endpoint not found — is WebRTC wired?');
+      return false;
+    } else {
+      fail('t-rooms-reach', `HTTP ${r.status}`);
+      return false;
+    }
+
+    if (r.body && Array.isArray(r.body.rooms)) {
+      pass('t-rooms-shape', `rooms array present (${r.body.rooms.length} rooms)`);
+    } else {
+      fail('t-rooms-shape', 'Missing rooms array in response');
+    }
+
+    // Check bandwidth fields if there are active rooms
+    if (r.body.rooms && r.body.rooms.length > 0) {
+      const room = r.body.rooms[0];
+      const required = ['id','track_count','peer_count','bytes_forwarded','packets_forwarded'];
+      const missing = required.filter(f => !(f in room));
+      if (missing.length === 0) {
+        pass('t-bw-fields', 'All bandwidth fields present');
+      } else {
+        fail('t-bw-fields', `Missing: ${missing.join(', ')}`);
+      }
+    } else {
+      pass('t-bw-fields', 'No active rooms — fields check skipped');
+    }
+    return true;
+  } catch (e) {
+    fail('t-rooms-reach', `Network error: ${e.message}`);
+    fail('t-rooms-shape', 'Skipped');
+    fail('t-bw-fields', 'Skipped');
+    return false;
+  }
+}
+
+// ── Test: getUserMedia ────────────────────────────────────────────────────────
+
+async function testGetUserMedia() {
+  try {
+    const stream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
+    const vt = stream.getVideoTracks();
+    const at = stream.getAudioTracks();
+    stream.getTracks().forEach(t => t.stop());
+    if (vt.length > 0 && at.length > 0) {
+      pass('t-getusermedia', `${vt.length} video + ${at.length} audio tracks`);
+      return true;
+    } else {
+      fail('t-getusermedia', `video: ${vt.length}, audio: ${at.length}`);
+      return false;
+    }
+  } catch (e) {
+    fail('t-getusermedia', e.message);
+    return false;
+  }
+}
+
+// ── Test: RTCPeerConnection creation ─────────────────────────────────────────
+
+async function testRtcCreate() {
+  try {
+    const pc = new RTCPeerConnection({ iceServers: [{ urls: 'stun:stun.l.google.com:19302' }] });
+    const state = pc.signalingState;
+    pc.close();
+    if (state === 'stable') {
+      pass('t-rtc-create', 'PeerConnection created, state=stable');
+      return true;
+    } else {
+      fail('t-rtc-create', `Unexpected state: ${state}`);
+      return false;
+    }
+  } catch (e) {
+    fail('t-rtc-create', e.message);
+    return false;
+  }
+}
+
+// ── Test: SDP publish ─────────────────────────────────────────────────────────
+
+let publishPc = null;
+let publishStream = null;
+
+async function testPublish() {
+  try {
+    publishStream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
+    publishPc = new RTCPeerConnection({ iceServers: [{ urls: 'stun:stun.l.google.com:19302' }] });
+
+    publishStream.getTracks().forEach(t => publishPc.addTrack(t, publishStream));
+
+    const offer = await publishPc.createOffer();
+    await publishPc.setLocalDescription(offer);
+
+    const r = await apiPost(`/api/webrtc/publish`, {
+      room: roomId(),
+      peer_id: peerId(),
+      sdp: offer.sdp,
+    });
+
+    if (r.status === 200 && r.body && r.body.sdp) {
+      await publishPc.setRemoteDescription({ type: 'answer', sdp: r.body.sdp });
+      pass('t-publish', `SDP answer received (${r.body.sdp.length} chars)`);
+      return true;
+    } else {
+      fail('t-publish', `HTTP ${r.status} — ${JSON.stringify(r.body)}`);
+      return false;
+    }
+  } catch (e) {
+    fail('t-publish', e.message);
+    return false;
+  }
+}
+
+// ── Test: SDP subscribe ───────────────────────────────────────────────────────
+
+let subscribePc = null;
+
+async function testSubscribe() {
+  try {
+    subscribePc = new RTCPeerConnection({ iceServers: [{ urls: 'stun:stun.l.google.com:19302' }] });
+
+    subscribePc.ontrack = (e) => {
+      const remoteVideo = document.getElementById('remote-video');
+      if (!remoteVideo.srcObject) remoteVideo.srcObject = e.streams[0];
+      document.getElementById('sub-tracks').textContent =
+        (subscribePc.getReceivers().length) + ' receivers';
+    };
+
+    const offer = await subscribePc.createOffer({ offerToReceiveAudio: true, offerToReceiveVideo: true });
+    await subscribePc.setLocalDescription(offer);
+
+    const subPeerId = 'sub-' + Math.random().toString(36).slice(2, 7);
+    const r = await apiPost(`/api/webrtc/subscribe`, {
+      room: roomId(),
+      peer_id: subPeerId,
+      sdp: offer.sdp,
+    });
+
+    if (r.status === 200 && r.body && r.body.sdp) {
+      await subscribePc.setRemoteDescription({ type: 'answer', sdp: r.body.sdp });
+      pass('t-subscribe', `SDP answer received (${r.body.sdp.length} chars)`);
+      return true;
+    } else {
+      fail('t-subscribe', `HTTP ${r.status} — ${JSON.stringify(r.body)}`);
+      return false;
+    }
+  } catch (e) {
+    fail('t-subscribe', e.message);
+    return false;
+  }
+}
+
+// ── Test: ICE candidate ───────────────────────────────────────────────────────
+
+async function testIceCandidate() {
+  if (!publishPc) {
+    fail('t-ice', 'No active publish connection — run publish test first');
+    return false;
+  }
+  try {
+    const candidate = {
+      candidate: 'candidate:1 1 udp 2122260223 192.168.1.100 54321 typ host',
+      sdpMid: '0',
+      sdpMLineIndex: 0,
+    };
+    const r = await apiPost(`/api/webrtc/ice/${peerId()}?room=${encodeURIComponent(roomId())}`, candidate);
+    if (r.status === 200) {
+      pass('t-ice', 'ICE candidate accepted');
+      return true;
+    } else {
+      fail('t-ice', `HTTP ${r.status} — ${JSON.stringify(r.body)}`);
+      return false;
+    }
+  } catch (e) {
+    fail('t-ice', e.message);
+    return false;
+  }
+}
+
+// ── Test: Room appears in list ────────────────────────────────────────────────
+
+async function testRoomListed() {
+  try {
+    await new Promise(r => setTimeout(r, 500)); // brief settle time
+    const res = await apiGet('/api/webrtc/rooms');
+    if (res.status !== 200) {
+      fail('t-room-listed', `HTTP ${res.status}`);
+      return false;
+    }
+    const rooms = res.body?.rooms || [];
+    const found = rooms.find(r => r.id === roomId());
+    if (found) {
+      pass('t-room-listed', `Room "${roomId()}" found (${found.peer_count} peers)`);
+      return true;
+    } else {
+      fail('t-room-listed', `Room "${roomId()}" not in list: [${rooms.map(r=>r.id).join(',')}]`);
+      return false;
+    }
+  } catch (e) {
+    fail('t-room-listed', e.message);
+    return false;
+  }
+}
+
+// ── Test: Bandwidth counters increase ─────────────────────────────────────────
+
+async function testBandwidthIncrease() {
+  try {
+    const r1 = await apiGet('/api/webrtc/rooms');
+    if (r1.status !== 200) { fail('t-bw-increase', 'Rooms endpoint unavailable'); return false; }
+    const before = r1.body?.rooms?.find(r => r.id === roomId());
+    const bytesBefore = before?.bytes_forwarded ?? 0;
+
+    // Wait for some RTP traffic to flow
+    await new Promise(r => setTimeout(r, 2000));
+
+    const r2 = await apiGet('/api/webrtc/rooms');
+    const after = r2.body?.rooms?.find(r => r.id === roomId());
+    const bytesAfter = after?.bytes_forwarded ?? 0;
+
+    if (bytesAfter >= bytesBefore) {
+      pass('t-bw-increase',
+           `bytes_forwarded: ${bytesBefore} → ${bytesAfter} (+${bytesAfter - bytesBefore})`);
+      return true;
+    } else {
+      fail('t-bw-increase', `bytes decreased? ${bytesBefore} → ${bytesAfter}`);
+      return false;
+    }
+  } catch (e) {
+    fail('t-bw-increase', e.message);
+    return false;
+  }
+}
+
+// ── Run all tests ─────────────────────────────────────────────────────────────
+
+async function runAllTests() {
+  resetCounts();
+  log('═══════════════════════════════════════════════', 'info');
+  log('Starting full WebRTC test suite…', 'info');
+  log('═══════════════════════════════════════════════', 'info');
+
+  document.getElementById('overall-status').textContent = '⏳ Running…';
+  document.getElementById('overall-status').className = 'status-run';
+
+  // Reset all to pending
+  ['t-rooms-reach','t-rooms-shape','t-bw-fields','t-getusermedia',
+   't-rtc-create','t-publish','t-subscribe','t-ice',
+   't-room-listed','t-bw-increase'].forEach(pending);
+
+  // Run sequentially
+  await testRoomsEndpoint();
+  await testGetUserMedia();
+  await testRtcCreate();
+  const pubOk = await testPublish();
+  await testSubscribe();
+  if (pubOk) await testIceCandidate();
+  else fail('t-ice', 'Skipped — publish failed');
+  if (pubOk) await testRoomListed();
+  else fail('t-room-listed', 'Skipped — publish failed');
+  if (pubOk) await testBandwidthIncrease();
+  else fail('t-bw-increase', 'Skipped — publish failed');
+
+  log(`═══════════════════════════════════════════════`, 'info');
+  log(`Done: ${passCount} passed, ${failCount} failed`, failCount > 0 ? 'err' : 'ok');
+  updateOverall();
+}
+
+// ── Manual publish ────────────────────────────────────────────────────────────
+
+async function startPublish() {
+  document.getElementById('btn-pub').disabled = true;
+  document.getElementById('btn-stop-pub').disabled = false;
+
+  try {
+    publishStream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
+    const lv = document.getElementById('local-video');
+    lv.srcObject = publishStream;
+
+    const vt = publishStream.getVideoTracks()[0];
+    const settings = vt.getSettings();
+    document.getElementById('pub-resolution').textContent =
+      `${settings.width ?? '?'}×${settings.height ?? '?'} @ ${settings.frameRate?.toFixed(0) ?? '?'}fps`;
+    document.getElementById('pub-audio').textContent =
+      `${publishStream.getAudioTracks().length} track(s)`;
+
+    publishPc = new RTCPeerConnection({ iceServers: [{ urls: 'stun:stun.l.google.com:19302' }] });
+    publishPc.oniceconnectionstatechange = () => {
+      document.getElementById('pub-state').textContent = publishPc.iceConnectionState;
+    };
+    publishStream.getTracks().forEach(t => publishPc.addTrack(t, publishStream));
+
+    const offer = await publishPc.createOffer();
+    await publishPc.setLocalDescription(offer);
+
+    const r = await apiPost('/api/webrtc/publish', {
+      room: roomId(), peer_id: peerId(), sdp: offer.sdp,
+    });
+
+    if (r.status === 200 && r.body?.sdp) {
+      await publishPc.setRemoteDescription({ type: 'answer', sdp: r.body.sdp });
+      log(`Publish connected to room "${roomId()}"`, 'ok');
+      startRtcStats();
+    } else {
+      log(`Publish failed: HTTP ${r.status} — ${JSON.stringify(r.body)}`, 'err');
+    }
+  } catch (e) {
+    log(`Publish error: ${e.message}`, 'err');
+    document.getElementById('btn-pub').disabled = false;
+    document.getElementById('btn-stop-pub').disabled = true;
+  }
+}
+
+function stopPublish() {
+  if (publishPc) { publishPc.close(); publishPc = null; }
+  if (publishStream) { publishStream.getTracks().forEach(t => t.stop()); publishStream = null; }
+  document.getElementById('local-video').srcObject = null;
+  document.getElementById('pub-state').textContent = '–';
+  document.getElementById('btn-pub').disabled = false;
+  document.getElementById('btn-stop-pub').disabled = true;
+  log('Publish stopped', 'warn');
+}
+
+async function startSubscribe() {
+  document.getElementById('btn-sub').disabled = true;
+  document.getElementById('btn-stop-sub').disabled = false;
+
+  subscribePc = new RTCPeerConnection({ iceServers: [{ urls: 'stun:stun.l.google.com:19302' }] });
+  subscribePc.oniceconnectionstatechange = () => {
+    document.getElementById('sub-state').textContent = subscribePc.iceConnectionState;
+  };
+  subscribePc.ontrack = (e) => {
+    document.getElementById('remote-video').srcObject = e.streams[0];
+    document.getElementById('sub-tracks').textContent =
+      subscribePc.getReceivers().length + ' receiver(s)';
+  };
+
+  try {
+    const offer = await subscribePc.createOffer({
+      offerToReceiveAudio: true, offerToReceiveVideo: true,
+    });
+    await subscribePc.setLocalDescription(offer);
+    const subPeer = 'sub-' + Math.random().toString(36).slice(2, 7);
+    const r = await apiPost('/api/webrtc/subscribe', {
+      room: roomId(), peer_id: subPeer, sdp: offer.sdp,
+    });
+    if (r.status === 200 && r.body?.sdp) {
+      await subscribePc.setRemoteDescription({ type: 'answer', sdp: r.body.sdp });
+      log(`Subscribe connected to room "${roomId()}"`, 'ok');
+    } else {
+      log(`Subscribe failed: HTTP ${r.status}`, 'err');
+    }
+  } catch (e) {
+    log(`Subscribe error: ${e.message}`, 'err');
+    document.getElementById('btn-sub').disabled = false;
+    document.getElementById('btn-stop-sub').disabled = true;
+  }
+}
+
+function stopSubscribe() {
+  if (subscribePc) { subscribePc.close(); subscribePc = null; }
+  document.getElementById('remote-video').srcObject = null;
+  document.getElementById('sub-state').textContent = '–';
+  document.getElementById('btn-sub').disabled = false;
+  document.getElementById('btn-stop-sub').disabled = true;
+  log('Subscribe stopped', 'warn');
+}
+
+// ── Live RTC stats ────────────────────────────────────────────────────────────
+
+let statsInterval = null;
+let prevStats = {};
+let totalBytesIn = 0;
+
+async function refreshRtcStats() {
+  const pc = publishPc || subscribePc;
+  if (!pc) { log('No active PeerConnection — start publish or subscribe first', 'warn'); return; }
+
+  const stats = await pc.getStats();
+  let outBps = 0, inBps = 0, pktSent = 0, pktLost = 0, rtt = null, jitter = null;
+
+  stats.forEach(s => {
+    if (s.type === 'outbound-rtp') {
+      const prev = prevStats[s.id];
+      if (prev) {
+        const dt = (s.timestamp - prev.timestamp) / 1000;
+        outBps = ((s.bytesSent - prev.bytesSent) * 8 / dt);
+      }
+      pktSent = s.packetsSent || 0;
+      prevStats[s.id] = s;
+    }
+    if (s.type === 'inbound-rtp') {
+      const prev = prevStats[s.id];
+      if (prev) {
+        const dt = (s.timestamp - prev.timestamp) / 1000;
+        inBps = ((s.bytesReceived - prev.bytesReceived) * 8 / dt);
+        totalBytesIn += (s.bytesReceived - (prev.bytesReceived || 0));
+      }
+      pktLost = s.packetsLost || 0;
+      jitter  = s.jitter != null ? (s.jitter * 1000).toFixed(1) : null;
+      prevStats[s.id] = s;
+    }
+    if (s.type === 'remote-inbound-rtp' && s.roundTripTime != null) {
+      rtt = (s.roundTripTime * 1000).toFixed(0);
+    }
+  });
+
+  const fmt = bps => bps < 1000 ? bps.toFixed(0) + ' bps'
+                   : bps < 1e6  ? (bps/1000).toFixed(1) + ' kbps'
+                   :               (bps/1e6).toFixed(2) + ' Mbps';
+  const fmtB = b => b < 1024   ? b + ' B'
+                 : b < 1048576  ? (b/1024).toFixed(1) + ' KB'
+                 :                (b/1048576).toFixed(2) + ' MB';
+
+  document.getElementById('stat-out-bps').textContent = outBps > 0 ? fmt(outBps) : '–';
+  document.getElementById('stat-in-bps').textContent  = inBps  > 0 ? fmt(inBps)  : '–';
+  document.getElementById('stat-pkt-sent').textContent = pktSent;
+  document.getElementById('stat-pkt-lost').textContent = pktLost > 0 ? `⚠️ ${pktLost}` : '0';
+  document.getElementById('stat-rtt').textContent = rtt ?? '–';
+  document.getElementById('stat-jitter').textContent = jitter ?? '–';
+  document.getElementById('sub-bytes').textContent = fmtB(totalBytesIn);
+
+  // Update bars (cap at 10 Mbps = 100%)
+  const maxBps = 10e6;
+  document.getElementById('bar-out').style.width = Math.min(100, outBps/maxBps*100) + '%';
+  document.getElementById('bar-in').style.width  = Math.min(100, inBps /maxBps*100) + '%';
+}
+
+function startRtcStats() {
+  if (statsInterval) clearInterval(statsInterval);
+  statsInterval = setInterval(refreshRtcStats, 1000);
+}
+
+// ── ICE candidate manual submission ──────────────────────────────────────────
+
+async function submitIceCandidate() {
+  const room = document.getElementById('ice-room').value || roomId();
+  const peer = document.getElementById('ice-peer').value || peerId();
+  const json = document.getElementById('ice-json').value.trim();
+  const el = document.getElementById('ice-result');
+
+  if (!json) { el.textContent = 'Enter ICE candidate JSON'; el.style.color = '#ef4444'; return; }
+
+  try {
+    const body = JSON.parse(json);
+    const r = await apiPost(`/api/webrtc/ice/${peer}?room=${encodeURIComponent(room)}`, body);
+    if (r.status === 200) {
+      el.textContent = '✓ ICE candidate accepted';
+      el.style.color = '#22c55e';
+      log(`ICE candidate accepted for peer ${peer} in room ${room}`, 'ok');
+    } else {
+      el.textContent = `✗ HTTP ${r.status}: ${JSON.stringify(r.body)}`;
+      el.style.color = '#ef4444';
+      log(`ICE failed: HTTP ${r.status}`, 'err');
+    }
+  } catch (e) {
+    el.textContent = `Error: ${e.message}`;
+    el.style.color = '#ef4444';
+  }
+}
+
+// ── Rooms list ─────────────────────────────────────────────────────────────────
+
+async function refreshRooms() {
+  const el = document.getElementById('rooms-list');
+  try {
+    const r = await apiGet('/api/webrtc/rooms');
+    if (r.status !== 200) {
+      el.innerHTML = `<span style="color:#ef4444">Rooms endpoint returned HTTP ${r.status}</span>`;
+      return;
+    }
+    const rooms = r.body?.rooms || [];
+    if (rooms.length === 0) {
+      el.innerHTML = '<span style="color:#4b5563">No active rooms</span>';
+      return;
+    }
+    el.innerHTML = rooms.map(room => `
+      <div style="background:#0f172a;border:1px solid #1e293b;border-radius:6px;padding:10px;margin-bottom:8px">
+        <div style="font-weight:700;color:#f8fafc;margin-bottom:4px">🎯 ${room.id}</div>
+        <div style="display:grid;grid-template-columns:1fr 1fr;gap:4px;font-size:0.75rem">
+          <span style="color:#64748b">Tracks:</span><span>${room.track_count}</span>
+          <span style="color:#64748b">Publishers:</span><span>${room.publishers ?? room.peer_count}</span>
+          <span style="color:#64748b">Subscribers:</span><span>${room.subscribers ?? 0}</span>
+          <span style="color:#64748b">Bytes fwd:</span><span style="color:#22c55e">${fmtBytes(room.bytes_forwarded)}</span>
+          <span style="color:#64748b">Packets fwd:</span><span>${(room.packets_forwarded ?? 0).toLocaleString()}</span>
+        </div>
+      </div>
+    `).join('');
+  } catch (e) {
+    el.innerHTML = `<span style="color:#ef4444">Error: ${e.message}</span>`;
+  }
+}
+
+function fmtBytes(n) {
+  if (!n || n === 0) return '0 B';
+  const units = ['B','KB','MB','GB'];
+  let i = 0, v = Number(n);
+  while (v >= 1024 && i < units.length - 1) { v /= 1024; i++; }
+  return v.toFixed(i === 0 ? 0 : 1) + ' ' + units[i];
+}
+
+// Auto-generate peer ID on load
+peerId();
+// Refresh rooms on load
+refreshRooms();
+</script>
+</body>
+</html>

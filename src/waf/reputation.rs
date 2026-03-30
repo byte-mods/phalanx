@@ -27,8 +27,7 @@ impl IpReputationManager {
         if let Some(client) = redis_client {
             let mgr_clone = Arc::clone(&mgr);
             tokio::spawn(async move {
-                if let Ok(mut con) = client.get_async_connection().await {
-                    let mut pubsub = con.into_pubsub();
+                if let Ok(mut pubsub) = client.get_async_pubsub().await {
                     if pubsub.subscribe("phalanx:waf:strikes").await.is_ok() {
                         let mut stream = pubsub.on_message();
                         use futures_util::StreamExt;
@@ -68,9 +67,9 @@ impl IpReputationManager {
         // Broadcast to cluster
         if let Some(client) = &self.redis_client {
             let ip_str = ip.to_string();
-            let mut client_clone = client.clone();
+            let client_clone = client.clone();
             tokio::spawn(async move {
-                if let Ok(mut con) = client_clone.get_async_connection().await {
+                if let Ok(mut con) = client_clone.get_multiplexed_async_connection().await {
                     use redis::AsyncCommands;
                     let payload = format!("{}:{}", ip_str, severity);
                     let _: redis::RedisResult<()> = con.publish("phalanx:waf:strikes", payload).await;
@@ -107,6 +106,53 @@ impl IpReputationManager {
     /// Returns the current strike count for an IP (0 if not tracked).
     pub fn get_strikes(&self, ip: &str) -> u32 {
         self.strikes.get(ip).map(|e| e.0).unwrap_or(0)
+    }
+
+    /// Returns all currently-banned IPs with their strike count and seconds remaining.
+    pub fn list_bans(&self) -> Vec<(String, u32, u64)> {
+        let _now = std::time::Instant::now();
+        self.strikes
+            .iter()
+            .filter_map(|entry| {
+                let (count, last_time) = *entry.value();
+                if count >= self.ban_threshold {
+                    let elapsed = last_time.elapsed().as_secs();
+                    if elapsed < self.ban_duration_secs {
+                        let remaining = self.ban_duration_secs - elapsed;
+                        Some((entry.key().clone(), count, remaining))
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            })
+            .collect()
+    }
+
+    /// Removes an IP from the ban list (clears all strikes).
+    pub fn unban(&self, ip: &str) {
+        self.strikes.remove(ip);
+        tracing::info!("IP {} manually unbanned", ip);
+    }
+
+    /// Immediately bans an IP by setting its strikes to the threshold.
+    pub fn manual_ban(&self, ip: &str) {
+        self.strikes
+            .entry(ip.to_string())
+            .and_modify(|e| { e.0 = self.ban_threshold; e.1 = std::time::Instant::now(); })
+            .or_insert((self.ban_threshold, std::time::Instant::now()));
+        tracing::info!("IP {} manually banned", ip);
+    }
+
+    /// Returns strike count for all tracked IPs (not just banned ones), sorted by count descending.
+    pub fn list_all_strikes(&self) -> Vec<(String, u32)> {
+        let mut result: Vec<(String, u32)> = self.strikes
+            .iter()
+            .map(|e| (e.key().clone(), e.value().0))
+            .collect();
+        result.sort_by(|a, b| b.1.cmp(&a.1));
+        result
     }
 }
 
@@ -169,5 +215,53 @@ mod tests {
         let mgr = IpReputationManager::new(10, 3600, None);
         mgr.add_strike("high", 10);
         assert!(mgr.is_banned("high"));
+    }
+
+    #[tokio::test]
+    async fn test_list_bans_empty() {
+        let mgr = IpReputationManager::new(5, 3600, None);
+        assert!(mgr.list_bans().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_list_bans_returns_banned_ips() {
+        let mgr = IpReputationManager::new(3, 3600, None);
+        mgr.add_strike("1.2.3.4", 3);
+        mgr.add_strike("5.6.7.8", 1);
+        let bans = mgr.list_bans();
+        assert_eq!(bans.len(), 1);
+        assert_eq!(bans[0].0, "1.2.3.4");
+        assert_eq!(bans[0].1, 3);
+        assert!(bans[0].2 <= 3600);
+    }
+
+    #[tokio::test]
+    async fn test_unban_removes_ip() {
+        let mgr = IpReputationManager::new(3, 3600, None);
+        mgr.add_strike("victim", 5);
+        assert!(mgr.is_banned("victim"));
+        mgr.unban("victim");
+        assert!(!mgr.is_banned("victim"));
+        assert_eq!(mgr.get_strikes("victim"), 0);
+    }
+
+    #[tokio::test]
+    async fn test_manual_ban() {
+        let mgr = IpReputationManager::new(5, 3600, None);
+        assert!(!mgr.is_banned("target"));
+        mgr.manual_ban("target");
+        assert!(mgr.is_banned("target"));
+    }
+
+    #[tokio::test]
+    async fn test_list_all_strikes_sorted() {
+        let mgr = IpReputationManager::new(100, 3600, None);
+        mgr.add_strike("a", 10);
+        mgr.add_strike("b", 30);
+        mgr.add_strike("c", 20);
+        let strikes = mgr.list_all_strikes();
+        assert_eq!(strikes[0].0, "b");
+        assert_eq!(strikes[1].0, "c");
+        assert_eq!(strikes[2].0, "a");
     }
 }

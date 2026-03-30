@@ -12,37 +12,64 @@
       color: #d1d5db;
       min-height: 100vh;
     }
+    /* ── Layout ── */
     header {
       background: linear-gradient(135deg, #1e293b 0%, #0f172a 100%);
       border-bottom: 1px solid #334155;
-      padding: 16px 24px;
+      padding: 14px 24px;
       display: flex;
       align-items: center;
-      justify-content: space-between;
+      gap: 16px;
     }
-    header h1 { font-size: 1.4rem; color: #f8fafc; letter-spacing: 0.03em; }
-    header .badge {
+    header h1 { font-size: 1.3rem; color: #f8fafc; letter-spacing: 0.03em; flex: 1; }
+    .badge {
       background: #22c55e22;
       border: 1px solid #22c55e55;
       color: #22c55e;
       border-radius: 6px;
       padding: 3px 10px;
-      font-size: 0.75rem;
+      font-size: 0.72rem;
+      font-weight: 700;
     }
-    .toolbar {
-      padding: 12px 24px;
+    .badge-warn {
+      background: #f59e0b22;
+      border: 1px solid #f59e0b55;
+      color: #f59e0b;
+    }
+    nav {
+      background: #111827;
+      border-bottom: 1px solid #1e293b;
+      padding: 0 24px;
       display: flex;
-      gap: 12px;
+      gap: 0;
+    }
+    nav button {
+      background: none;
+      border: none;
+      border-bottom: 2px solid transparent;
+      color: #6b7280;
+      cursor: pointer;
+      font-size: 0.82rem;
+      font-weight: 600;
+      padding: 10px 16px;
+      transition: all 0.15s;
+    }
+    nav button.active { color: #3b82f6; border-bottom-color: #3b82f6; }
+    nav button:hover:not(.active) { color: #d1d5db; }
+    .toolbar {
+      padding: 10px 24px;
+      display: flex;
+      gap: 10px;
       align-items: center;
       background: #111827;
       border-bottom: 1px solid #1e293b;
     }
     .btn {
-      padding: 6px 16px;
+      padding: 6px 14px;
       border-radius: 6px;
       border: none;
       cursor: pointer;
-      font-size: 0.85rem;
+      font-size: 0.82rem;
       font-weight: 600;
       transition: all 0.15s;
     }
@@ -50,14 +77,22 @@
     .btn-primary:hover { background: #2563eb; }
     .btn-danger { background: #ef4444; color: #fff; }
     .btn-danger:hover { background: #b91c1c; }
-    .btn-sm { padding: 3px 10px; font-size: 0.78rem; }
-    #refresh-status { font-size: 0.78rem; color: #6b7280; margin-left: auto; }
+    .btn-success { background: #22c55e; color: #fff; }
+    .btn-success:hover { background: #16a34a; }
+    .btn-sm { padding: 3px 10px; font-size: 0.76rem; }
+    .btn-ghost { background: #1e293b; color: #94a3b8; border: 1px solid #334155; }
+    .btn-ghost:hover { background: #334155; }
+    #refresh-status { font-size: 0.76rem; color: #4b5563; margin-left: auto; }
+    /* ── Pages ── */
+    .page { display: none; }
+    .page.active { display: block; }
     .grid {
       display: grid;
-      grid-template-columns: repeat(auto-fill, minmax(340px, 1fr));
+      grid-template-columns: repeat(auto-fill, minmax(320px, 1fr));
       gap: 20px;
       padding: 24px;
     }
+    /* ── Cards ── */
     .card {
       background: #1e293b;
       border: 1px solid #334155;
@@ -66,336 +101,957 @@
     }
     .card-header {
       background: #0f172a;
-      padding: 12px 16px;
-      font-size: 0.82rem;
+      padding: 10px 16px;
+      font-size: 0.78rem;
       font-weight: 700;
       text-transform: uppercase;
       letter-spacing: 0.08em;
-      color: #94a3b8;
+      color: #64748b;
       border-bottom: 1px solid #334155;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
     }
+    .card-header .card-actions { display: flex; gap: 6px; }
     .card-body { padding: 16px; }
-    /* Stats grid */
+    /* ── Stat boxes ── */
     .stats-grid {
       display: grid;
-      grid-template-columns: 1fr 1fr;
-      gap: 12px;
+      grid-template-columns: repeat(3, 1fr);
+      gap: 10px;
     }
     .stat-box {
       background: #0f172a;
       border: 1px solid #1e293b;
       border-radius: 8px;
-      padding: 12px;
+      padding: 12px 10px;
       text-align: center;
     }
-    .stat-box .val { font-size: 1.6rem; font-weight: 700; color: #f8fafc; }
-    .stat-box .lbl { font-size: 0.72rem; color: #64748b; text-transform: uppercase; margin-top: 2px; }
-    /* Table */
-    table { width: 100%; border-collapse: collapse; font-size: 0.82rem; }
-    th { text-align: left; padding: 6px 8px; color: #64748b; border-bottom: 1px solid #334155; }
-    td { padding: 7px 8px; border-bottom: 1px solid #1e293b; }
+    .stat-box .val { font-size: 1.5rem; font-weight: 700; color: #f8fafc; }
+    .stat-box .lbl { font-size: 0.68rem; color: #64748b; text-transform: uppercase; margin-top: 2px; }
+    .stat-box.green .val { color: #22c55e; }
+    .stat-box.red .val   { color: #ef4444; }
+    .stat-box.yellow .val{ color: #f59e0b; }
+    .stat-box.blue .val  { color: #3b82f6; }
+    /* ── Tables ── */
+    .tbl-wrap { overflow-x: auto; }
+    table { width: 100%; border-collapse: collapse; font-size: 0.8rem; }
+    th { text-align: left; padding: 7px 10px; color: #475569; border-bottom: 1px solid #334155; font-size: 0.72rem; text-transform: uppercase; letter-spacing: 0.05em; }
+    td { padding: 7px 10px; border-bottom: 1px solid #1e293b; vertical-align: middle; }
     tr:last-child td { border-bottom: none; }
-    .badge-up { background: #16a34a22; color: #22c55e; border: 1px solid #16a34a55; padding: 2px 8px; border-radius: 4px; font-size: 0.72rem; font-weight: 700; }
-    .badge-down { background: #dc262622; color: #ef4444; border: 1px solid #dc262655; padding: 2px 8px; border-radius: 4px; font-size: 0.72rem; font-weight: 700; }
-    /* Keyval form */
-    .kv-form { display: flex; gap: 8px; margin-bottom: 12px; }
-    .kv-input {
-      flex: 1;
+    tr:hover td { background: #0f172a44; }
+    /* ── Badges ── */
+    .b-up   { background: #16a34a22; color: #22c55e; border: 1px solid #16a34a55; padding: 2px 8px; border-radius: 4px; font-size: 0.7rem; font-weight: 700; }
+    .b-down { background: #dc262622; color: #ef4444; border: 1px solid #dc262655; padding: 2px 8px; border-radius: 4px; font-size: 0.7rem; font-weight: 700; }
+    .b-warn { background: #f59e0b22; color: #f59e0b; border: 1px solid #f59e0b55; padding: 2px 8px; border-radius: 4px; font-size: 0.7rem; font-weight: 700; }
+    .b-info { background: #3b82f622; color: #60a5fa; border: 1px solid #3b82f655; padding: 2px 8px; border-radius: 4px; font-size: 0.7rem; font-weight: 700; }
+    /* ── Inputs ── */
+    .inp {
       background: #0f172a;
       border: 1px solid #334155;
       border-radius: 6px;
       padding: 7px 10px;
       color: #d1d5db;
       font-size: 0.82rem;
+      outline: none;
     }
-    .kv-input::placeholder { color: #475569; }
-    /* Rate limit table */
-    .rl-bar-wrap { background: #0f172a; border-radius: 4px; height: 6px; margin-top: 4px; }
-    .rl-bar { background: #f59e0b; border-radius: 4px; height: 6px; transition: width 0.4s; }
-    #reload-status { font-size: 0.78rem; color: #6b7280; margin-left: 4px; }
+    .inp:focus { border-color: #3b82f6; }
+    .inp::placeholder { color: #475569; }
+    .row { display: flex; gap: 8px; align-items: center; margin-bottom: 12px; flex-wrap: wrap; }
+    /* ── Chart ── */
+    .chart-wrap { height: 120px; display: flex; align-items: flex-end; gap: 3px; padding: 8px 0 0; overflow: hidden; }
+    .chart-bar { flex: 1; background: #3b82f6; border-radius: 3px 3px 0 0; min-height: 2px; transition: height 0.3s; }
+    .chart-lbl { font-size: 0.65rem; color: #4b5563; text-align: center; margin-top: 4px; }
+    /* ── Heatmap ── */
+    .heatmap { display: grid; gap: 4px; }
+    .hm-row { display: flex; gap: 4px; align-items: center; }
+    .hm-pool { font-size: 0.72rem; color: #6b7280; min-width: 80px; }
+    .hm-cell { width: 24px; height: 24px; border-radius: 4px; display: flex; align-items: center; justify-content: center; font-size: 0.58rem; font-weight: 700; cursor: default; }
+    .hm-up   { background: #16a34a33; color: #22c55e; }
+    .hm-down { background: #dc262633; color: #ef4444; }
+    /* ── Misc ── */
+    .empty-msg { color: #4b5563; font-size: 0.8rem; padding: 12px 0; }
+    #reload-status { font-size: 0.76rem; margin-left: 4px; }
+    .monospace { font-family: 'Cascadia Code', 'Fira Mono', monospace; font-size: 0.78rem; }
+    .score-bar-wrap { background: #0f172a; border-radius: 3px; height: 4px; width: 60px; display: inline-block; vertical-align: middle; }
+    .score-bar { height: 4px; border-radius: 3px; background: #22c55e; }
+    .text-red { color: #ef4444; }
+    .text-green { color: #22c55e; }
+    .text-yellow { color: #f59e0b; }
+    .text-blue { color: #60a5fa; }
+    .text-muted { color: #6b7280; }
+    .full-span { grid-column: 1 / -1; }
   </style>
 </head>
 <body>
+
 <header>
-  <h1>⚡ Phalanx Admin Dashboard</h1>
-  <span class="badge">LIVE</span>
+  <h1>⚡ Phalanx Admin</h1>
+  <span class="badge" id="live-badge">LIVE</span>
+  <span id="refresh-status"></span>
 </header>
+
+<nav>
+  <button class="active" onclick="showPage('overview')">Overview</button>
+  <button onclick="showPage('upstreams')">Upstreams</button>
+  <button onclick="showPage('waf')">WAF & Security</button>
+  <button onclick="showPage('ml')">ML Fraud</button>
+  <button onclick="showPage('bandwidth')">Bandwidth &amp; Alerts</button>
+  <button onclick="showPage('keyval')">Keyval</button>
+  <button onclick="showPage('cluster')">Cluster</button>
+</nav>
+
 <div class="toolbar">
-  <button class="btn btn-primary" onclick="reloadConfig()">↺ Reload Config</button>
+  <button class="btn btn-primary btn-sm" onclick="reloadConfig()">↺ Reload Config</button>
   <span id="reload-status"></span>
-  <span id="refresh-status">Auto-refresh: 2s</span>
+  <button class="btn btn-ghost btn-sm" onclick="refreshAll()">⟳ Refresh Now</button>
 </div>
 
-<div class="grid">
-  <!-- Connection Stats -->
-  <div class="card">
-    <div class="card-header">Global Stats</div>
-    <div class="card-body">
-      <div class="stats-grid">
-        <div class="stat-box">
-          <div class="val" id="stat-active-conns">–</div>
-          <div class="lbl">Active Connections</div>
-        </div>
-        <div class="stat-box">
-          <div class="val" id="stat-requests">–</div>
-          <div class="lbl">Total Requests</div>
-        </div>
-        <div class="stat-box">
-          <div class="val" id="stat-waf-blocks">–</div>
-          <div class="lbl">WAF Blocks</div>
-        </div>
-        <div class="stat-box">
-          <div class="val" id="stat-rl-rejects">–</div>
-          <div class="lbl">Rate Limit Rejects</div>
-        </div>
-        <div class="stat-box">
-          <div class="val" id="stat-cache-hits">–</div>
-          <div class="lbl">Cache Hits</div>
-        </div>
-        <div class="stat-box">
-          <div class="val" id="stat-cache-misses">–</div>
-          <div class="lbl">Cache Misses</div>
+<!-- ════════════════ OVERVIEW PAGE ════════════════ -->
+<div id="page-overview" class="page active">
+  <div class="grid">
+
+    <!-- Global Stats (6-box) -->
+    <div class="card full-span">
+      <div class="card-header">Global Stats</div>
+      <div class="card-body">
+        <div class="stats-grid" style="grid-template-columns: repeat(6,1fr)">
+          <div class="stat-box blue">
+            <div class="val" id="s-conns">–</div>
+            <div class="lbl">Active Conns</div>
+          </div>
+          <div class="stat-box green">
+            <div class="val" id="s-reqs">–</div>
+            <div class="lbl">Total Requests</div>
+          </div>
+          <div class="stat-box red">
+            <div class="val" id="s-waf">–</div>
+            <div class="lbl">WAF Blocks</div>
+          </div>
+          <div class="stat-box yellow">
+            <div class="val" id="s-rl">–</div>
+            <div class="lbl">Rate Limited</div>
+          </div>
+          <div class="stat-box green">
+            <div class="val" id="s-chits">–</div>
+            <div class="lbl">Cache Hits</div>
+          </div>
+          <div class="stat-box">
+            <div class="val" id="s-cmiss">–</div>
+            <div class="lbl">Cache Misses</div>
+          </div>
         </div>
       </div>
     </div>
-  </div>
 
-  <!-- Upstream Health Panel -->
-  <div class="card" style="grid-column: span 2;">
-    <div class="card-header">Upstream Health</div>
-    <div class="card-body">
-      <table>
-        <thead>
-          <tr>
-            <th>Pool</th>
-            <th>Address</th>
-            <th>Status</th>
-            <th>Active Conns</th>
-            <th>Weight</th>
-          </tr>
-        </thead>
-        <tbody id="upstreams-body">
-          <tr><td colspan="5" style="color:#4b5563">Loading…</td></tr>
-        </tbody>
-      </table>
-    </div>
-  </div>
-
-  <!-- Keyval Store Panel -->
-  <div class="card" style="grid-column: span 2;">
-    <div class="card-header">Keyval Store</div>
-    <div class="card-body">
-      <div class="kv-form">
-        <input class="kv-input" id="kv-key" placeholder="Key" />
-        <input class="kv-input" id="kv-value" placeholder="Value" />
-        <input class="kv-input" id="kv-ttl" placeholder="TTL (s)" style="max-width:90px" type="number" />
-        <button class="btn btn-primary btn-sm" onclick="kvSet()">SET</button>
+    <!-- Req/s live chart -->
+    <div class="card">
+      <div class="card-header">Request Rate (last 30 polls)</div>
+      <div class="card-body">
+        <div class="chart-wrap" id="req-chart"></div>
+        <div style="display:flex;justify-content:space-between;margin-top:2px">
+          <span class="chart-lbl">30s ago</span>
+          <span class="chart-lbl">now</span>
+        </div>
       </div>
-      <table>
-        <thead>
-          <tr><th>Key</th><th>Value</th><th>Action</th></tr>
-        </thead>
-        <tbody id="kv-body">
-          <tr><td colspan="3" style="color:#4b5563">No entries</td></tr>
-        </tbody>
-      </table>
     </div>
-  </div>
 
-  <!-- Rate Limit Zone Stats -->
-  <div class="card">
-    <div class="card-header">Rate Limit Zones</div>
-    <div class="card-body" id="rl-body">
-      <table>
-        <thead><tr><th>Zone</th><th>Rejections</th></tr></thead>
-        <tbody id="rl-table-body">
-          <tr><td colspan="2" style="color:#4b5563">Loading…</td></tr>
-        </tbody>
-      </table>
+    <!-- Requests by Status -->
+    <div class="card">
+      <div class="card-header">Requests by Status</div>
+      <div class="card-body tbl-wrap">
+        <table>
+          <thead><tr><th>Method</th><th>Status</th><th>Pool</th><th>Count</th></tr></thead>
+          <tbody id="req-body"><tr><td colspan="4" class="empty-msg">Loading…</td></tr></tbody>
+        </table>
+      </div>
     </div>
-  </div>
 
-  <!-- Request Breakdown -->
-  <div class="card">
-    <div class="card-header">Requests by Status</div>
-    <div class="card-body">
-      <table>
-        <thead><tr><th>Method</th><th>Status</th><th>Pool</th><th>Count</th></tr></thead>
-        <tbody id="req-body">
-          <tr><td colspan="4" style="color:#4b5563">Loading…</td></tr>
-        </tbody>
-      </table>
+    <!-- Top IPs leaderboard -->
+    <div class="card">
+      <div class="card-header">
+        Top IPs by Request Count
+        <div class="card-actions">
+          <button class="btn btn-danger btn-sm" id="ban-top-btn" onclick="banTopIp()">Ban #1</button>
+        </div>
+      </div>
+      <div class="card-body tbl-wrap">
+        <table>
+          <thead><tr><th>IP</th><th>Requests</th><th>Action</th></tr></thead>
+          <tbody id="top-ips-body"><tr><td colspan="3" class="empty-msg">Loading…</td></tr></tbody>
+        </table>
+      </div>
     </div>
-  </div>
 
-  <!-- ML Fraud Detection -->
-  <div class="card" style="grid-column: span 2;">
-    <div class="card-header">Fraud Detection (ML)</div>
-    <div class="card-body">
-      <div class="kv-form" style="margin-bottom: 20px;">
-        <input type="file" id="ml-model-file" accept=".onnx" class="kv-input" style="flex: 2" />
-        <button class="btn btn-primary btn-sm" onclick="uploadMlModel()">Upload .ONNX Model</button>
-        <div style="flex: 1; display: flex; align-items: center; justify-content: flex-end; gap: 10px;">
-          <span style="font-size: 0.8rem; color: #94a3b8;">Mode:</span>
-          <select id="ml-mode-select" class="kv-input" style="width: 120px;" onchange="toggleMlMode()">
+    <!-- Rate limit zones -->
+    <div class="card">
+      <div class="card-header">Rate Limit Rejections by Zone</div>
+      <div class="card-body tbl-wrap">
+        <table>
+          <thead><tr><th>Zone</th><th>Rejections</th></tr></thead>
+          <tbody id="rl-body"><tr><td colspan="2" class="empty-msg">Loading…</td></tr></tbody>
+        </table>
+      </div>
+    </div>
+
+  </div>
+</div>
+
+<!-- ════════════════ UPSTREAMS PAGE ════════════════ -->
+<div id="page-upstreams" class="page">
+  <div class="grid">
+
+    <!-- Backend Heatmap -->
+    <div class="card full-span">
+      <div class="card-header">Backend Health Heatmap</div>
+      <div class="card-body">
+        <div class="heatmap" id="heatmap">
+          <span class="empty-msg">Loading…</span>
+        </div>
+      </div>
+    </div>
+
+    <!-- Detailed table -->
+    <div class="card full-span">
+      <div class="card-header">Upstream Detail</div>
+      <div class="card-body tbl-wrap">
+        <table>
+          <thead>
+            <tr><th>Pool</th><th>Address</th><th>Status</th><th>Active Conns</th><th>Weight</th></tr>
+          </thead>
+          <tbody id="up-body"><tr><td colspan="5" class="empty-msg">Loading…</td></tr></tbody>
+        </table>
+      </div>
+    </div>
+
+  </div>
+</div>
+
+<!-- ════════════════ WAF & SECURITY PAGE ════════════════ -->
+<div id="page-waf" class="page">
+  <div class="grid">
+
+    <!-- Active Bans -->
+    <div class="card">
+      <div class="card-header">
+        Active IP Bans
+        <div class="card-actions">
+          <input class="inp" id="ban-ip-input" placeholder="IP to ban" style="width:130px" />
+          <button class="btn btn-danger btn-sm" onclick="manualBan()">Ban</button>
+        </div>
+      </div>
+      <div class="card-body tbl-wrap">
+        <table>
+          <thead><tr><th>IP</th><th>Strikes</th><th>Expires in</th><th>Action</th></tr></thead>
+          <tbody id="bans-body"><tr><td colspan="4" class="empty-msg">No active bans</td></tr></tbody>
+        </table>
+      </div>
+    </div>
+
+    <!-- Strike leaderboard -->
+    <div class="card">
+      <div class="card-header">Strike Leaderboard (top 20)</div>
+      <div class="card-body tbl-wrap">
+        <table>
+          <thead><tr><th>IP</th><th>Strikes</th><th>Action</th></tr></thead>
+          <tbody id="strikes-body"><tr><td colspan="3" class="empty-msg">No strikes</td></tr></tbody>
+        </table>
+      </div>
+    </div>
+
+    <!-- Attack live feed -->
+    <div class="card full-span">
+      <div class="card-header">WAF Attack Log (last 50, newest first)</div>
+      <div class="card-body tbl-wrap">
+        <table>
+          <thead><tr><th>Time</th><th>IP</th><th>Method</th><th>Path</th><th>Reason</th></tr></thead>
+          <tbody id="attacks-body"><tr><td colspan="5" class="empty-msg">No attacks recorded</td></tr></tbody>
+        </table>
+      </div>
+    </div>
+
+  </div>
+</div>
+
+<!-- ════════════════ ML FRAUD PAGE ════════════════ -->
+<div id="page-ml" class="page">
+  <div class="grid">
+
+    <!-- Upload + Mode -->
+    <div class="card full-span">
+      <div class="card-header">Model Management</div>
+      <div class="card-body">
+        <div class="row">
+          <input type="file" id="ml-file" accept=".onnx" class="inp" style="flex:2" />
+          <button class="btn btn-primary btn-sm" onclick="uploadModel()">Upload .ONNX</button>
+          <span style="color:#64748b;font-size:0.8rem">Mode:</span>
+          <select id="ml-mode" class="inp" style="width:110px" onchange="setMode()">
             <option value="shadow">Shadow</option>
             <option value="active">Active</option>
           </select>
         </div>
+        <div id="ml-msg" style="font-size:0.8rem;height:18px;color:#10b981"></div>
       </div>
-      <div id="ml-status" style="font-size: 0.8rem; color: #10b981; margin-bottom: 12px; height: 16px;"></div>
-      
-      <table>
-        <thead>
-          <tr><th>Time</th><th>IP</th><th>Path</th><th>Fraud Score</th><th>Flagged</th><th>Action</th></tr>
-        </thead>
-        <tbody id="ml-logs-body">
-          <tr><td colspan="6" style="color:#4b5563">Waiting for logs…</td></tr>
-        </tbody>
-      </table>
+    </div>
+
+    <!-- Fraud Score Histogram -->
+    <div class="card">
+      <div class="card-header">Fraud Score Distribution</div>
+      <div class="card-body">
+        <div id="fraud-hist" style="display:flex;align-items:flex-end;gap:4px;height:90px">
+          <span class="empty-msg">No data</span>
+        </div>
+        <div style="display:flex;justify-content:space-between;font-size:0.65rem;color:#4b5563;margin-top:4px">
+          <span>0.0</span><span>0.5</span><span>1.0</span>
+        </div>
+      </div>
+    </div>
+
+    <!-- ML Log table -->
+    <div class="card full-span" style="grid-column: 2 / -1;">
+      <div class="card-header">Inference Log (last 15)</div>
+      <div class="card-body tbl-wrap">
+        <table>
+          <thead><tr><th>Time</th><th>IP</th><th>Path</th><th>Score</th><th>Flag</th><th>Action</th></tr></thead>
+          <tbody id="ml-body"><tr><td colspan="6" class="empty-msg">Waiting for events…</td></tr></tbody>
+        </table>
+      </div>
+    </div>
+
+  </div>
+</div>
+
+<!-- ════════════════ KEYVAL PAGE ════════════════ -->
+<div id="page-keyval" class="page">
+  <div class="grid">
+    <div class="card full-span">
+      <div class="card-header">Keyval Store</div>
+      <div class="card-body">
+        <div class="row">
+          <input class="inp" id="kv-key" placeholder="Key" style="flex:1" />
+          <input class="inp" id="kv-val" placeholder="Value" style="flex:2" />
+          <input class="inp" id="kv-ttl" placeholder="TTL (s)" type="number" style="width:90px" />
+          <button class="btn btn-primary btn-sm" onclick="kvSet()">SET</button>
+        </div>
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>Key</th><th>Value</th><th>Action</th></tr></thead>
+            <tbody id="kv-body"><tr><td colspan="3" class="empty-msg">No entries</td></tr></tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ════════════════ CLUSTER PAGE ════════════════ -->
+<!-- ════════════════ BANDWIDTH & ALERTS PAGE ════════════════ -->
+<div id="page-bandwidth" class="page">
+  <div class="grid">
+
+    <!-- Per-Protocol Bandwidth Gauges -->
+    <div class="card full-span">
+      <div class="card-header">
+        Per-Protocol Traffic
+        <div class="card-actions">
+          <span class="text-muted" style="font-size:0.7rem">bytes in/out cumulative</span>
+        </div>
+      </div>
+      <div class="card-body tbl-wrap">
+        <table id="bw-table">
+          <thead>
+            <tr>
+              <th>Protocol</th>
+              <th>Bytes In</th>
+              <th>Bytes Out</th>
+              <th>Total Traffic</th>
+              <th>Requests</th>
+              <th>Active Conns</th>
+              <th>Utilization</th>
+            </tr>
+          </thead>
+          <tbody id="bw-body"><tr><td colspan="7" class="empty-msg">Loading…</td></tr></tbody>
+        </table>
+      </div>
+    </div>
+
+    <!-- Bandwidth Bar Chart -->
+    <div class="card">
+      <div class="card-header">Traffic Distribution (Total Bytes)</div>
+      <div class="card-body">
+        <div id="bw-chart" style="display:flex;flex-direction:column;gap:8px;"></div>
+      </div>
+    </div>
+
+    <!-- Active Connections per Protocol -->
+    <div class="card">
+      <div class="card-header">Active Connections per Protocol</div>
+      <div class="card-body">
+        <div id="conn-chart" style="display:flex;flex-direction:column;gap:8px;"></div>
+      </div>
+    </div>
+
+    <!-- Resource Alerts -->
+    <div class="card full-span">
+      <div class="card-header">
+        Resource Alerts
+        <div class="card-actions">
+          <button class="btn btn-ghost btn-sm" onclick="triggerAlertCheck()">⚡ Check Now</button>
+        </div>
+      </div>
+      <div class="card-body tbl-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>Time</th>
+              <th>Level</th>
+              <th>Protocol</th>
+              <th>Metric</th>
+              <th>Message</th>
+              <th>Value</th>
+              <th>Threshold</th>
+            </tr>
+          </thead>
+          <tbody id="alerts-body"><tr><td colspan="7" class="empty-msg">No alerts</td></tr></tbody>
+        </table>
+      </div>
+    </div>
+
+    <!-- WebRTC Room Details -->
+    <div class="card full-span">
+      <div class="card-header">WebRTC Room Bandwidth</div>
+      <div class="card-body tbl-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>Room ID</th>
+              <th>Tracks</th>
+              <th>Publishers</th>
+              <th>Subscribers</th>
+              <th>Bytes Forwarded</th>
+              <th>Packets Forwarded</th>
+            </tr>
+          </thead>
+          <tbody id="rooms-bw-body"><tr><td colspan="6" class="empty-msg">No active rooms</td></tr></tbody>
+        </table>
+      </div>
+    </div>
+
+  </div>
+</div>
+
+<div id="page-cluster" class="page">
+  <div class="grid">
+    <div class="card full-span">
+      <div class="card-header">Cluster Nodes</div>
+      <div class="card-body tbl-wrap">
+        <table>
+          <thead><tr><th>Node ID</th><th>Status</th><th>Last Seen</th></tr></thead>
+          <tbody id="nodes-body"><tr><td colspan="3" class="empty-msg">Loading…</td></tr></tbody>
+        </table>
+      </div>
+    </div>
+    <div class="card">
+      <div class="card-header">Cache Stats</div>
+      <div class="card-body">
+        <div class="stats-grid" style="grid-template-columns:1fr 1fr">
+          <div class="stat-box blue">
+            <div class="val" id="cs-entries">–</div>
+            <div class="lbl">Cached Entries</div>
+          </div>
+          <div class="stat-box green">
+            <div class="val" id="cs-hr">–</div>
+            <div class="lbl">Hit Rate</div>
+          </div>
+        </div>
+      </div>
     </div>
   </div>
 </div>
 
 <script>
-const BASE = '';
+/* ── State ── */
+let currentPage = 'overview';
+let reqHistory = Array(30).fill(0);
+let lastTotalReqs = 0;
+let topIpsList = [];
 
+/* ── Page navigation ── */
+function showPage(id) {
+  document.querySelectorAll('.page').forEach(p => p.classList.remove('active'));
+  document.querySelectorAll('nav button').forEach(b => b.classList.remove('active'));
+  document.getElementById('page-' + id).classList.add('active');
+  event.target.classList.add('active');
+  currentPage = id;
+}
+
+/* ── Helpers ── */
+function esc(s) {
+  return String(s ?? '').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+}
+function fmt(n) { return n == null ? '–' : Number(n).toLocaleString(); }
+function fmtTime(ts) { return new Date(ts * 1000).toLocaleTimeString(); }
+function fmtExpiry(s) {
+  if (s >= 3600) return Math.floor(s/3600) + 'h ' + Math.floor((s%3600)/60) + 'm';
+  if (s >= 60) return Math.floor(s/60) + 'm ' + (s%60) + 's';
+  return s + 's';
+}
+
+/* ── Overview: Stats + Chart ── */
 async function fetchStats() {
   try {
-    const r = await fetch(BASE + '/api/stats');
-    const d = await r.json();
+    const d = await (await fetch('/api/stats')).json();
 
-    document.getElementById('stat-active-conns').textContent = d.active_connections ?? '0';
+    document.getElementById('s-conns').textContent = fmt(d.active_connections);
 
-    let totalReqs = 0;
-    (d.http_requests_total || []).forEach(m => { totalReqs += m.value; });
-    document.getElementById('stat-requests').textContent = Math.round(totalReqs);
+    let totalReqs = (d.http_requests_total || []).reduce((a, m) => a + m.value, 0);
+    document.getElementById('s-reqs').textContent = fmt(Math.round(totalReqs));
 
-    let wafBlocks = 0;
-    (d.waf_blocks_total || []).forEach(m => { wafBlocks += m.value; });
-    document.getElementById('stat-waf-blocks').textContent = Math.round(wafBlocks);
+    const delta = Math.max(0, totalReqs - lastTotalReqs);
+    lastTotalReqs = totalReqs;
+    reqHistory.push(delta);
+    reqHistory = reqHistory.slice(-30);
 
-    let rlRejects = 0;
-    (d.rate_limit_rejections || []).forEach(m => { rlRejects += m.value; });
-    document.getElementById('stat-rl-rejects').textContent = Math.round(rlRejects);
+    let waf = (d.waf_blocks_total || []).reduce((a, m) => a + m.value, 0);
+    document.getElementById('s-waf').textContent = fmt(Math.round(waf));
+
+    let rl = (d.rate_limit_rejections || []).reduce((a, m) => a + m.value, 0);
+    document.getElementById('s-rl').textContent = fmt(Math.round(rl));
 
     let hits = 0, misses = 0;
     (d.cache_hits_total || []).forEach(m => {
-      if (m.labels && m.labels.result === 'hit') hits += m.value;
-      else if (m.labels && m.labels.result === 'miss') misses += m.value;
+      if (m.labels?.result === 'hit') hits += m.value;
+      else misses += m.value;
     });
-    document.getElementById('stat-cache-hits').textContent = Math.round(hits);
-    document.getElementById('stat-cache-misses').textContent = Math.round(misses);
+    document.getElementById('s-chits').textContent = fmt(Math.round(hits));
+    document.getElementById('s-cmiss').textContent = fmt(Math.round(misses));
 
-    // Rate limit table
-    const rlBody = document.getElementById('rl-table-body');
-    if ((d.rate_limit_rejections || []).length === 0) {
-      rlBody.innerHTML = '<tr><td colspan="2" style="color:#4b5563">No rejections</td></tr>';
-    } else {
-      rlBody.innerHTML = (d.rate_limit_rejections || []).map(m => {
-        const zone = m.labels ? (m.labels.type || 'global') : 'global';
-        return `<tr><td>${zone}</td><td>${Math.round(m.value)}</td></tr>`;
-      }).join('');
-    }
+    // Chart
+    const maxVal = Math.max(...reqHistory, 1);
+    const chart = document.getElementById('req-chart');
+    chart.innerHTML = reqHistory.map(v =>
+      `<div class="chart-bar" style="height:${Math.round((v/maxVal)*110)}px" title="${v} req"></div>`
+    ).join('');
 
-    // Request breakdown
+    // RL zones
+    const rlBody = document.getElementById('rl-body');
+    const rlData = d.rate_limit_rejections || [];
+    rlBody.innerHTML = rlData.length
+      ? rlData.map(m => `<tr><td>${esc(m.labels?.type || 'global')}</td><td>${fmt(Math.round(m.value))}</td></tr>`).join('')
+      : '<tr><td colspan="2" class="empty-msg">No rejections</td></tr>';
+
+    // Req breakdown
     const reqBody = document.getElementById('req-body');
-    if ((d.http_requests_total || []).length === 0) {
-      reqBody.innerHTML = '<tr><td colspan="4" style="color:#4b5563">No requests yet</td></tr>';
-    } else {
-      reqBody.innerHTML = (d.http_requests_total || []).map(m => {
-        const method = m.labels?.method || '–';
-        const status = m.labels?.status || '–';
-        const pool = m.labels?.pool || '–';
-        return `<tr><td>${method}</td><td>${status}</td><td>${pool}</td><td>${Math.round(m.value)}</td></tr>`;
-      }).join('');
-    }
-  } catch (e) {
-    console.error('Stats fetch failed:', e);
-  }
+    const reqs = d.http_requests_total || [];
+    reqBody.innerHTML = reqs.length
+      ? reqs.map(m => {
+          const sc = parseInt(m.labels?.status) || 0;
+          const cls = sc >= 500 ? 'text-red' : sc >= 400 ? 'text-yellow' : 'text-green';
+          return `<tr><td>${esc(m.labels?.method)}</td><td class="${cls}">${esc(m.labels?.status)}</td><td class="text-muted">${esc(m.labels?.pool)}</td><td>${fmt(Math.round(m.value))}</td></tr>`;
+        }).join('')
+      : '<tr><td colspan="4" class="empty-msg">No requests yet</td></tr>';
+
+  } catch (e) { console.error('stats', e); }
 }
 
+/* ── Overview: Top IPs ── */
+async function fetchTopIps() {
+  try {
+    const d = await (await fetch('/api/rates/top?n=10')).json();
+    topIpsList = d.top_ips || [];
+    const body = document.getElementById('top-ips-body');
+    body.innerHTML = topIpsList.length
+      ? topIpsList.map((e, i) => `
+          <tr>
+            <td class="monospace">${esc(e.ip)}</td>
+            <td>${fmt(e.requests)}</td>
+            <td><button class="btn btn-danger btn-sm" onclick="banIp('${esc(e.ip)}')">Ban</button></td>
+          </tr>`).join('')
+      : '<tr><td colspan="3" class="empty-msg">No data</td></tr>';
+  } catch (e) { console.error('top-ips', e); }
+}
+
+async function banTopIp() {
+  if (topIpsList.length) await banIp(topIpsList[0].ip);
+}
+
+/* ── Upstreams ── */
 async function fetchUpstreams() {
   try {
-    const r = await fetch(BASE + '/api/upstreams/detail');
-    const d = await r.json();
-    const body = document.getElementById('upstreams-body');
+    const d = await (await fetch('/api/upstreams/detail')).json();
+    // Table
+    const body = document.getElementById('up-body');
     let rows = '';
     for (const [pool, info] of Object.entries(d)) {
       (info.backends || []).forEach(b => {
-        const badge = b.healthy
-          ? '<span class="badge-up">UP</span>'
-          : '<span class="badge-down">DOWN</span>';
         rows += `<tr>
-          <td>${pool}</td>
-          <td>${b.address}</td>
-          <td>${badge}</td>
-          <td>${b.active_conns}</td>
-          <td>${b.weight}</td>
+          <td class="text-muted">${esc(pool)}</td>
+          <td class="monospace">${esc(b.address)}</td>
+          <td>${b.healthy ? '<span class="b-up">UP</span>' : '<span class="b-down">DOWN</span>'}</td>
+          <td>${fmt(b.active_conns)}</td>
+          <td>${fmt(b.weight)}</td>
         </tr>`;
       });
     }
-    body.innerHTML = rows || '<tr><td colspan="5" style="color:#4b5563">No upstreams</td></tr>';
-  } catch (e) {
-    document.getElementById('upstreams-body').innerHTML =
-      '<tr><td colspan="5" style="color:#ef4444">Failed to load upstream data</td></tr>';
-  }
+    body.innerHTML = rows || '<tr><td colspan="5" class="empty-msg">No upstreams</td></tr>';
+
+    // Heatmap
+    const hm = document.getElementById('heatmap');
+    let hmHtml = '';
+    for (const [pool, info] of Object.entries(d)) {
+      const cells = (info.backends || []).map(b =>
+        `<div class="hm-cell ${b.healthy ? 'hm-up' : 'hm-down'}" title="${b.address}&#10;${b.healthy ? 'UP' : 'DOWN'}&#10;Conns: ${b.active_conns}">${b.healthy ? '✓' : '✗'}</div>`
+      ).join('');
+      hmHtml += `<div class="hm-row"><span class="hm-pool">${esc(pool)}</span>${cells}</div>`;
+    }
+    hm.innerHTML = hmHtml || '<span class="empty-msg">No upstream pools</span>';
+  } catch (e) { console.error('upstreams', e); }
 }
 
+/* ── WAF Bans ── */
+async function fetchBans() {
+  try {
+    const d = await (await fetch('/api/waf/bans')).json();
+    const bans = d.bans || [];
+    const body = document.getElementById('bans-body');
+    // Update badge
+    document.getElementById('live-badge').textContent = bans.length > 0 ? `${bans.length} BANNED` : 'LIVE';
+    document.getElementById('live-badge').className = bans.length > 0 ? 'badge badge-warn' : 'badge';
+
+    body.innerHTML = bans.length
+      ? bans.map(b => `<tr>
+          <td class="monospace">${esc(b.ip)}</td>
+          <td><span class="b-down">${b.strikes}</span></td>
+          <td>${fmtExpiry(b.expires_in_secs)}</td>
+          <td><button class="btn btn-success btn-sm" onclick="unbanIp('${esc(b.ip)}')">Unban</button></td>
+        </tr>`).join('')
+      : '<tr><td colspan="4" class="empty-msg">No active bans</td></tr>';
+  } catch (e) { console.error('bans', e); }
+}
+
+async function manualBan() {
+  const ip = document.getElementById('ban-ip-input').value.trim();
+  if (!ip) return;
+  await banIp(ip);
+  document.getElementById('ban-ip-input').value = '';
+}
+
+async function banIp(ip) {
+  await fetch(`/api/waf/ban/${encodeURIComponent(ip)}`, { method: 'POST' });
+  fetchBans();
+  fetchTopIps();
+}
+
+async function unbanIp(ip) {
+  await fetch(`/api/waf/ban/${encodeURIComponent(ip)}`, { method: 'DELETE' });
+  fetchBans();
+}
+
+/* ── WAF Strikes ── */
+async function fetchStrikes() {
+  try {
+    const d = await (await fetch('/api/waf/strikes')).json();
+    const strikes = (d.strikes || []).slice(0, 20);
+    const body = document.getElementById('strikes-body');
+    body.innerHTML = strikes.length
+      ? strikes.map(s => `<tr>
+          <td class="monospace">${esc(s.ip)}</td>
+          <td><span class="${s.strikes >= 5 ? 'b-down' : 'b-warn'}">${s.strikes}</span></td>
+          <td><button class="btn btn-danger btn-sm" onclick="banIp('${esc(s.ip)}')">Ban</button></td>
+        </tr>`).join('')
+      : '<tr><td colspan="3" class="empty-msg">No strikes</td></tr>';
+  } catch (e) { console.error('strikes', e); }
+}
+
+/* ── WAF Attack log ── */
+async function fetchAttacks() {
+  try {
+    const d = await (await fetch('/api/waf/attacks')).json();
+    const attacks = d.attacks || [];
+    const body = document.getElementById('attacks-body');
+    body.innerHTML = attacks.length
+      ? attacks.map(a => `<tr>
+          <td class="text-muted">${fmtTime(a.timestamp)}</td>
+          <td class="monospace">${esc(a.ip)}</td>
+          <td><span class="b-info">${esc(a.method)}</span></td>
+          <td>${esc(a.path)}</td>
+          <td><span class="b-down">${esc(a.reason)}</span></td>
+        </tr>`).join('')
+      : '<tr><td colspan="5" class="empty-msg">No attacks recorded yet</td></tr>';
+  } catch (e) { console.error('attacks', e); }
+}
+
+/* ── ML ── */
+async function fetchMlLogs() {
+  try {
+    const d = await (await fetch('/api/ml/logs')).json();
+    const logs = [...(d.logs || [])].reverse().slice(0, 15);
+    const body = document.getElementById('ml-body');
+    body.innerHTML = logs.length
+      ? logs.map(l => {
+          const score = parseFloat(l.fraud_score ?? 0);
+          const barColor = score > 0.7 ? '#ef4444' : score > 0.4 ? '#f59e0b' : '#22c55e';
+          const scoreHtml = `<span class="score-bar-wrap"><span class="score-bar" style="width:${Math.round(score*60)}px;background:${barColor}"></span></span> ${score.toFixed(3)}`;
+          const flag = l.flagged
+            ? '<span class="b-down">FLAGGED</span>'
+            : '<span class="b-up">PASS</span>';
+          const action = l.action_taken === 'IpBanned'
+            ? '<span class="text-red">BANNED</span>'
+            : `<span class="text-muted">${esc(l.action_taken)}</span>`;
+          return `<tr>
+            <td class="text-muted">${fmtTime(l.timestamp)}</td>
+            <td class="monospace">${esc(l.ip)}</td>
+            <td>${esc(l.path)}</td>
+            <td>${scoreHtml}</td>
+            <td>${flag}</td>
+            <td>${action}</td>
+          </tr>`;
+        }).join('')
+      : '<tr><td colspan="6" class="empty-msg">Waiting for events…</td></tr>';
+
+    // Histogram buckets [0-0.1, 0.1-0.2, ..., 0.9-1.0]
+    const buckets = Array(10).fill(0);
+    (d.logs || []).forEach(l => {
+      const b = Math.min(9, Math.floor(parseFloat(l.fraud_score ?? 0) * 10));
+      buckets[b]++;
+    });
+    const maxB = Math.max(...buckets, 1);
+    const hist = document.getElementById('fraud-hist');
+    if ((d.logs || []).length === 0) {
+      hist.innerHTML = '<span class="empty-msg">No data</span>';
+    } else {
+      hist.innerHTML = buckets.map((v, i) => {
+        const c = i >= 7 ? '#ef4444' : i >= 4 ? '#f59e0b' : '#22c55e';
+        return `<div style="flex:1;background:${c}33;border-radius:3px 3px 0 0;height:${Math.round((v/maxB)*80)}px;min-height:2px" title="${(i/10).toFixed(1)}-${((i+1)/10).toFixed(1)}: ${v}"></div>`;
+      }).join('');
+    }
+  } catch (e) { console.error('ml-logs', e); }
+}
+
+async function uploadModel() {
+  const f = document.getElementById('ml-file').files[0];
+  const msg = document.getElementById('ml-msg');
+  if (!f) { msg.textContent = 'Select a .onnx file first.'; msg.style.color = '#ef4444'; return; }
+  msg.textContent = 'Uploading…'; msg.style.color = '#3b82f6';
+  try {
+    const r = await fetch('/api/ml/upload', { method: 'POST', body: await f.arrayBuffer(), headers: { 'Content-Type': 'application/octet-stream' } });
+    const d = await r.json();
+    if (r.ok) { msg.textContent = '✓ Loaded ' + d.path; msg.style.color = '#10b981'; }
+    else { msg.textContent = '✗ ' + d.error; msg.style.color = '#ef4444'; }
+  } catch (e) { msg.textContent = '✗ Upload failed'; msg.style.color = '#ef4444'; }
+}
+
+async function setMode() {
+  const mode = document.getElementById('ml-mode').value;
+  const msg = document.getElementById('ml-msg');
+  try {
+    const r = await fetch('/api/ml/mode', { method: 'PUT', headers: {'Content-Type':'application/json'}, body: JSON.stringify({mode}) });
+    if (r.ok) { msg.textContent = '✓ Mode → ' + mode.toUpperCase(); msg.style.color = '#10b981'; }
+  } catch(e) { console.error(e); }
+}
+
+/* ── Keyval ── */
 async function fetchKeyval() {
   try {
-    const r = await fetch(BASE + '/api/keyval');
-    const entries = await r.json();
+    const entries = await (await fetch('/api/keyval')).json();
     const body = document.getElementById('kv-body');
-    if (!entries || entries.length === 0) {
-      body.innerHTML = '<tr><td colspan="3" style="color:#4b5563">No entries</td></tr>';
-      return;
-    }
-    body.innerHTML = entries.map(e =>
-      `<tr>
-        <td>${escHtml(e.key)}</td>
-        <td>${escHtml(e.value)}</td>
-        <td><button class="btn btn-danger btn-sm" onclick="kvDelete('${escHtml(e.key)}')">DEL</button></td>
-      </tr>`
-    ).join('');
-  } catch (e) {
-    document.getElementById('kv-body').innerHTML =
-      '<tr><td colspan="3" style="color:#ef4444">Failed to load keyval store</td></tr>';
-  }
-}
-
-function escHtml(s) {
-  return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+    body.innerHTML = (entries || []).length
+      ? entries.map(e => `<tr>
+          <td class="monospace">${esc(e.key)}</td>
+          <td>${esc(e.value)}</td>
+          <td><button class="btn btn-danger btn-sm" onclick="kvDel('${esc(e.key)}')">DEL</button></td>
+        </tr>`).join('')
+      : '<tr><td colspan="3" class="empty-msg">No entries</td></tr>';
+  } catch (e) { console.error('keyval', e); }
 }
 
 async function kvSet() {
   const key = document.getElementById('kv-key').value.trim();
-  const value = document.getElementById('kv-value').value.trim();
-  const ttlRaw = document.getElementById('kv-ttl').value.trim();
-  if (!key || !value) return;
-  const body = { value };
-  if (ttlRaw) body.ttl_secs = parseInt(ttlRaw, 10);
-  await fetch(`${BASE}/api/keyval/${encodeURIComponent(key)}`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(body),
-  });
-  document.getElementById('kv-key').value = '';
-  document.getElementById('kv-value').value = '';
-  document.getElementById('kv-ttl').value = '';
+  const val = document.getElementById('kv-val').value.trim();
+  const ttl = document.getElementById('kv-ttl').value.trim();
+  if (!key || !val) return;
+  const body = { value: val };
+  if (ttl) body.ttl_secs = parseInt(ttl, 10);
+  await fetch(`/api/keyval/${encodeURIComponent(key)}`, { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body) });
+  ['kv-key','kv-val','kv-ttl'].forEach(id => document.getElementById(id).value = '');
+  fetchKeyval();
+}
+async function kvDel(key) {
+  await fetch(`/api/keyval/${encodeURIComponent(key)}`, { method:'DELETE' });
   fetchKeyval();
 }
 
-async function kvDelete(key) {
-  await fetch(`${BASE}/api/keyval/${encodeURIComponent(key)}`, { method: 'DELETE' });
-  fetchKeyval();
+/* ── Cluster ── */
+async function fetchCluster() {
+  try {
+    const d = await (await fetch('/api/cluster/nodes')).json();
+    const body = document.getElementById('nodes-body');
+    const nodes = d.nodes || [];
+    body.innerHTML = nodes.length
+      ? nodes.map(n => `<tr>
+          <td class="monospace">${esc(n.node_id)}</td>
+          <td>${n.status === 'healthy' ? '<span class="b-up">HEALTHY</span>' : '<span class="b-down">DOWN</span>'}</td>
+          <td>${n.last_seen_secs === 0 ? '<span class="text-green">self</span>' : n.last_seen_secs + 's ago'}</td>
+        </tr>`).join('')
+      : '<tr><td colspan="3" class="empty-msg">No nodes</td></tr>';
+  } catch (e) { console.error('cluster', e); }
 }
 
+async function fetchCacheStats() {
+  try {
+    const [cs, stats] = await Promise.all([
+      fetch('/api/cache/stats').then(r => r.json()),
+      fetch('/api/stats').then(r => r.json()),
+    ]);
+    document.getElementById('cs-entries').textContent = fmt(cs.entries);
+    let hits = 0, misses = 0;
+    (stats.cache_hits_total || []).forEach(m => {
+      if (m.labels?.result === 'hit') hits += m.value;
+      else misses += m.value;
+    });
+    const total = hits + misses;
+    const hr = total > 0 ? ((hits / total) * 100).toFixed(1) + '%' : '–';
+    document.getElementById('cs-hr').textContent = hr;
+  } catch (e) { console.error('cache-stats', e); }
+}
+
+/* ── Bandwidth ── */
+function fmtBytes(n) {
+  if (n == null || n === 0) return '0 B';
+  const units = ['B','KB','MB','GB','TB'];
+  let i = 0;
+  let v = Number(n);
+  while (v >= 1024 && i < units.length - 1) { v /= 1024; i++; }
+  return v.toFixed(i === 0 ? 0 : 1) + ' ' + units[i];
+}
+
+function alertLevelClass(level) {
+  if (level === 'critical') return 'b-down';
+  if (level === 'warning') return 'b-warn';
+  return 'b-info';
+}
+
+async function fetchBandwidth() {
+  try {
+    const d = await (await fetch('/api/bandwidth')).json();
+    const protocols = d.protocols || [];
+
+    // Table rows
+    const body = document.getElementById('bw-body');
+    if (!protocols.length) {
+      body.innerHTML = '<tr><td colspan="7" class="empty-msg">No traffic data yet</td></tr>';
+      return;
+    }
+
+    // Compute max for utilization bar
+    const maxTotal = Math.max(1, ...protocols.map(p => (p.bytes_in || 0) + (p.bytes_out || 0)));
+    const maxConns = Math.max(1, ...protocols.map(p => p.active_connections || 0));
+
+    body.innerHTML = protocols.map(p => {
+      const total = (p.bytes_in || 0) + (p.bytes_out || 0);
+      const pct = Math.round((total / maxTotal) * 100);
+      const barColor = pct > 80 ? '#ef4444' : pct > 50 ? '#f59e0b' : '#22c55e';
+      const connColor = (p.active_connections || 0) > 1000 ? '#ef4444' : '#60a5fa';
+      return `<tr>
+        <td><code class="monospace">${esc(p.protocol)}</code></td>
+        <td>${fmtBytes(p.bytes_in)}</td>
+        <td>${fmtBytes(p.bytes_out)}</td>
+        <td>${fmtBytes(total)}</td>
+        <td>${fmt(p.requests)}</td>
+        <td style="color:${connColor}">${fmt(p.active_connections)}</td>
+        <td>
+          <div style="display:flex;align-items:center;gap:6px">
+            <div style="width:80px;background:#0f172a;border-radius:3px;height:6px">
+              <div style="width:${pct}%;background:${barColor};height:6px;border-radius:3px;transition:width 0.3s"></div>
+            </div>
+            <span style="font-size:0.72rem;color:#64748b">${pct}%</span>
+          </div>
+        </td>
+      </tr>`;
+    }).join('');
+
+    // Horizontal bar chart
+    const chart = document.getElementById('bw-chart');
+    chart.innerHTML = protocols.slice(0, 8).map(p => {
+      const total = (p.bytes_in || 0) + (p.bytes_out || 0);
+      const pct = Math.round((total / maxTotal) * 100);
+      return `<div style="display:flex;align-items:center;gap:8px">
+        <span style="width:80px;font-size:0.72rem;color:#94a3b8;text-align:right">${esc(p.protocol)}</span>
+        <div style="flex:1;background:#0f172a;border-radius:3px;height:14px">
+          <div style="width:${pct}%;background:#3b82f6;height:14px;border-radius:3px;transition:width 0.3s;display:flex;align-items:center;padding:0 4px">
+            <span style="font-size:0.62rem;color:#fff;white-space:nowrap;overflow:hidden">${fmtBytes(total)}</span>
+          </div>
+        </div>
+      </div>`;
+    }).join('');
+
+    // Connection chart
+    const connChart = document.getElementById('conn-chart');
+    connChart.innerHTML = protocols.slice(0, 8).map(p => {
+      const pct = Math.round(((p.active_connections || 0) / maxConns) * 100);
+      const color = pct > 80 ? '#ef4444' : pct > 50 ? '#f59e0b' : '#22c55e';
+      return `<div style="display:flex;align-items:center;gap:8px">
+        <span style="width:80px;font-size:0.72rem;color:#94a3b8;text-align:right">${esc(p.protocol)}</span>
+        <div style="flex:1;background:#0f172a;border-radius:3px;height:14px">
+          <div style="width:${pct}%;background:${color};height:14px;border-radius:3px;transition:width 0.3s;display:flex;align-items:center;padding:0 4px">
+            <span style="font-size:0.62rem;color:#fff;white-space:nowrap;overflow:hidden">${fmt(p.active_connections)}</span>
+          </div>
+        </div>
+      </div>`;
+    }).join('');
+
+  } catch (e) { console.error('bandwidth', e); }
+}
+
+async function fetchAlerts() {
+  try {
+    const d = await (await fetch('/api/alerts?n=50')).json();
+    const alerts = d.alerts || [];
+    const body = document.getElementById('alerts-body');
+    body.innerHTML = alerts.length
+      ? alerts.map(a => `<tr>
+          <td class="text-muted" style="white-space:nowrap">${new Date(a.timestamp * 1000).toLocaleTimeString()}</td>
+          <td><span class="${alertLevelClass(a.level)}">${a.level.toUpperCase()}</span></td>
+          <td><code class="monospace">${esc(a.protocol)}</code></td>
+          <td class="text-muted">${esc(a.metric)}</td>
+          <td>${esc(a.message)}</td>
+          <td class="monospace">${a.value.toLocaleString(undefined,{maximumFractionDigits:0})}</td>
+          <td class="monospace text-muted">${a.threshold.toLocaleString(undefined,{maximumFractionDigits:0})}</td>
+        </tr>`).join('')
+      : '<tr><td colspan="7" class="empty-msg">No alerts — system healthy</td></tr>';
+  } catch (e) { console.error('alerts', e); }
+}
+
+async function triggerAlertCheck() {
+  try {
+    await fetch('/api/alerts/check', { method: 'POST' });
+    fetchAlerts();
+  } catch (e) { console.error('alert-check', e); }
+}
+
+async function fetchWebRtcRoomsBandwidth() {
+  try {
+    const d = await (await fetch('/api/webrtc/rooms')).json();
+    const rooms = d.rooms || [];
+    const body = document.getElementById('rooms-bw-body');
+    body.innerHTML = rooms.length
+      ? rooms.map(r => `<tr>
+          <td class="monospace">${esc(r.id)}</td>
+          <td>${fmt(r.track_count)}</td>
+          <td>${fmt(r.publishers)}</td>
+          <td>${fmt(r.subscribers)}</td>
+          <td>${fmtBytes(r.bytes_forwarded)}</td>
+          <td>${fmt(r.packets_forwarded)}</td>
+        </tr>`).join('')
+      : '<tr><td colspan="6" class="empty-msg">No active WebRTC rooms</td></tr>';
+  } catch (e) { /* WebRTC endpoint may not be mounted — ignore */ }
+}
+
+/* ── Config reload ── */
 async function reloadConfig() {
   const el = document.getElementById('reload-status');
   try {
-    const r = await fetch(BASE + '/api/reload', { method: 'POST' });
-    const d = await r.json();
+    const d = await (await fetch('/api/reload', { method: 'POST' })).json();
     el.textContent = '✓ ' + (d.status || 'reloaded');
     el.style.color = '#22c55e';
   } catch (e) {
@@ -405,109 +1061,26 @@ async function reloadConfig() {
   setTimeout(() => { el.textContent = ''; el.style.color = ''; }, 3000);
 }
 
-async function fetchMlLogs() {
-  try {
-    const r = await fetch(BASE + '/api/ml/logs');
-    const d = await r.json();
-    const body = document.getElementById('ml-logs-body');
-    if (!d.logs || d.logs.length === 0) {
-      body.innerHTML = '<tr><td colspan="6" style="color:#4b5563">No ML logs available</td></tr>';
-      return;
-    }
-    
-    // Reverse so latest is on top
-    const logs = [...d.logs].reverse().slice(0, 15);
-    
-    body.innerHTML = logs.map(l => {
-      const timeStr = new Date(l.timestamp * 1000).toLocaleTimeString();
-      const badge = l.flagged 
-        ? '<span class="badge-down" style="background:#ef444422;border-color:#ef444455;color:#ef4444">FLAGGED</span>' 
-        : '<span class="badge-up" style="background:#22c55e22;border-color:#22c55e55;color:#22c55e">PASS</span>';
-      
-      const actionBadge = l.action_taken === "IpBanned" 
-        ? '<span style="color:#f59e0b;font-weight:bold;">BANNED</span>' 
-        : l.action_taken;
-        
-      return `<tr>
-        <td>${timeStr}</td>
-        <td style="font-family:monospace">${escHtml(l.ip)}</td>
-        <td>${escHtml(l.path)}</td>
-        <td style="font-family:monospace">${l.fraud_score.toFixed(4)}</td>
-        <td>${badge}</td>
-        <td>${actionBadge}</td>
-      </tr>`;
-    }).join('');
-  } catch (e) {
-    console.error('ML logs fetch failed:', e);
-  }
-}
-
-async function uploadMlModel() {
-  const fileInput = document.getElementById('ml-model-file');
-  const statusEl = document.getElementById('ml-status');
-  if (!fileInput.files.length) {
-    statusEl.textContent = 'Please select a .ONNX file first.';
-    statusEl.style.color = '#ef4444';
-    return;
-  }
-  
-  const file = fileInput.files[0];
-  const buffer = await file.arrayBuffer();
-  
-  statusEl.textContent = 'Uploading and compiling model...';
-  statusEl.style.color = '#3b82f6';
-  
-  try {
-    const r = await fetch(BASE + '/api/ml/upload', {
-      method: 'POST',
-      body: buffer,
-      headers: { 'Content-Type': 'application/octet-stream' }
-    });
-    const d = await r.json();
-    if (r.ok) {
-        statusEl.textContent = '✓ Model successfully loaded (' + d.path + ')';
-        statusEl.style.color = '#10b981';
-    } else {
-        statusEl.textContent = '✗ ' + d.error;
-        statusEl.style.color = '#ef4444';
-    }
-  } catch(e) {
-    statusEl.textContent = '✗ Upload failed';
-    statusEl.style.color = '#ef4444';
-  }
-}
-
-async function toggleMlMode() {
-  const select = document.getElementById('ml-mode-select');
-  const mode = select.value;
-  const statusEl = document.getElementById('ml-status');
-  
-  try {
-    const r = await fetch(BASE + '/api/ml/mode', {
-      method: 'PUT',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ mode })
-    });
-    if (r.ok) {
-        statusEl.textContent = '✓ Mode changed to ' + mode.toUpperCase();
-        statusEl.style.color = '#10b981';
-    }
-  } catch(e) {
-    console.error('Mode switch failed', e);
-  }
-}
-
+/* ── Main refresh loop ── */
 function refreshAll() {
   fetchStats();
+  fetchTopIps();
   fetchUpstreams();
-  fetchKeyval();
+  fetchBans();
+  fetchStrikes();
+  fetchAttacks();
   fetchMlLogs();
-  document.getElementById('refresh-status').textContent =
-    'Last updated: ' + new Date().toLocaleTimeString();
+  fetchKeyval();
+  fetchCluster();
+  fetchCacheStats();
+  fetchBandwidth();
+  fetchAlerts();
+  fetchWebRtcRoomsBandwidth();
+  document.getElementById('refresh-status').textContent = 'Updated ' + new Date().toLocaleTimeString();
 }
 
 refreshAll();
-setInterval(refreshAll, 2000);
+setInterval(refreshAll, 3000);
 </script>
 </body>
 </html>

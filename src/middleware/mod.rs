@@ -30,6 +30,7 @@ impl ResponseCache {
             store: Cache::builder()
                 .max_capacity(max_capacity)
                 .time_to_live(Duration::from_secs(ttl_secs))
+                .support_invalidation_closures()
                 .build(),
         }
     }
@@ -61,6 +62,33 @@ impl ResponseCache {
         response.expires_at = Instant::now() + Duration::from_secs(ttl_secs.max(1));
         debug!("Cache STORE: {} ({} bytes)", key, response.body.len());
         self.store.insert(key, response).await;
+    }
+
+    /// Removes a single entry by exact key. Returns true if the key was present.
+    pub async fn purge(&self, key: &str) -> bool {
+        let was_present = self.store.get(key).await.is_some();
+        self.store.invalidate(key).await;
+        was_present
+    }
+
+    /// Removes all entries whose key starts with `prefix`. Returns count removed.
+    pub async fn purge_prefix(&self, prefix: &str) -> u64 {
+        // Moka doesn't expose iteration, so we track an approximate count via a
+        // before/after entry_count delta (best-effort, fine for admin use).
+        let before = self.store.entry_count();
+        let prefix_owned = prefix.to_string();
+        self.store
+            .invalidate_entries_if(move |k, _v| k.starts_with(&prefix_owned))
+            .expect("invalidate_entries_if failed");
+        self.store.run_pending_tasks().await;
+        let after = self.store.entry_count();
+        before.saturating_sub(after)
+    }
+
+    /// Removes all entries from the cache.
+    pub async fn purge_all(&self) {
+        self.store.invalidate_all();
+        self.store.run_pending_tasks().await;
     }
 
     /// Returns the current number of entries in the cache.

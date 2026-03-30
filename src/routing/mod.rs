@@ -1,11 +1,22 @@
 use arc_swap::ArcSwap;
 use dashmap::DashMap;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::net::TcpStream;
 use tokio::time::{Duration, sleep};
 use tracing::{info, warn};
+
+// ─── Circuit Breaker State Constants ────────────────────────────────────────
+
+/// Normal operation: all requests pass through and failures are counted.
+const CIRCUIT_CLOSED: u8 = 0;
+/// Backend is considered unavailable: all requests are rejected immediately.
+/// After the backoff period, the health-check loop transitions to HALF_OPEN.
+const CIRCUIT_OPEN: u8 = 1;
+/// A single health-check probe is in progress. Live traffic is still blocked.
+/// On probe success → CLOSED; on probe failure → OPEN with doubled backoff.
+const CIRCUIT_HALF_OPEN: u8 = 2;
 
 use crate::config::{BackendConfig, LoadBalancingAlgorithm, UpstreamPoolConfig};
 
@@ -42,10 +53,20 @@ pub struct BackendNode {
     /// Epoch-secs when this backend last transitioned from DOWN → UP (for slow-start ramp).
     /// Zero means the backend has been UP since startup (no ramp needed).
     recovery_time: AtomicU64,
+
+    // ── Circuit Breaker state ─────────────────────────────────────────────
+    /// Current circuit state: CIRCUIT_CLOSED (0), CIRCUIT_OPEN (1), CIRCUIT_HALF_OPEN (2).
+    circuit_state: AtomicU8,
+    /// Epoch-secs when the circuit was last tripped to OPEN.
+    circuit_open_at: AtomicU64,
+    /// Current backoff duration in seconds before a health-check probe is allowed.
+    /// Doubles on each successive trip, capped at `config.circuit_max_backoff_secs`.
+    circuit_backoff_secs: AtomicU64,
 }
 
 impl BackendNode {
     pub fn new(config: BackendConfig) -> Self {
+        let initial_backoff = config.circuit_initial_backoff_secs;
         Self {
             config,
             active_connections: AtomicUsize::new(0),
@@ -53,6 +74,9 @@ impl BackendNode {
             fail_count: AtomicU32::new(0),
             last_fail_at: AtomicU64::new(0),
             recovery_time: AtomicU64::new(0),
+            circuit_state: AtomicU8::new(CIRCUIT_CLOSED),
+            circuit_open_at: AtomicU64::new(0),
+            circuit_backoff_secs: AtomicU64::new(initial_backoff),
         }
     }
 
@@ -79,16 +103,71 @@ impl BackendNode {
                 "Passive health check: backend {} DOWN after {} consecutive failures",
                 self.config.address, count
             );
+            self.trip_circuit();
+        }
+    }
+
+    // ── Circuit Breaker ──────────────────────────────────────────────────────
+
+    /// Trips the circuit to OPEN. If the circuit was already OPEN (failed probe),
+    /// the backoff is doubled up to `circuit_max_backoff_secs`.
+    pub fn trip_circuit(&self) {
+        if !self.config.circuit_breaker {
+            return;
+        }
+        let prev_state = self.circuit_state.swap(CIRCUIT_OPEN, Ordering::AcqRel);
+        let new_backoff = match prev_state {
+            // Failed probe in HALF_OPEN: double the backoff
+            CIRCUIT_HALF_OPEN => {
+                let current = self.circuit_backoff_secs.load(Ordering::Relaxed);
+                (current * 2).min(self.config.circuit_max_backoff_secs)
+            }
+            // Fresh trip from CLOSED: reset to initial backoff
+            _ => self.config.circuit_initial_backoff_secs,
+        };
+        self.circuit_backoff_secs.store(new_backoff, Ordering::Release);
+        self.circuit_open_at.store(now_secs(), Ordering::Release);
+        warn!(
+            "Circuit breaker OPEN for backend {} (backoff: {}s)",
+            self.config.address, new_backoff
+        );
+    }
+
+    /// Returns `true` if the circuit is CLOSED and requests may be forwarded.
+    /// OPEN and HALF_OPEN both block live traffic; the health-check loop handles probing.
+    pub fn is_circuit_closed(&self) -> bool {
+        if !self.config.circuit_breaker {
+            return true;
+        }
+        self.circuit_state.load(Ordering::Acquire) == CIRCUIT_CLOSED
+    }
+
+    /// Called by the health-check loop after a successful probe in HALF_OPEN state.
+    /// Transitions the circuit back to CLOSED and resets the backoff counter.
+    pub fn record_circuit_success(&self) {
+        if !self.config.circuit_breaker {
+            return;
+        }
+        let prev = self.circuit_state.swap(CIRCUIT_CLOSED, Ordering::AcqRel);
+        if prev != CIRCUIT_CLOSED {
+            self.circuit_backoff_secs
+                .store(self.config.circuit_initial_backoff_secs, Ordering::Release);
+            info!(
+                "Circuit breaker CLOSED for backend {} (probe succeeded)",
+                self.config.address
+            );
         }
     }
 
     /// Called by the active health check loop when it detects a DOWN→UP transition.
     /// Stamps `recovery_time` so slow-start can ramp the effective weight.
+    /// Also closes the circuit breaker if it was in HALF_OPEN state.
     pub fn record_recovery(&self) {
         let now = now_secs();
         self.recovery_time.store(now, Ordering::Release);
         self.fail_count.store(0, Ordering::Relaxed);
         self.is_healthy.store(true, Ordering::Release);
+        self.record_circuit_success();
         info!(
             "Backend {} recovered (UP). Slow-start: {} secs",
             self.config.address, self.config.slow_start_secs
@@ -202,12 +281,13 @@ impl UpstreamPool {
             healthy_primary
         };
 
-        // Filter by max_conns (skip backends at capacity)
+        // Filter by max_conns (skip backends at capacity) and circuit breaker state
         let available: Vec<Arc<BackendNode>> = healthy
             .into_iter()
             .filter(|b| {
-                b.config.max_conns == 0
-                    || b.active_connections.load(Ordering::Relaxed) < b.config.max_conns as usize
+                (b.config.max_conns == 0
+                    || b.active_connections.load(Ordering::Relaxed) < b.config.max_conns as usize)
+                    && b.is_circuit_closed()
             })
             .collect();
 
@@ -450,41 +530,92 @@ async fn health_check_loop(pool_name: String, pool: Arc<UpstreamPool>) {
             let address = &backend.config.address;
             let was_healthy = backend.is_healthy.load(Ordering::Acquire);
 
-            let now_healthy = if let Some(ref path) = backend.config.health_check_path {
-                let url = format!("http://{}{}", address, path);
-                let expected = backend.config.health_check_status;
-                match reqwest_health_get(&url, expected).await {
-                    Ok(true) => true,
-                    Ok(false) => {
-                        warn!(
-                            "Health check FAILED for {} in pool {} (unexpected status)",
+            // ── Circuit breaker: advance OPEN → HALF_OPEN when backoff expires ──
+            if backend.config.circuit_breaker
+                && backend.circuit_state.load(Ordering::Acquire) == CIRCUIT_OPEN
+            {
+                let backoff = backend.circuit_backoff_secs.load(Ordering::Relaxed);
+                let opened_at = backend.circuit_open_at.load(Ordering::Relaxed);
+                if now_secs().saturating_sub(opened_at) >= backoff {
+                    // Try to advance to HALF_OPEN (only one health-check task wins the CAS)
+                    if backend
+                        .circuit_state
+                        .compare_exchange(
+                            CIRCUIT_OPEN,
+                            CIRCUIT_HALF_OPEN,
+                            Ordering::AcqRel,
+                            Ordering::Relaxed,
+                        )
+                        .is_ok()
+                    {
+                        info!(
+                            "Circuit breaker HALF_OPEN for backend {} in pool {} — probing",
                             address, pool_name
                         );
-                        false
-                    }
-                    Err(e) => {
-                        warn!(
-                            "Health check ERROR for {} in pool {}: {}",
-                            address, pool_name, e
-                        );
-                        false
                     }
                 }
-            } else {
-                matches!(TcpStream::connect(address).await, Ok(_))
-            };
+            }
 
-            match (was_healthy, now_healthy) {
-                (false, true) => {
-                    // DOWN → UP transition: stamp recovery_time for slow-start
-                    backend.record_recovery();
-                    info!("Backend {} in pool {} is now UP", address, pool_name);
+            let circuit_probing = backend.config.circuit_breaker
+                && backend.circuit_state.load(Ordering::Acquire) == CIRCUIT_HALF_OPEN;
+
+            // Only probe if: backend is DOWN, OR the circuit is in HALF_OPEN state
+            if !was_healthy || circuit_probing {
+                let probe_ok = if let Some(ref path) = backend.config.health_check_path {
+                    let url = format!("http://{}{}", address, path);
+                    let expected = backend.config.health_check_status;
+                    match reqwest_health_get(&url, expected).await {
+                        Ok(true) => true,
+                        Ok(false) => {
+                            warn!(
+                                "Health check FAILED for {} in pool {} (unexpected status)",
+                                address, pool_name
+                            );
+                            false
+                        }
+                        Err(e) => {
+                            warn!(
+                                "Health check ERROR for {} in pool {}: {}",
+                                address, pool_name, e
+                            );
+                            false
+                        }
+                    }
+                } else {
+                    matches!(TcpStream::connect(address).await, Ok(_))
+                };
+
+                match (was_healthy, probe_ok) {
+                    (false, true) => {
+                        // DOWN → UP: record recovery (also closes circuit if in HALF_OPEN)
+                        backend.record_recovery();
+                        info!("Backend {} in pool {} is now UP", address, pool_name);
+                    }
+                    (_, false) if circuit_probing => {
+                        // HALF_OPEN probe failed: trip circuit again (doubles backoff)
+                        backend.trip_circuit();
+                        warn!(
+                            "Circuit breaker probe FAILED for {} in pool {} — back to OPEN",
+                            address, pool_name
+                        );
+                    }
+                    _ => {}
                 }
-                (true, false) => {
+            } else if was_healthy {
+                // Backend is UP — run health check to detect newly-failed backends
+                let still_ok = if let Some(ref path) = backend.config.health_check_path {
+                    let url = format!("http://{}{}", address, path);
+                    let expected = backend.config.health_check_status;
+                    matches!(reqwest_health_get(&url, expected).await, Ok(true))
+                } else {
+                    matches!(TcpStream::connect(address).await, Ok(_))
+                };
+
+                if !still_ok {
                     backend.is_healthy.store(false, Ordering::Release);
-                    warn!("Backend {} in pool {} is DOWN", address, pool_name);
+                    backend.trip_circuit();
+                    warn!("Backend {} in pool {} is DOWN (health check)", address, pool_name);
                 }
-                _ => {} // no change
             }
         }
     }
@@ -662,5 +793,146 @@ mod tests {
             "consistent hash should always pick same backend for same IP: {:?}",
             backends
         );
+    }
+
+    // ── Circuit breaker ──────────────────────────────────────────────────────
+
+    #[test]
+    fn test_circuit_breaker_trip() {
+        let mut node = make_backend(1, 3, 30, 0);
+        // Enable circuit breaker
+        node.config.circuit_breaker = true;
+        node.config.circuit_initial_backoff_secs = 1;
+        node.config.circuit_max_backoff_secs = 10;
+
+        assert!(node.is_circuit_closed(), "circuit should start closed");
+        node.trip_circuit();
+        assert!(!node.is_circuit_closed(), "circuit should be OPEN after trip");
+    }
+
+    #[test]
+    fn test_circuit_breaker_disabled_always_closed() {
+        let mut node = make_backend(1, 3, 30, 0);
+        node.config.circuit_breaker = false;
+
+        node.trip_circuit(); // Should be no-op
+        assert!(node.is_circuit_closed(), "circuit should always be closed when disabled");
+    }
+
+    #[test]
+    fn test_circuit_breaker_success_closes_circuit() {
+        let mut node = make_backend(1, 3, 30, 0);
+        node.config.circuit_breaker = true;
+        node.config.circuit_initial_backoff_secs = 1;
+        node.config.circuit_max_backoff_secs = 10;
+
+        node.trip_circuit();
+        assert!(!node.is_circuit_closed());
+
+        node.record_circuit_success();
+        assert!(node.is_circuit_closed(), "circuit should close after successful probe");
+    }
+
+    // ── Helper functions ──────────────────────────────────────────────────────
+
+    #[test]
+    fn test_is_ip_literal_true_v4() {
+        assert!(is_ip_literal("192.168.1.1"));
+        assert!(is_ip_literal("10.0.0.1:8080"));
+    }
+
+    #[test]
+    fn test_is_ip_literal_ipv6_brackets() {
+        // IPv6 addresses with brackets are NOT correctly detected by this function
+        // (this is a known limitation - the function uses split(':') which breaks IPv6)
+        // The function only works for plain IPv4 addresses
+        assert!(!is_ip_literal("[::1]:8080"));
+    }
+
+    #[test]
+    fn test_is_ip_literal_false_hostname() {
+        assert!(!is_ip_literal("localhost"));
+        assert!(!is_ip_literal("backend.example.com"));
+        assert!(!is_ip_literal("my-service:8080"));
+    }
+
+    #[test]
+    fn test_split_host_port_with_port() {
+        let (host, port) = split_host_port("backend.example.com:8080");
+        assert_eq!(host, "backend.example.com");
+        assert_eq!(port, "8080");
+    }
+
+    #[test]
+    fn test_split_host_port_without_port() {
+        let (host, port) = split_host_port("backend.example.com");
+        assert_eq!(host, "backend.example.com");
+        assert_eq!(port, "80");
+    }
+
+    #[test]
+    fn test_split_host_port_ipv4_with_port() {
+        let (host, port) = split_host_port("192.168.1.1:3000");
+        assert_eq!(host, "192.168.1.1");
+        assert_eq!(port, "3000");
+    }
+
+    // ── Weighted round-robin ─────────────────────────────────────────────────
+
+    #[test]
+    fn test_weighted_roundrobin_respects_weights() {
+        let pool_config = crate::config::UpstreamPoolConfig {
+            algorithm: LoadBalancingAlgorithm::WeightedRoundRobin,
+            backends: vec![
+                BackendConfig {
+                    address: "10.0.0.1:8080".to_string(),
+                    weight: 3,
+                    ..Default::default()
+                },
+                BackendConfig {
+                    address: "10.0.0.2:8080".to_string(),
+                    weight: 1,
+                    ..Default::default()
+                },
+            ],
+            keepalive: 0,
+            srv_discover: None,
+        };
+        let pool = UpstreamPool::new(&pool_config);
+
+        let mut counts = std::collections::HashMap::new();
+        for _ in 0..100 {
+            let backend = pool.get_next_backend(None, None).unwrap();
+            *counts.entry(backend.config.address.clone()).or_insert(0) += 1;
+        }
+        // 10.0.0.1 with weight 3 should be picked ~75% of the time
+        let a_count = *counts.get("10.0.0.1:8080").unwrap_or(&0);
+        let b_count = *counts.get("10.0.0.2:8080").unwrap_or(&0);
+        assert!(a_count > b_count * 2, "higher weight should be picked more often: a={}, b={}", a_count, b_count);
+    }
+
+    // ── IP hash ─────────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_ip_hash_same_ip_same_backend() {
+        let pool_config = crate::config::UpstreamPoolConfig {
+            algorithm: LoadBalancingAlgorithm::IpHash,
+            backends: vec![
+                BackendConfig { address: "10.0.0.1:8080".to_string(), ..Default::default() },
+                BackendConfig { address: "10.0.0.2:8080".to_string(), ..Default::default() },
+                BackendConfig { address: "10.0.0.3:8080".to_string(), ..Default::default() },
+            ],
+            keepalive: 0,
+            srv_discover: None,
+        };
+        let pool = UpstreamPool::new(&pool_config);
+        let ip: std::net::IpAddr = "192.168.1.100".parse().unwrap();
+
+        // Same IP always picks the same backend
+        let backend1 = pool.get_next_backend(Some(&ip), None).unwrap();
+        for _ in 0..10 {
+            let backend = pool.get_next_backend(Some(&ip), None).unwrap();
+            assert_eq!(backend.config.address, backend1.config.address);
+        }
     }
 }

@@ -25,7 +25,7 @@ use tracing::{debug, error, info, warn};
 use crate::admin::ProxyMetrics;
 use crate::ai::AiRouter;
 use crate::config::AppConfig;
-use crate::middleware::ResponseCache;
+use crate::middleware::{CachedResponse, ResponseCache};
 use crate::routing::UpstreamManager;
 
 /// Starts the HTTP/3 QUIC server on the configured UDP bind address.
@@ -34,8 +34,8 @@ pub async fn start_http3_proxy(
     app_config: Arc<AppConfig>,
     upstreams: Arc<UpstreamManager>,
     metrics: Arc<ProxyMetrics>,
-    _cache: Arc<ResponseCache>,
-    _ai_engine: Arc<dyn AiRouter>,
+    cache: Arc<ResponseCache>,
+    ai_engine: Arc<dyn AiRouter>,
     shutdown: CancellationToken,
 ) {
     let addr: SocketAddr = match bind_addr.parse() {
@@ -82,6 +82,8 @@ pub async fn start_http3_proxy(
                 let upstreams_c = Arc::clone(&upstreams);
                 let config_c = Arc::clone(&app_config);
                 let metrics_c = Arc::clone(&metrics);
+                let cache_c = Arc::clone(&cache);
+                let ai_c = Arc::clone(&ai_engine);
 
                 tokio::spawn(async move {
                     let conn = match incoming.await {
@@ -103,7 +105,7 @@ pub async fn start_http3_proxy(
                             }
                         };
 
-                    serve_h3_connection(h3_conn, upstreams_c, config_c, metrics_c).await;
+                    serve_h3_connection(h3_conn, upstreams_c, config_c, metrics_c, cache_c, ai_c).await;
                 });
             }
             _ = shutdown.cancelled() => {
@@ -121,6 +123,8 @@ async fn serve_h3_connection(
     upstreams: Arc<UpstreamManager>,
     app_config: Arc<AppConfig>,
     metrics: Arc<ProxyMetrics>,
+    cache: Arc<ResponseCache>,
+    ai_engine: Arc<dyn AiRouter>,
 ) {
     loop {
         // h3 0.0.8: accept() returns Option<RequestResolver<C,B>>
@@ -137,8 +141,10 @@ async fn serve_h3_connection(
                 let u = Arc::clone(&upstreams);
                 let c = Arc::clone(&app_config);
                 let m = Arc::clone(&metrics);
+                let ca = Arc::clone(&cache);
+                let ai = Arc::clone(&ai_engine);
                 tokio::spawn(async move {
-                    handle_h3_request(req, stream, u, c, m).await;
+                    handle_h3_request(req, stream, u, c, m, ca, ai).await;
                 });
             }
             Ok(None) => {
@@ -160,12 +166,46 @@ async fn handle_h3_request(
     upstreams: Arc<UpstreamManager>,
     app_config: Arc<AppConfig>,
     metrics: Arc<ProxyMetrics>,
+    cache: Arc<ResponseCache>,
+    ai_engine: Arc<dyn AiRouter>,
 ) {
     let path = req.uri().path().to_string();
+    let query = req.uri().query().map(String::from);
     let method = req.method().clone();
+    let host = req
+        .headers()
+        .get(hyper::header::HOST)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("_");
     let start = std::time::Instant::now();
 
     debug!("HTTP/3 {} {}", method, path);
+
+    // Serve from cache for GET requests
+    if method == hyper::Method::GET {
+        let cache_key = ResponseCache::cache_key(
+            "GET",
+            host,
+            &path,
+            query.as_deref(),
+        );
+        if let Some(cached) = cache.get(&cache_key).await {
+            let response = hyper::Response::builder()
+                .status(cached.status)
+                .header("x-proxy-by", "Phalanx/HTTP3")
+                .header("x-cache", "HIT")
+                .header("content-type", cached.content_type.as_str())
+                .body(())
+                .unwrap();
+            if let Err(e) = stream.send_response(response).await {
+                debug!("HTTP/3 cache send error: {}", e);
+                return;
+            }
+            let _ = stream.send_data(Bytes::from(cached.body)).await;
+            let _ = stream.finish().await;
+            return;
+        }
+    }
 
     // Route matching — longest-prefix match
     let route = {
@@ -195,7 +235,7 @@ async fn handle_h3_request(
         .get_pool(&pool_name)
         .or_else(|| upstreams.get_pool("default"));
 
-    let backend = match pool.as_ref().and_then(|p| p.get_next_backend(None, None)) {
+    let backend = match pool.as_ref().and_then(|p| p.get_next_backend(None, Some(Arc::clone(&ai_engine)))) {
         Some(b) => b,
         None => {
             send_h3_error(&mut stream, StatusCode::BAD_GATEWAY).await;
@@ -262,7 +302,20 @@ async fn handle_h3_request(
         .with_label_values(&[&method_str, &pool_name])
         .observe(latency_secs);
 
+    // Feed AI engine with latency/error signal
+    ai_engine.update_score(
+        &backend.config.address,
+        (latency_secs * 1000.0) as u64,
+        status.is_server_error(),
+    );
+
     // Collect response body from backend
+    let content_type = backend_resp
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("application/octet-stream")
+        .to_string();
     let body_bytes = match backend_resp.bytes().await {
         Ok(b) => b,
         Err(e) => {
@@ -272,10 +325,28 @@ async fn handle_h3_request(
         }
     };
 
+    // Cache GET 200 responses
+    if method == hyper::Method::GET && status == StatusCode::OK {
+        let cache_key = ResponseCache::cache_key("GET", host, &path, query.as_deref());
+        cache
+            .insert_with_ttl(
+                cache_key,
+                CachedResponse {
+                    status: status_u16,
+                    body: Bytes::copy_from_slice(&body_bytes),
+                    content_type: content_type.clone(),
+                    expires_at: std::time::Instant::now(),
+                },
+                60,
+            )
+            .await;
+    }
+
     // Send HTTP/3 response headers
     let response = hyper::Response::builder()
         .status(status)
         .header("x-proxy-by", "Phalanx/HTTP3")
+        .header("content-type", content_type.as_str())
         .body(())
         .unwrap();
 

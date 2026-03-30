@@ -46,6 +46,15 @@ pub struct BackendConfig {
     pub max_conns: u32,
     /// Queue size when max_conns is reached. Requests wait up to `queue_timeout_ms`. 0 = no queue.
     pub queue_size: u32,
+
+    // ── Circuit Breaker ──────────────────────────────────────────────────────
+    /// Enable the exponential-backoff circuit breaker for this backend. Default: false.
+    pub circuit_breaker: bool,
+    /// Initial backoff duration (secs) when circuit trips to OPEN. Doubles on each re-trip.
+    /// Default: 5.
+    pub circuit_initial_backoff_secs: u64,
+    /// Maximum backoff duration (secs) the circuit will wait before probing. Default: 60.
+    pub circuit_max_backoff_secs: u64,
 }
 
 impl Default for BackendConfig {
@@ -61,6 +70,9 @@ impl Default for BackendConfig {
             backup: false,
             max_conns: 0,
             queue_size: 0,
+            circuit_breaker: false,
+            circuit_initial_backoff_secs: 5,
+            circuit_max_backoff_secs: 60,
         }
     }
 }
@@ -131,6 +143,21 @@ pub struct RouteConfig {
     pub auth_request_url: Option<String>,
     /// Mirror pool name for traffic tee on this route.
     pub mirror_pool: Option<String>,
+
+    // ── JWKS-based JWT Auth ──────────────────────────────────────────────────
+    /// JWKS endpoint URI for dynamic public key fetching (RS256/ES256).
+    /// When set, replaces static `auth_jwt_secret` with remote JWKS key lookup.
+    #[serde(default)]
+    pub auth_jwks_uri: Option<String>,
+
+    // ── OIDC Session Auth ────────────────────────────────────────────────────
+    /// OIDC issuer URL (e.g. https://accounts.google.com). When set with
+    /// `auth_oidc_cookie_name`, enables OIDC session validation on this route.
+    #[serde(default)]
+    pub auth_oidc_issuer: Option<String>,
+    /// Cookie name that holds the OIDC session ID. Default: "phalanx_oidc".
+    #[serde(default)]
+    pub auth_oidc_cookie_name: Option<String>,
 }
 
 /// The global application configuration state.
@@ -229,6 +256,44 @@ pub struct AppConfig {
     pub auto_ssl_cache_dir: Option<String>,
     /// Redis connection URL for cluster state sharing.
     pub redis_url: Option<String>,
+    /// SMTP proxy bind address (e.g. "0.0.0.0:25"). Enables mail proxy for SMTP when set.
+    #[serde(default)]
+    pub smtp_bind: Option<String>,
+    /// IMAP proxy bind address (e.g. "0.0.0.0:143"). Enables mail proxy for IMAP when set.
+    #[serde(default)]
+    pub imap_bind: Option<String>,
+    /// POP3 proxy bind address (e.g. "0.0.0.0:110"). Enables mail proxy for POP3 when set.
+    #[serde(default)]
+    pub pop3_bind: Option<String>,
+    /// Upstream pool name for mail proxies. Defaults to "default".
+    #[serde(default)]
+    pub mail_upstream_pool: Option<String>,
+    /// WAF policy file path (JSON format, NGINX App Protect-style). Optional.
+    #[serde(default)]
+    pub waf_policy_path: Option<String>,
+
+    // ── OCSP Stapling ────────────────────────────────────────────────────────
+    /// Override OCSP responder URL (normally extracted from the cert AIA extension).
+    #[serde(default)]
+    pub ocsp_responder_url: Option<String>,
+
+    // ── Cluster State ────────────────────────────────────────────────────────
+    /// etcd v3 endpoint list (comma-separated). When set, enables etcd-backed cluster state.
+    /// Example: "http://etcd1:2379,http://etcd2:2379"
+    #[serde(default)]
+    pub etcd_endpoints: Option<String>,
+    /// Node identifier for this Phalanx instance in a cluster. Defaults to hostname.
+    #[serde(default)]
+    pub node_id: Option<String>,
+
+    // ── ML Fraud Detection ───────────────────────────────────────────────────
+    /// Path to an ONNX model file for ML-based fraud detection.
+    /// When set, the ML fraud engine is started at launch.
+    #[serde(default)]
+    pub ml_fraud_model_path: Option<String>,
+    /// ML fraud detection mode: "shadow" (log only) or "active" (auto-ban). Default: shadow.
+    #[serde(default)]
+    pub ml_fraud_mode: Option<String>,
 }
 
 impl Default for AppConfig {
@@ -305,6 +370,16 @@ impl Default for AppConfig {
             auto_ssl_email: None,
             auto_ssl_cache_dir: None,
             redis_url: None,
+            smtp_bind: None,
+            imap_bind: None,
+            pop3_bind: None,
+            mail_upstream_pool: None,
+            waf_policy_path: None,
+            ocsp_responder_url: None,
+            etcd_endpoints: None,
+            node_id: None,
+            ml_fraud_model_path: None,
+            ml_fraud_mode: None,
         }
     }
 }
@@ -478,6 +553,36 @@ pub fn load_config(conf_path: &str) -> AppConfig {
                 if let Some(v) = server.directives.get("redis_url") {
                     app_cfg.redis_url = Some(v.clone());
                 }
+                if let Some(v) = server.directives.get("ocsp_responder_url") {
+                    app_cfg.ocsp_responder_url = Some(v.clone());
+                }
+                if let Some(v) = server.directives.get("etcd_endpoints") {
+                    app_cfg.etcd_endpoints = Some(v.clone());
+                }
+                if let Some(v) = server.directives.get("node_id") {
+                    app_cfg.node_id = Some(v.clone());
+                }
+                if let Some(v) = server.directives.get("ml_fraud_model_path") {
+                    app_cfg.ml_fraud_model_path = Some(v.clone());
+                }
+                if let Some(v) = server.directives.get("ml_fraud_mode") {
+                    app_cfg.ml_fraud_mode = Some(v.clone());
+                }
+                if let Some(v) = server.directives.get("smtp_bind") {
+                    app_cfg.smtp_bind = Some(v.clone());
+                }
+                if let Some(v) = server.directives.get("imap_bind") {
+                    app_cfg.imap_bind = Some(v.clone());
+                }
+                if let Some(v) = server.directives.get("pop3_bind") {
+                    app_cfg.pop3_bind = Some(v.clone());
+                }
+                if let Some(v) = server.directives.get("mail_upstream_pool") {
+                    app_cfg.mail_upstream_pool = Some(v.clone());
+                }
+                if let Some(v) = server.directives.get("waf_policy_path") {
+                    app_cfg.waf_policy_path = Some(v.clone());
+                }
 
                 // Map phalanx-style route blocks into our RouteConfig hashmap
                 for (path, route) in server.routes {
@@ -504,6 +609,9 @@ pub fn load_config(conf_path: &str) -> AppConfig {
                             brotli: route.brotli,
                             auth_request_url: route.auth_request_url,
                             mirror_pool: route.mirror_pool,
+                            auth_jwks_uri: route.auth_jwks_uri,
+                            auth_oidc_issuer: route.auth_oidc_issuer,
+                            auth_oidc_cookie_name: route.auth_oidc_cookie_name,
                         },
                     );
                 }
@@ -544,6 +652,7 @@ pub fn load_config(conf_path: &str) -> AppConfig {
                         backup: false,
                         max_conns: 0,
                         queue_size: 0,
+                        ..Default::default()
                     })
                     .collect();
                 app_cfg.upstreams.insert(

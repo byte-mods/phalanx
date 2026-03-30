@@ -100,6 +100,11 @@ pub struct RouteBlock {
     pub auth_request_url: Option<String>,
     // ── Mirror ────────────────────────────────────────────────────────────────
     pub mirror_pool: Option<String>,
+    // ── JWKS-based JWT Auth ───────────────────────────────────────────────────
+    pub auth_jwks_uri: Option<String>,
+    // ── OIDC Session Auth ─────────────────────────────────────────────────────
+    pub auth_oidc_issuer: Option<String>,
+    pub auth_oidc_cookie_name: Option<String>,
 }
 
 /// A strict parser for a subset of Nginx configuration syntax.

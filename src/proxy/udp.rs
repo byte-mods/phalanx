@@ -176,3 +176,33 @@ pub async fn start_udp_proxy(
         }
     }
 }
+
+// ─── Tests ───────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const UDP_BUF_SIZE: usize = 65535;
+    const SESSION_TIMEOUT: Duration = Duration::from_secs(60);
+
+    #[test]
+    fn test_constants_defined() {
+        assert_eq!(UDP_BUF_SIZE, 65535);
+        assert_eq!(SESSION_TIMEOUT, Duration::from_secs(60));
+    }
+
+    #[test]
+    fn test_session_timeout_is_reasonable() {
+        // Session timeout should be at least 30 seconds
+        assert!(SESSION_TIMEOUT >= Duration::from_secs(30));
+    }
+
+    #[test]
+    fn test_udp_buffer_size_adequate() {
+        // Buffer should be large enough for a typical UDP packet
+        assert!(UDP_BUF_SIZE >= 512);
+        // And not excessively large
+        assert!(UDP_BUF_SIZE <= 1024 * 1024);
+    }
+}

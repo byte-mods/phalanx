@@ -68,4 +68,5 @@ trust-dns-resolver = "0.23.2"
 rhai = { version = "1", features = ["sync"] }
 rustls-acme = { version = "0.15.1", features = ["tokio"] }
 redis = { version = "0.27", features = ["tokio-comp"] }
+bcrypt = "0.15"
 webrtc = "0.17.1"

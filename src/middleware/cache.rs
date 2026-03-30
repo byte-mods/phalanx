@@ -198,6 +198,13 @@ impl AdvancedCache {
         self.memory.entry_count()
     }
 
+    /// Flushes Moka's internal pending-write queue so that `entry_count()` reflects
+    /// all inserts that have already been `.await`ed. Must be called in async tests
+    /// before asserting on `entry_count()`.
+    pub async fn run_pending_tasks(&self) {
+        self.memory.run_pending_tasks().await;
+    }
+
     // ── Disk I/O helpers ──
 
     fn disk_entry_path(&self, base: &Path, key: &str) -> PathBuf {
@@ -417,6 +424,8 @@ mod tests {
         assert_eq!(cache.entry_count(), 0);
         cache.insert("a".to_string(), fresh_entry()).await;
         cache.insert("b".to_string(), fresh_entry()).await;
+        // Moka's async cache defers index updates — flush before asserting count.
+        cache.run_pending_tasks().await;
         assert_eq!(cache.entry_count(), 2);
     }
 

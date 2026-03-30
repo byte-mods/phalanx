@@ -63,8 +63,7 @@ impl KeyvalStore {
         if let Some(client) = redis_client {
             let store_clone = Arc::clone(&store);
             tokio::spawn(async move {
-                if let Ok(mut con) = client.get_async_connection().await {
-                    let mut pubsub = con.into_pubsub();
+                if let Ok(mut pubsub) = client.get_async_pubsub().await {
                     if pubsub.subscribe("phalanx:keyval:sync").await.is_ok() {
                         let mut stream = pubsub.on_message();
                         use futures_util::StreamExt;
@@ -114,11 +113,11 @@ impl KeyvalStore {
         self.set_local(key.clone(), value.clone(), ttl_secs);
         
         if let Some(client) = &self.redis_client {
-            let mut client_clone = client.clone();
+            let client_clone = client.clone();
             let ttl_str = ttl_secs.map(|t| t.to_string()).unwrap_or_default();
             let payload = format!("SET:{}:{}:{}", key, ttl_str, value);
             tokio::spawn(async move {
-                if let Ok(mut con) = client_clone.get_async_connection().await {
+                if let Ok(mut con) = client_clone.get_multiplexed_async_connection().await {
                     use redis::AsyncCommands;
                     let _: redis::RedisResult<()> = con.publish("phalanx:keyval:sync", payload).await;
                 }
@@ -141,10 +140,10 @@ impl KeyvalStore {
         
         if existed {
             if let Some(client) = &self.redis_client {
-                let mut client_clone = client.clone();
+                let client_clone = client.clone();
                 let payload = format!("DEL:{}", key);
                 tokio::spawn(async move {
-                    if let Ok(mut con) = client_clone.get_async_connection().await {
+                    if let Ok(mut con) = client_clone.get_multiplexed_async_connection().await {
                         use redis::AsyncCommands;
                         let _: redis::RedisResult<()> = con.publish("phalanx:keyval:sync", payload).await;
                     }

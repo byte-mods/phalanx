@@ -1,4 +1,6 @@
+use std::collections::VecDeque;
 use std::sync::Arc;
+use tokio::sync::RwLock;
 use tracing::{debug, warn};
 
 use crate::keyval::KeyvalStore;
@@ -10,6 +12,7 @@ pub mod reputation;
 pub mod rules;
 
 use self::ml_fraud::MlFraudEngine;
+use self::policy::PolicyEngine;
 use self::reputation::IpReputationManager;
 use self::rules::WafRules;
 
@@ -17,6 +20,16 @@ use self::rules::WafRules;
 pub enum WafAction {
     Allow,
     Block(String), // Reason for blocking
+}
+
+/// A single WAF attack event recorded for the dashboard live feed.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct AttackEvent {
+    pub timestamp: u64,
+    pub ip: String,
+    pub path: String,
+    pub reason: String,
+    pub method: String,
 }
 
 #[derive(Clone)]
@@ -28,6 +41,10 @@ pub struct WafEngine {
     keyval: Option<Arc<KeyvalStore>>,
     /// Asynchronous Machine Learning Fraud Detection Engine
     pub ml_engine: Arc<MlFraudEngine>,
+    /// Declarative WAF policy engine (NGINX App Protect-style)
+    pub policy_engine: Arc<PolicyEngine>,
+    /// Rolling log of the last 200 attack events for the dashboard.
+    pub attack_log: Arc<RwLock<VecDeque<AttackEvent>>>,
 }
 
 /// Decodes percent-encoded URL sequences (%XX → character).
@@ -63,13 +80,47 @@ impl WafEngine {
             enabled,
             keyval: None,
             ml_engine: Arc::new(MlFraudEngine::new()),
+            policy_engine: Arc::new(PolicyEngine::new()),
+            attack_log: Arc::new(RwLock::new(VecDeque::with_capacity(200))),
         }
+    }
+
+    /// Records an attack event in the rolling log (max 200 entries).
+    pub async fn record_attack(&self, ip: &str, path: &str, method: &str, reason: &str) {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let event = AttackEvent {
+            timestamp: now,
+            ip: ip.to_string(),
+            path: path.to_string(),
+            reason: reason.to_string(),
+            method: method.to_string(),
+        };
+        let mut log = self.attack_log.write().await;
+        if log.len() >= 200 {
+            log.pop_front();
+        }
+        log.push_back(event);
+    }
+
+    /// Returns the last N attack events (newest first).
+    pub async fn recent_attacks(&self, n: usize) -> Vec<AttackEvent> {
+        let log = self.attack_log.read().await;
+        log.iter().rev().take(n).cloned().collect()
     }
 
     /// Attach a shared [`KeyvalStore`] for dynamic IP ban list lookups.
     /// Any key matching the client IP (with any value) is treated as a ban.
     pub fn with_keyval(mut self, keyval: Arc<KeyvalStore>) -> Self {
         self.keyval = Some(keyval);
+        self
+    }
+
+    /// Replace the default (empty) policy engine with a pre-configured one.
+    pub fn with_policy_engine(mut self, engine: PolicyEngine) -> Self {
+        self.policy_engine = Arc::new(engine);
         self
     }
 
@@ -128,6 +179,19 @@ impl WafEngine {
             );
             self.reputation.add_strike(ip, 3);
             return WafAction::Block(format!("WAF Rule: {}", violation));
+        }
+
+        // 4. Declarative Policy Engine (NGINX App Protect-style custom rules)
+        let policy_violations = self.policy_engine.evaluate(None, path, query, &[], None);
+        for v in &policy_violations {
+            if matches!(v.action, policy::RuleAction::Block) {
+                warn!(
+                    "WAF Policy Blocked: rule {} '{}' matched for {}",
+                    v.rule_id, v.description, ip
+                );
+                self.reputation.add_strike(ip, 2);
+                return WafAction::Block(format!("Policy Rule {}: {}", v.rule_id, v.category));
+            }
         }
 
         WafAction::Allow

@@ -1,4 +1,5 @@
 use dashmap::DashMap;
+use std::sync::Arc;
 use governor::{
     clock::DefaultClock,
     state::keyed::DefaultKeyedStateStore,
@@ -324,5 +325,24 @@ mod tests {
     fn test_extract_jwt_claim_missing_header() {
         let headers = hyper::HeaderMap::new();
         assert_eq!(extract_jwt_claim(&headers, "sub"), None);
+    }
+}
+
+/// RAII guard that automatically releases a connection slot when dropped.
+/// Use this to ensure `release_connection` is always called even on early returns.
+pub struct ConnectionGuard {
+    zone: Arc<ZoneLimiter>,
+    key: String,
+}
+
+impl ConnectionGuard {
+    pub fn new(zone: Arc<ZoneLimiter>, key: String) -> Self {
+        Self { zone, key }
+    }
+}
+
+impl Drop for ConnectionGuard {
+    fn drop(&mut self) {
+        self.zone.release_connection(&self.key);
     }
 }

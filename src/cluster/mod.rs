@@ -85,9 +85,32 @@ impl ClusterState {
                 }
                 Ok(())
             }
-            ClusterBackend::Redis { url: _ } => {
-                // Redis integration would use the `redis` crate
-                debug!("Redis cluster put: {} (stub)", key);
+            ClusterBackend::Redis { url } => {
+                let client = redis::Client::open(url.as_str())
+                    .map_err(|e| format!("Redis connect error: {}", e))?;
+                let mut con = client
+                    .get_multiplexed_async_connection()
+                    .await
+                    .map_err(|e| format!("Redis connection error: {}", e))?;
+                let serialized =
+                    serde_json::to_string(&entry).map_err(|e| format!("serialize: {}", e))?;
+                if let Some(ttl) = ttl_secs {
+                    redis::cmd("SET")
+                        .arg(key)
+                        .arg(&serialized)
+                        .arg("EX")
+                        .arg(ttl)
+                        .query_async::<()>(&mut con)
+                        .await
+                        .map_err(|e| format!("Redis SET error: {}", e))?;
+                } else {
+                    redis::cmd("SET")
+                        .arg(key)
+                        .arg(&serialized)
+                        .query_async::<()>(&mut con)
+                        .await
+                        .map_err(|e| format!("Redis SET error: {}", e))?;
+                }
                 Ok(())
             }
             ClusterBackend::Standalone => Ok(()),
@@ -117,9 +140,26 @@ impl ClusterState {
                     Ok(None)
                 }
             }
-            ClusterBackend::Redis { url: _ } => {
-                debug!("Redis cluster get: {} (stub)", key);
-                Ok(None)
+            ClusterBackend::Redis { url } => {
+                let client = redis::Client::open(url.as_str())
+                    .map_err(|e| format!("Redis connect error: {}", e))?;
+                let mut con = client
+                    .get_multiplexed_async_connection()
+                    .await
+                    .map_err(|e| format!("Redis connection error: {}", e))?;
+                let val: Option<String> = redis::cmd("GET")
+                    .arg(key)
+                    .query_async(&mut con)
+                    .await
+                    .map_err(|e| format!("Redis GET error: {}", e))?;
+                match val {
+                    Some(s) => {
+                        let entry: ClusterEntry =
+                            serde_json::from_str(&s).map_err(|e| format!("deserialize: {}", e))?;
+                        Ok(Some(entry))
+                    }
+                    None => Ok(None),
+                }
             }
             ClusterBackend::Standalone => Ok(None),
         }
