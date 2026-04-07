@@ -1,3 +1,14 @@
+/// ONNX-based machine learning fraud detection engine.
+///
+/// Runs inference asynchronously in a dedicated background task to avoid
+/// blocking request handling. Requests are queued via an MPSC channel;
+/// the worker extracts a 6-feature vector from request metadata and runs
+/// it through a pre-trained ONNX model (e.g., CatBoost binary classifier).
+///
+/// Two operational modes:
+/// - **Shadow**: predictions are logged but no enforcement action is taken.
+/// - **Active**: high-confidence fraud predictions trigger immediate IP bans
+///   via the reputation manager.
 use arc_swap::ArcSwap;
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
@@ -17,36 +28,67 @@ pub enum MlFraudMode {
     Active,
 }
 
-/// A serialized log entry for the Dashboard UI
+/// A serialized log entry for the admin dashboard UI.
+///
+/// Stored in a capped ring buffer (max 100 entries) for real-time display.
 #[derive(Debug, Clone, Serialize)]
 pub struct MlLogEntry {
+    /// Unix timestamp when the prediction was made.
     pub timestamp: u64,
+    /// Client IP address that was evaluated.
     pub ip: String,
+    /// Request path that was inspected.
     pub path: String,
+    /// Truncated request body for human review.
     pub payload_snippet: String,
+    /// Model output score (0.0 = benign, 1.0 = fraudulent).
     pub fraud_score: f32,
+    /// Whether the score exceeded the 0.5 threshold.
     pub flagged: bool,
+    /// Action taken: "Pass", "ShadowFlag", "IpBanned", or "InferenceError".
     pub action_taken: String,
 }
 
-/// Request metadata captured asynchronously for ML inference
+/// Request metadata captured asynchronously for ML inference.
+///
+/// Constructed in the request handler hot path and sent via MPSC channel
+/// to the background inference worker. Fields are chosen to produce a
+/// 6-dimensional feature vector: [path_len, method_enum, query_len,
+/// header_count, ua_len, body_len].
 #[derive(Debug, Clone)]
 pub struct MlEvent {
+    /// Client IP address.
     pub ip: String,
+    /// HTTP method (GET, POST, PUT, DELETE, etc.).
     pub method: String,
+    /// Request URL path.
     pub path: String,
+    /// Optional query string.
     pub query: Option<String>,
+    /// Unix timestamp when the request was received.
     pub timestamp: u64,
+    /// Number of HTTP headers in the request.
     pub header_count: usize,
+    /// Length of the User-Agent header string.
     pub user_agent_len: usize,
+    /// Length of the request body in bytes.
     pub body_len: usize,
+    /// First N bytes of the request body for logging/review.
     pub body_snippet: String,
 }
 
-/// The ML Inference background engine
+/// The ML fraud detection background engine.
+///
+/// Manages the lifecycle of the ONNX inference worker: model loading,
+/// event queuing, mode switching, and log retrieval. The engine is safe
+/// to share across threads; all mutable state is behind locks or atomics.
 pub struct MlFraudEngine {
+    /// Channel sender for queuing events to the background worker.
+    /// `None` until `load_model()` is called.
     tx: std::sync::RwLock<Option<mpsc::Sender<MlEvent>>>,
+    /// Current operational mode (Shadow or Active), atomically swappable at runtime.
     pub mode: Arc<ArcSwap<MlFraudMode>>,
+    /// Rolling log of the last 100 inference results for the admin dashboard.
     pub logs: Arc<RwLock<VecDeque<MlLogEntry>>>,
 }
 
@@ -87,14 +129,18 @@ impl MlFraudEngine {
             }).await.unwrap_or_else(|e| Err(anyhow::anyhow!("JoinError: {}", e)));
 
             let model = match model_result {
-                Ok(m) => m,
+                Ok(m) => Some(m),
                 Err(e) => {
-                    error!("ML Fraud Worker: Failed to load ONNX model. Worker shutting down. Error: {}", e);
-                    return;
+                    error!("ML Fraud Worker: Failed to load ONNX model, using rule-based fallback. Error: {}", e);
+                    None
                 }
             };
 
-            info!("ML Fraud Worker: ONNX model successfully loaded and active.");
+            if model.is_some() {
+                info!("ML Fraud Worker: ONNX model successfully loaded and active.");
+            } else {
+                warn!("ML Fraud Worker: Running in rule-based fallback mode.");
+            }
 
             while let Some(event) = rx.recv().await {
                 // Convert metadata into a standardized feature vector (6 floats)
@@ -116,25 +162,23 @@ impl MlFraudEngine {
                     event.body_len as f32,
                 ];
 
-                let model_clone = model.clone();
                 let event_clone = event.clone();
                 let current_mode = **mode_ref.load();
-                
-                // Perform Tract synchronous inference on a spawn_blocking thread
-                // so we don't block the MPSC receiver loop or Tokio core for long inputs
-                let log_entry = tokio::task::spawn_blocking(move || {
-                    let mut is_fraud = false;
-                    let mut score = 0.0;
-                    
-                    let tensor = tract_ndarray::Array1::from_vec(features).into_tensor();
-                    // Reshape to (1, 6) if the model expects batching
-                    let reshaped = tensor.clone().into_shape(&[1, 6]).unwrap_or(tensor);
-                    
-                    if let Ok(result) = model_clone.run(tvec!(reshaped.into())) {
+
+                let log_entry = if let Some(ref model) = model {
+                    let model_clone = model.clone();
+                    // Perform Tract synchronous inference on a spawn_blocking thread
+                    tokio::task::spawn_blocking(move || {
+                        let mut is_fraud = false;
+                        let mut score = 0.0;
+
+                        let tensor = tract_ndarray::Array1::from_vec(features).into_tensor();
+                        let reshaped = tensor.clone().into_shape(&[1, 6]).unwrap_or(tensor);
+
+                        if let Ok(result) = model_clone.run(tvec!(reshaped.into())) {
                             if let Ok(view) = result[0].to_array_view::<f32>() {
                                 if let Some(first_val) = view.iter().next() {
                                     score = *first_val;
-                                    // Assuming a CatBoost binary classifier output: positive => fraud
                                     if score > 0.5 {
                                         is_fraud = true;
                                     }
@@ -142,32 +186,36 @@ impl MlFraudEngine {
                             }
                         }
 
-                    MlLogEntry {
-                        timestamp: event_clone.timestamp,
-                        ip: event_clone.ip,
-                        path: event_clone.path,
-                        payload_snippet: event_clone.body_snippet,
-                        fraud_score: score,
-                        flagged: is_fraud,
-                        action_taken: if is_fraud {
-                            if current_mode == MlFraudMode::Active {
-                                "IpBanned".to_string()
+                        MlLogEntry {
+                            timestamp: event_clone.timestamp,
+                            ip: event_clone.ip,
+                            path: event_clone.path,
+                            payload_snippet: event_clone.body_snippet,
+                            fraud_score: score,
+                            flagged: is_fraud,
+                            action_taken: if is_fraud {
+                                if current_mode == MlFraudMode::Active {
+                                    "IpBanned".to_string()
+                                } else {
+                                    "ShadowFlag".to_string()
+                                }
                             } else {
-                                "ShadowFlag".to_string()
-                            }
-                        } else {
-                            "Pass".to_string()
-                        },
-                    }
-                }).await.unwrap_or_else(|_| MlLogEntry {
-                    timestamp: event.timestamp,
-                    ip: event.ip.clone(),
-                    path: event.path,
-                    payload_snippet: event.body_snippet,
-                    fraud_score: -1.0,
-                    flagged: false,
-                    action_taken: "InferenceError".to_string(),
-                });
+                                "Pass".to_string()
+                            },
+                        }
+                    }).await.unwrap_or_else(|_| MlLogEntry {
+                        timestamp: event.timestamp,
+                        ip: event.ip.clone(),
+                        path: event.path.clone(),
+                        payload_snippet: event.body_snippet.clone(),
+                        fraud_score: -1.0,
+                        flagged: false,
+                        action_taken: "InferenceError".to_string(),
+                    })
+                } else {
+                    // Rule-based fallback scoring when ONNX model is unavailable
+                    rule_based_score(&event, current_mode)
+                };
 
                 // If Active Mode and marked fraud, ban the IP instantly
                 if log_entry.flagged && **mode_ref.load() == MlFraudMode::Active {
@@ -192,6 +240,58 @@ impl MlFraudEngine {
                 let _ = tx.try_send(event); // drop if channel full to prevent OOM
             }
         }
+    }
+}
+
+/// Rule-based fallback scorer used when the ONNX model is unavailable.
+///
+/// Applies simple heuristics to estimate a fraud score:
+/// - Unusually long paths (>500 chars): 0.6
+/// - Non-standard HTTP methods on static-looking paths: 0.4
+/// - Very large bodies (>1MB): 0.5
+/// - Missing user-agent: 0.3
+/// Scores are capped at 1.0.
+fn rule_based_score(event: &MlEvent, mode: MlFraudMode) -> MlLogEntry {
+    let mut score: f32 = 0.0;
+
+    if event.path.len() > 500 {
+        score += 0.6;
+    }
+    if event.body_len > 1_000_000 {
+        score += 0.5;
+    }
+    if event.user_agent_len == 0 {
+        score += 0.3;
+    }
+    // Suspicious: non-GET methods on paths that look like static files
+    if event.method != "GET"
+        && (event.path.ends_with(".js")
+            || event.path.ends_with(".css")
+            || event.path.ends_with(".png")
+            || event.path.ends_with(".jpg"))
+    {
+        score += 0.4;
+    }
+
+    score = score.min(1.0);
+    let is_fraud = score > 0.5;
+
+    MlLogEntry {
+        timestamp: event.timestamp,
+        ip: event.ip.clone(),
+        path: event.path.clone(),
+        payload_snippet: event.body_snippet.clone(),
+        fraud_score: score,
+        flagged: is_fraud,
+        action_taken: if is_fraud {
+            if mode == MlFraudMode::Active {
+                "IpBanned".to_string()
+            } else {
+                "ShadowFlag".to_string()
+            }
+        } else {
+            "Pass".to_string()
+        },
     }
 }
 
@@ -281,6 +381,79 @@ mod tests {
         // Accessing logs through the RwLock should work
         let logs = engine.logs.read().await;
         assert_eq!(logs.len(), 0);
+    }
+
+    #[test]
+    fn test_rule_based_fallback_normal_request() {
+        let event = MlEvent {
+            ip: "1.2.3.4".to_string(),
+            method: "GET".to_string(),
+            path: "/api/users".to_string(),
+            query: None,
+            timestamp: 0,
+            header_count: 5,
+            user_agent_len: 50,
+            body_len: 0,
+            body_snippet: String::new(),
+        };
+        let entry = rule_based_score(&event, MlFraudMode::Shadow);
+        assert!(!entry.flagged, "normal request should not be flagged");
+        assert_eq!(entry.action_taken, "Pass");
+    }
+
+    #[test]
+    fn test_rule_based_fallback_suspicious_request() {
+        let long_path = "/".repeat(600);
+        let event = MlEvent {
+            ip: "1.2.3.4".to_string(),
+            method: "POST".to_string(),
+            path: long_path,
+            query: None,
+            timestamp: 0,
+            header_count: 0,
+            user_agent_len: 0,   // missing UA
+            body_len: 2_000_000, // very large body
+            body_snippet: String::new(),
+        };
+        let entry = rule_based_score(&event, MlFraudMode::Shadow);
+        assert!(entry.flagged, "suspicious request should be flagged");
+        assert_eq!(entry.action_taken, "ShadowFlag");
+    }
+
+    #[test]
+    fn test_rule_based_fallback_active_mode_bans() {
+        let long_path = "/".repeat(600);
+        let event = MlEvent {
+            ip: "1.2.3.4".to_string(),
+            method: "POST".to_string(),
+            path: long_path,
+            query: None,
+            timestamp: 0,
+            header_count: 0,
+            user_agent_len: 0,
+            body_len: 0,
+            body_snippet: String::new(),
+        };
+        let entry = rule_based_score(&event, MlFraudMode::Active);
+        assert!(entry.flagged);
+        assert_eq!(entry.action_taken, "IpBanned");
+    }
+
+    #[test]
+    fn test_rule_based_score_capped_at_one() {
+        let event = MlEvent {
+            ip: "1.2.3.4".to_string(),
+            method: "PUT".to_string(),
+            path: "/".repeat(600) + ".js", // long + static file method
+            query: None,
+            timestamp: 0,
+            header_count: 0,
+            user_agent_len: 0,
+            body_len: 2_000_000,
+            body_snippet: String::new(),
+        };
+        let entry = rule_based_score(&event, MlFraudMode::Shadow);
+        assert!(entry.fraud_score <= 1.0);
     }
 
     #[test]

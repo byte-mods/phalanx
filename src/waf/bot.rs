@@ -3,10 +3,12 @@
 /// This module provides:
 /// - A tiered bot classification (known-good, known-bad, unknown)
 /// - Rate-anomaly scoring for bot-like traffic patterns
-/// - A CAPTCHA challenge interface (stub — wire to a provider like hCaptcha or Cloudflare Turnstile)
+/// - A CAPTCHA challenge interface with provider-specific rendering and verification hooks
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
+use base64::Engine;
+use rand::RngExt;
 
 /// Classification of a detected bot.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -83,6 +85,11 @@ pub struct BotRateTracker {
 }
 
 impl BotRateTracker {
+    /// Creates a new rate tracker with the given sliding window duration.
+    ///
+    /// # Arguments
+    /// * `window_secs` - Length of the sliding window in seconds. Requests
+    ///   older than this are evicted before computing the rate.
     pub fn new(window_secs: u64) -> Self {
         Self {
             windows: Arc::new(Mutex::new(HashMap::new())),
@@ -111,11 +118,8 @@ impl BotRateTracker {
     }
 }
 
-/// Placeholder for CAPTCHA challenge integration.
-///
-/// In production, wire this to hCaptcha, Cloudflare Turnstile, or reCAPTCHA.
-/// Returns the HTML challenge page to serve, or an error if the provider
-/// is not configured.
+/// Legacy helper for static hCaptcha challenge HTML.
+/// Prefer `CaptchaManager::challenge_html` for provider-specific output.
 pub fn captcha_challenge_html(site_key: Option<&str>) -> Result<String, &'static str> {
     let key = site_key.ok_or("CAPTCHA site key not configured")?;
     Ok(format!(
@@ -146,14 +150,24 @@ pub enum CaptchaAction {
     Challenge,
 }
 
+/// Supported CAPTCHA service providers.
+///
+/// Each provider has its own JavaScript widget, server-side verification URL,
+/// HTML div class, and form field name. The [`CaptchaManager`] generates
+/// provider-specific challenge pages automatically.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CaptchaProvider {
+    /// hCaptcha (privacy-focused alternative to reCAPTCHA).
     HCaptcha,
+    /// Cloudflare Turnstile (invisible/managed challenge).
     Turnstile,
+    /// Google reCAPTCHA v2 (checkbox challenge).
     RecaptchaV2,
 }
 
 impl CaptchaProvider {
+    /// Parses a provider name string into its enum variant.
+    /// Defaults to `HCaptcha` for unrecognized values.
     pub fn from_str(s: &str) -> Self {
         match s.to_lowercase().as_str() {
             "turnstile" | "cloudflare" => Self::Turnstile,
@@ -162,6 +176,7 @@ impl CaptchaProvider {
         }
     }
 
+    /// Returns the JavaScript SDK URL for the CAPTCHA provider widget.
     pub fn script_url(&self) -> &'static str {
         match self {
             Self::HCaptcha => "https://hcaptcha.com/1/api.js",
@@ -170,6 +185,7 @@ impl CaptchaProvider {
         }
     }
 
+    /// Returns the server-side token verification API endpoint.
     pub fn verify_url(&self) -> &'static str {
         match self {
             Self::HCaptcha => "https://hcaptcha.com/siteverify",
@@ -178,6 +194,7 @@ impl CaptchaProvider {
         }
     }
 
+    /// Returns the CSS class name for the CAPTCHA widget container div.
     pub fn div_class(&self) -> &'static str {
         match self {
             Self::HCaptcha => "h-captcha",
@@ -186,6 +203,7 @@ impl CaptchaProvider {
         }
     }
 
+    /// Returns the HTML form field name that carries the solved CAPTCHA token.
     pub fn form_field(&self) -> &'static str {
         match self {
             Self::HCaptcha => "h-captcha-response",
@@ -210,9 +228,31 @@ pub struct CaptchaManager {
     challenge_threshold: f64,
     /// Bot rate tracker for anomaly scoring
     rate_tracker: BotRateTracker,
+    /// Pending one-time CAPTCHA challenges keyed by client IP.
+    pending_challenges: Arc<Mutex<HashMap<String, PendingChallenge>>>,
+    /// Challenge nonce time-to-live.
+    challenge_ttl: Duration,
+}
+
+/// Internal record of a CAPTCHA challenge issued to a specific client IP.
+#[derive(Debug, Clone)]
+struct PendingChallenge {
+    /// Cryptographically random nonce to prevent replay attacks.
+    nonce: String,
+    /// URL path to redirect to after successful verification.
+    return_to: String,
+    /// When the challenge was issued, for TTL enforcement.
+    issued_at: Instant,
 }
 
 impl CaptchaManager {
+    /// Creates a new CAPTCHA manager with the given provider credentials.
+    ///
+    /// # Arguments
+    /// * `site_key` - Public site key shown in the HTML widget.
+    /// * `secret_key` - Server-side secret for token verification.
+    /// * `provider` - Which CAPTCHA service to use.
+    /// * `challenge_threshold` - Requests/second above which unknown bots are challenged.
     pub fn new(
         site_key: String,
         secret_key: String,
@@ -226,6 +266,8 @@ impl CaptchaManager {
             verified_ips: Arc::new(Mutex::new(HashSet::new())),
             challenge_threshold,
             rate_tracker: BotRateTracker::new(60),
+            pending_challenges: Arc::new(Mutex::new(HashMap::new())),
+            challenge_ttl: Duration::from_secs(600),
         }
     }
 
@@ -256,6 +298,27 @@ impl CaptchaManager {
 
     /// Generates the challenge HTML page for the configured provider.
     pub fn challenge_html(&self) -> String {
+        self.challenge_html_for("0.0.0.0", "/")
+    }
+
+    /// Generates challenge HTML with a one-time nonce bound to IP and return path.
+    pub fn challenge_html_for(&self, ip: &str, return_to: &str) -> String {
+        let mut nonce_bytes = [0u8; 24];
+        rand::rng().fill(&mut nonce_bytes);
+        let nonce = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(nonce_bytes);
+        let safe_return_to = sanitize_return_to(return_to);
+
+        if let Ok(mut pending) = self.pending_challenges.lock() {
+            pending.insert(
+                ip.to_string(),
+                PendingChallenge {
+                    nonce: nonce.clone(),
+                    return_to: safe_return_to.clone(),
+                    issued_at: Instant::now(),
+                },
+            );
+        }
+
         format!(
             r#"<!DOCTYPE html>
 <html>
@@ -273,6 +336,8 @@ button:hover {{ background: #357ABD; }}
 <div class="container">
 <h1>Please verify you are human</h1>
 <form method="POST" action="/__phalanx/captcha/verify">
+  <input type="hidden" name="phalanx_challenge_nonce" value="{nonce}">
+  <input type="hidden" name="return_to" value="{return_to}">
   <div class="{div_class}" data-sitekey="{site_key}"></div>
   <button type="submit">Continue</button>
 </form>
@@ -282,6 +347,8 @@ button:hover {{ background: #357ABD; }}
             script_url = self.provider.script_url(),
             div_class = self.provider.div_class(),
             site_key = self.site_key,
+            nonce = nonce,
+            return_to = html_escape_attr(&safe_return_to),
         )
     }
 
@@ -341,13 +408,88 @@ button:hover {{ background: #357ABD; }}
         self.verified_ips.lock().unwrap().clear();
     }
 
+    /// Returns a validated return path if the nonce matches the pending challenge for `ip`.
+    pub fn return_to_for_valid_nonce(&self, ip: &str, nonce: &str) -> Option<String> {
+        let mut pending = self.pending_challenges.lock().ok()?;
+        if let Some(entry) = pending.get(ip) {
+            if entry.issued_at.elapsed() > self.challenge_ttl {
+                pending.remove(ip);
+                return None;
+            }
+            if entry.nonce == nonce {
+                return Some(entry.return_to.clone());
+            }
+        }
+        None
+    }
+
+    /// Consumes an existing challenge nonce for `ip`.
+    pub fn consume_challenge(&self, ip: &str) {
+        if let Ok(mut pending) = self.pending_challenges.lock() {
+            pending.remove(ip);
+        }
+    }
+
+    /// Returns the public site key configured for this manager.
     pub fn site_key(&self) -> &str {
         &self.site_key
     }
 
+    /// Returns the CAPTCHA provider type configured for this manager.
     pub fn provider(&self) -> CaptchaProvider {
         self.provider
     }
+
+    /// Extracts a provider-appropriate CAPTCHA token from form fields.
+    pub fn extract_token_from_form(
+        &self,
+        form_values: &std::collections::HashMap<String, String>,
+    ) -> Option<String> {
+        form_values
+            .get(self.provider.form_field())
+            .or_else(|| form_values.get("response"))
+            .filter(|v| !v.is_empty())
+            .cloned()
+    }
+
+    /// Extracts the `phalanx_challenge_nonce` hidden field from submitted form data.
+    pub fn extract_nonce_from_form(
+        &self,
+        form_values: &std::collections::HashMap<String, String>,
+    ) -> Option<String> {
+        form_values
+            .get("phalanx_challenge_nonce")
+            .filter(|v| !v.is_empty())
+            .cloned()
+    }
+}
+
+/// Sanitizes the `return_to` URL to prevent open redirect attacks.
+///
+/// Only allows relative paths starting with a single `/`. Empty strings,
+/// absolute URLs, and protocol-relative URLs (`//evil.com`) are replaced
+/// with `/`.
+fn sanitize_return_to(return_to: &str) -> String {
+    if return_to.is_empty() {
+        return "/".to_string();
+    }
+    if !return_to.starts_with('/') {
+        return "/".to_string();
+    }
+    if return_to.starts_with("//") {
+        return "/".to_string();
+    }
+    return_to.to_string()
+}
+
+/// Escapes special HTML characters in attribute values to prevent XSS in
+/// the generated CAPTCHA challenge page.
+fn html_escape_attr(input: &str) -> String {
+    input
+        .replace('&', "&amp;")
+        .replace('"', "&quot;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -624,5 +766,74 @@ mod tests {
         assert_eq!(CaptchaAction::Challenge, CaptchaAction::Challenge);
         assert_ne!(CaptchaAction::Allow, CaptchaAction::Block);
         assert_ne!(CaptchaAction::Allow, CaptchaAction::Challenge);
+    }
+
+    #[test]
+    fn test_extract_token_from_form_turnstile() {
+        let mgr = CaptchaManager::new("k".into(), "s".into(), CaptchaProvider::Turnstile, 5.0);
+        let mut form = std::collections::HashMap::new();
+        form.insert("cf-turnstile-response".to_string(), "ts-token".to_string());
+        assert_eq!(
+            mgr.extract_token_from_form(&form),
+            Some("ts-token".to_string())
+        );
+    }
+
+    #[test]
+    fn test_extract_token_from_form_recaptcha() {
+        let mgr = CaptchaManager::new("k".into(), "s".into(), CaptchaProvider::RecaptchaV2, 5.0);
+        let mut form = std::collections::HashMap::new();
+        form.insert("g-recaptcha-response".to_string(), "rc-token".to_string());
+        assert_eq!(
+            mgr.extract_token_from_form(&form),
+            Some("rc-token".to_string())
+        );
+    }
+
+    #[test]
+    fn test_extract_nonce_from_form() {
+        let mgr = CaptchaManager::new("k".into(), "s".into(), CaptchaProvider::Turnstile, 5.0);
+        let mut form = std::collections::HashMap::new();
+        form.insert(
+            "phalanx_challenge_nonce".to_string(),
+            "nonce-123".to_string(),
+        );
+        assert_eq!(
+            mgr.extract_nonce_from_form(&form),
+            Some("nonce-123".to_string())
+        );
+    }
+
+    #[test]
+    fn test_challenge_html_for_embeds_nonce_and_return_to() {
+        let mgr = CaptchaManager::new("k".into(), "s".into(), CaptchaProvider::Turnstile, 5.0);
+        let html = mgr.challenge_html_for("10.1.1.1", "/docs?a=1");
+        assert!(html.contains("phalanx_challenge_nonce"));
+        assert!(html.contains("name=\"return_to\" value=\"/docs?a=1\""));
+    }
+
+    #[test]
+    fn test_nonce_validation_and_consume() {
+        let mgr = CaptchaManager::new("k".into(), "s".into(), CaptchaProvider::Turnstile, 5.0);
+        let html = mgr.challenge_html_for("10.2.2.2", "/admin");
+        let marker = "name=\"phalanx_challenge_nonce\" value=\"";
+        let start = html.find(marker).expect("nonce marker");
+        let rest = &html[start + marker.len()..];
+        let end = rest.find('"').expect("nonce end");
+        let nonce = &rest[..end];
+
+        assert_eq!(
+            mgr.return_to_for_valid_nonce("10.2.2.2", nonce),
+            Some("/admin".to_string())
+        );
+        mgr.consume_challenge("10.2.2.2");
+        assert_eq!(mgr.return_to_for_valid_nonce("10.2.2.2", nonce), None);
+    }
+
+    #[test]
+    fn test_sanitize_return_to_rejects_external() {
+        assert_eq!(sanitize_return_to("https://evil.com"), "/");
+        assert_eq!(sanitize_return_to("//evil.com"), "/");
+        assert_eq!(sanitize_return_to("/safe"), "/safe");
     }
 }

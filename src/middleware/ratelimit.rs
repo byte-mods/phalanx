@@ -1,38 +1,101 @@
+/// Per-IP and global token bucket rate limiter with optional Redis cluster sync.
+///
+/// Provides two tiers of protection:
+/// 1. **Global DDoS ceiling** -- a single bucket that limits total throughput
+///    across all clients, preventing saturation attacks.
+/// 2. **Per-IP token bucket** -- individual buckets per source IP to prevent
+///    any single client from monopolizing capacity.
+///
+/// When Redis is configured, both tiers use a Lua-based sliding window script
+/// for consistent enforcement across cluster nodes. When Redis is unavailable,
+/// falls back to local in-memory `governor` rate limiters.
+use arc_swap::ArcSwap;
 use governor::{
     clock::DefaultClock,
     state::{direct::NotKeyed, keyed::DefaultKeyedStateStore, InMemoryState},
     Quota, RateLimiter,
 };
-use std::net::IpAddr;
-use std::num::NonZeroU32;
-use tracing::{warn, error};
-use redis::AsyncCommands;
 use std::sync::Arc;
-use tokio::sync::Mutex;
+use std::{net::IpAddr, num::NonZeroU32};
+use tracing::{error, info, warn};
 
+/// Inner state holding the actual governor limiters.
+///
+/// Wrapped in `ArcSwap` so that SIGHUP reload can atomically swap in new
+/// limiters with updated rate/burst values without disrupting in-flight requests.
+struct RateLimiterInner {
+    ip_limiter: RateLimiter<IpAddr, DefaultKeyedStateStore<IpAddr>, DefaultClock>,
+    global_limiter: RateLimiter<NotKeyed, InMemoryState, DefaultClock>,
+    global_enabled: bool,
+    global_rate: Option<u32>,
+    per_ip_burst: u32,
+}
+
+/// The main rate limiter used by the Phalanx proxy.
+///
+/// Combines local (governor-based) and distributed (Redis-based) rate limiting
+/// with automatic fallback from distributed to local when Redis is unreachable.
 pub struct PhalanxRateLimiter {
-    pub ip_limiter: RateLimiter<IpAddr, DefaultKeyedStateStore<IpAddr>, DefaultClock>,
-    pub global_limiter: RateLimiter<NotKeyed, InMemoryState, DefaultClock>,
-    pub global_enabled: bool,
-    pub global_rate: Option<u32>,
-    /// Burst allowance stored so Redis per-IP check can use the same limit.
-    pub per_ip_burst: u32,
+    /// Atomically swappable inner state for hot-reload support.
+    inner: ArcSwap<RateLimiterInner>,
+    /// Optional Redis client for distributed rate limiting.
     pub redis_client: Option<redis::Client>,
-    /// Per-IP cumulative request counter for dashboard top-N queries.
+    /// Per-IP cumulative request counter for the admin dashboard's top-N queries.
     pub request_counts: Arc<dashmap::DashMap<String, u64>>,
 }
 
-impl PhalanxRateLimiter {
-    pub fn new(per_ip_rate: u32, per_ip_burst: u32, global_rate: Option<u32>, redis_url: Option<&str>) -> Self {
-        let ip_quota = Quota::per_second(NonZeroU32::new(per_ip_rate).unwrap())
-            .allow_burst(NonZeroU32::new(per_ip_burst).unwrap());
+/// Builds a `RateLimiterInner` from the given rate parameters.
+fn build_inner(per_ip_rate: u32, per_ip_burst: u32, global_rate: Option<u32>) -> RateLimiterInner {
+    let safe_per_ip_rate = if per_ip_rate == 0 {
+        warn!("rate_limit_per_ip of 0 is invalid; clamping to 1");
+        1
+    } else {
+        per_ip_rate
+    };
+    let safe_per_ip_burst = if per_ip_burst == 0 {
+        warn!("rate_limit_burst of 0 is invalid; clamping to 1");
+        1
+    } else {
+        per_ip_burst
+    };
+    let normalized_global_rate = match global_rate {
+        Some(0) => {
+            warn!("global_rate_limit of 0 disables global limiter");
+            None
+        }
+        Some(v) => Some(v),
+        None => None,
+    };
 
-        let global_limiter = if let Some(gr) = global_rate {
-            RateLimiter::direct(Quota::per_second(NonZeroU32::new(gr).unwrap()))
-        } else {
-            RateLimiter::direct(Quota::per_second(NonZeroU32::new(1).unwrap()))
-        };
-        
+    let ip_quota = Quota::per_second(NonZeroU32::new(safe_per_ip_rate).unwrap_or(NonZeroU32::MIN))
+        .allow_burst(NonZeroU32::new(safe_per_ip_burst).unwrap_or(NonZeroU32::MIN));
+
+    let global_limiter = if let Some(gr) = normalized_global_rate {
+        RateLimiter::direct(Quota::per_second(NonZeroU32::new(gr).unwrap_or(NonZeroU32::MIN)))
+    } else {
+        RateLimiter::direct(Quota::per_second(NonZeroU32::MIN))
+    };
+
+    RateLimiterInner {
+        ip_limiter: RateLimiter::keyed(ip_quota),
+        global_limiter,
+        global_enabled: normalized_global_rate.is_some(),
+        global_rate: normalized_global_rate,
+        per_ip_burst: safe_per_ip_burst,
+    }
+}
+
+impl PhalanxRateLimiter {
+    /// Creates a new rate limiter with the specified per-IP and global limits.
+    ///
+    /// # Arguments
+    /// * `per_ip_rate` - Sustained requests/second per IP (clamped to 1 if 0).
+    /// * `per_ip_burst` - Maximum burst allowance per IP (clamped to 1 if 0).
+    /// * `global_rate` - Optional global requests/second cap (`None` or `Some(0)` disables).
+    /// * `redis_url` - Optional Redis URL for distributed rate limiting.
+    pub fn new(per_ip_rate: u32, per_ip_burst: u32, global_rate: Option<u32>, redis_url: Option<&str>) -> Self {
+        let inner = build_inner(per_ip_rate, per_ip_burst, global_rate);
+
         let redis_client = redis_url.and_then(|url| {
             redis::Client::open(url).map_err(|e| {
                 error!("Failed to connect to Redis for Rate Limiter: {}", e);
@@ -41,14 +104,45 @@ impl PhalanxRateLimiter {
         });
 
         Self {
-            ip_limiter: RateLimiter::keyed(ip_quota),
-            global_limiter,
-            global_enabled: global_rate.is_some(),
-            global_rate,
-            per_ip_burst,
+            inner: ArcSwap::from_pointee(inner),
             redis_client,
             request_counts: Arc::new(dashmap::DashMap::new()),
         }
+    }
+
+    /// Atomically replaces the rate limiters with new instances using updated parameters.
+    ///
+    /// Called on SIGHUP reload when rate limit config values change. Existing
+    /// in-flight requests that already loaded the old inner will finish against
+    /// the old limiters; new requests see the new limits immediately.
+    pub fn reload(&self, per_ip_rate: Option<u32>, per_ip_burst: Option<u32>, global_rate: Option<u32>) {
+        let new_inner = build_inner(
+            per_ip_rate.unwrap_or(50),
+            per_ip_burst.unwrap_or(100),
+            global_rate,
+        );
+        info!(
+            "Rate limiter reloaded: per_ip={}/s burst={} global={:?}",
+            per_ip_rate.unwrap_or(50),
+            per_ip_burst.unwrap_or(100),
+            global_rate
+        );
+        self.inner.store(Arc::new(new_inner));
+    }
+
+    /// Returns the currently configured global rate limit.
+    pub fn global_rate(&self) -> Option<u32> {
+        self.inner.load().global_rate
+    }
+
+    /// Returns whether the global rate limiter is active.
+    pub fn global_enabled(&self) -> bool {
+        self.inner.load().global_enabled
+    }
+
+    /// Returns the currently configured per-IP burst allowance.
+    pub fn per_ip_burst(&self) -> u32 {
+        self.inner.load().per_ip_burst
     }
 
     /// Records a request from an IP (increments counter for dashboard top-N).
@@ -102,7 +196,7 @@ impl PhalanxRateLimiter {
                 let script = redis::Script::new(Self::REDIS_LUA_RATELIMIT);
 
                 // 1a. Global DDoS ceiling check via Redis
-                if let Some(gr) = self.global_rate {
+                if let Some(gr) = self.global_rate() {
                     let result: redis::RedisResult<i32> = script
                         .key("phalanx:ratelimit:global")
                         .arg(gr)
@@ -120,7 +214,7 @@ impl PhalanxRateLimiter {
                 let ip_key = format!("phalanx:ratelimit:ip:{}", ip);
                 // Re-fetch the per-ip quota from the local governor's burst setting.
                 // We use the governor quota's burst as the Redis window burst too.
-                let ip_burst = self.per_ip_burst;
+                let ip_burst = self.per_ip_burst();
                 let result: redis::RedisResult<i32> = script
                     .key(ip_key)
                     .arg(ip_burst)
@@ -140,15 +234,16 @@ impl PhalanxRateLimiter {
         }
 
         // 2. Global DDoS Panic Mode — local fallback when Redis is not configured/reachable
-        if self.global_enabled {
-            if self.global_limiter.check().is_err() {
+        let inner = self.inner.load();
+        if inner.global_enabled {
+            if inner.global_limiter.check().is_err() {
                 warn!("Global DDoS Rate Limit Exceeded (Local)! Dropping connection from {}", ip);
                 return false;
             }
         }
 
         // 3. Per-IP Token Bucket — local fallback
-        if self.ip_limiter.check_key(&ip).is_err() {
+        if inner.ip_limiter.check_key(&ip).is_err() {
             warn!("Per-IP Rate Limit Exceeded for {}! Dropping connection.", ip);
             return false;
         }
@@ -172,13 +267,13 @@ mod tests {
     #[test]
     fn test_rate_limiter_global_disabled() {
         let limiter = PhalanxRateLimiter::new(100, 10, None, None);
-        assert!(!limiter.global_enabled);
+        assert!(!limiter.global_enabled());
     }
 
     #[test]
     fn test_rate_limiter_global_enabled() {
         let limiter = PhalanxRateLimiter::new(100, 10, Some(1000), None);
-        assert!(limiter.global_enabled);
+        assert!(limiter.global_enabled());
     }
 
     #[tokio::test]
@@ -208,13 +303,28 @@ mod tests {
     #[test]
     fn test_rate_limiter_per_ip_burst_config() {
         let limiter = PhalanxRateLimiter::new(50, 200, None, None);
-        assert_eq!(limiter.per_ip_burst, 200);
+        assert_eq!(limiter.per_ip_burst(), 200);
     }
 
     #[test]
     fn test_rate_limiter_global_rate_config() {
         let limiter = PhalanxRateLimiter::new(50, 100, Some(5000), None);
-        assert_eq!(limiter.global_rate, Some(5000));
+        assert_eq!(limiter.global_rate(), Some(5000));
+    }
+
+    #[test]
+    fn test_rate_limiter_zero_values_are_sanitized() {
+        let limiter = PhalanxRateLimiter::new(0, 0, Some(0), None);
+        assert_eq!(limiter.per_ip_burst(), 1);
+        assert_eq!(limiter.global_rate(), None);
+        assert!(!limiter.global_enabled());
+    }
+
+    #[tokio::test]
+    async fn test_rate_limiter_zero_values_do_not_panic_or_block_all() {
+        let limiter = PhalanxRateLimiter::new(0, 0, Some(0), None);
+        let ip = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 9));
+        assert!(limiter.check_ip(ip).await);
     }
 
     #[tokio::test]
@@ -268,5 +378,26 @@ mod tests {
     fn test_top_ips_empty() {
         let limiter = PhalanxRateLimiter::new(100, 200, None, None);
         assert!(limiter.top_ips(10).is_empty());
+    }
+
+    #[test]
+    fn test_reload_updates_limits() {
+        let limiter = PhalanxRateLimiter::new(50, 100, Some(5000), None);
+        assert_eq!(limiter.per_ip_burst(), 100);
+        assert_eq!(limiter.global_rate(), Some(5000));
+
+        limiter.reload(Some(200), Some(500), Some(10000));
+        assert_eq!(limiter.per_ip_burst(), 500);
+        assert_eq!(limiter.global_rate(), Some(10000));
+        assert!(limiter.global_enabled());
+    }
+
+    #[test]
+    fn test_reload_disables_global() {
+        let limiter = PhalanxRateLimiter::new(50, 100, Some(5000), None);
+        assert!(limiter.global_enabled());
+
+        limiter.reload(Some(50), Some(100), None);
+        assert!(!limiter.global_enabled());
     }
 }

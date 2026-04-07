@@ -1,3 +1,17 @@
+//! FastCGI protocol gateway.
+//!
+//! Translates incoming HTTP requests into the FastCGI binary protocol and
+//! forwards them to a FastCGI application server (e.g. PHP-FPM). The response
+//! is streamed back to the client as a standard HTTP response.
+//!
+//! The FastCGI protocol multiplexes request metadata (CGI params) and the
+//! request body into a framed binary stream over a single TCP connection.
+//! This module handles:
+//! - Building the CGI parameter set from HTTP headers.
+//! - Streaming the request body to the FastCGI server.
+//! - Parsing the CGI response headers (e.g. `Status:`, `Content-Type:`).
+//! - Streaming the response body back through hyper as a `BoxBody`.
+
 use bytes::Bytes;
 use fastcgi_client::response::Content;
 use fastcgi_client::{Client, Params, Request as FcgiRequest};
@@ -13,7 +27,10 @@ use tracing::error;
 use crate::proxy::chrono_timestamp;
 use crate::telemetry::access_log::{AccessLogEntry, AccessLogger};
 
-fn empty_io_response(status: hyper::StatusCode) -> Response<BoxBody<Bytes, std::io::Error>> {
+/// Constructs an empty HTTP response with the given status code.
+/// Used for error responses (502, 500) when the FastCGI server is unreachable
+/// or returns invalid data.
+fn empty_response(status: hyper::StatusCode) -> Response<BoxBody<Bytes, hyper::Error>> {
     Response::builder()
         .status(status)
         .body(
@@ -24,6 +41,23 @@ fn empty_io_response(status: hyper::StatusCode) -> Response<BoxBody<Bytes, std::
         .unwrap()
 }
 
+/// Forwards an HTTP request to a FastCGI backend and returns the translated
+/// HTTP response.
+///
+/// # Arguments
+///
+/// * `_route_path`   - The matched route prefix (unused but kept for signature parity with other handlers).
+/// * `req_path`      - The full request path (e.g. `/app/index.php`).
+/// * `fastcgi_pass`  - `host:port` of the FastCGI server (e.g. `"127.0.0.1:9000"`).
+/// * `req`           - The incoming HTTP request (headers + streaming body).
+/// * `access_logger` - Logger for structured access log entries.
+/// * `method_str`    - HTTP method as a string (e.g. `"GET"`).
+/// * `ip_str`        - Client IP address string for logging.
+///
+/// # Returns
+///
+/// An HTTP response with the FastCGI application's status, headers, and
+/// streamed body. Returns 502 Bad Gateway if the FastCGI server is unreachable.
 pub async fn serve_fastcgi<T>(
     _route_path: &str,
     req_path: &str,
@@ -32,7 +66,7 @@ pub async fn serve_fastcgi<T>(
     access_logger: Arc<AccessLogger>,
     method_str: &str,
     ip_str: &str,
-) -> Result<Response<BoxBody<Bytes, std::io::Error>>, hyper::Error>
+) -> Result<Response<BoxBody<Bytes, hyper::Error>>, hyper::Error>
 where
     T: hyper::body::Body<Data = Bytes> + Send + Sync + Unpin + 'static,
     T::Error: std::fmt::Display + Send + Sync + 'static,
@@ -58,15 +92,17 @@ where
                 bytes_sent: 0,
                 referer: String::new(),
                 user_agent: String::new(),
+                trace_id: String::new(),
             });
-            return Ok(empty_io_response(StatusCode::BAD_GATEWAY));
+            return Ok(empty_response(StatusCode::BAD_GATEWAY));
         }
     };
 
     let (parts, body) = req.into_parts();
     let query_string = parts.uri.query().unwrap_or("");
 
-    // Setup FastCGI Params
+    // Build the standard CGI environment variables that FastCGI expects.
+    // These map 1:1 to the variables a CGI script would receive.
     let mut params = Params::default()
         .request_method(method_str)
         .request_uri(req_path)
@@ -74,7 +110,8 @@ where
         .query_string(query_string)
         .remote_addr(ip_str);
 
-    // Standard CGI headers
+    // Convert HTTP headers to CGI-style HTTP_* environment variables
+    // (e.g. "Content-Type" -> "HTTP_CONTENT_TYPE")
     let mut cgiparams = std::collections::HashMap::new();
     for (name, value) in parts.headers.iter() {
         let key = format!("HTTP_{}", name.as_str().to_uppercase().replace("-", "_"));
@@ -98,7 +135,7 @@ where
         Ok(s) => s,
         Err(e) => {
             error!("FastCGI stream execute error: {}", e);
-            return Ok(empty_io_response(StatusCode::INTERNAL_SERVER_ERROR));
+            return Ok(empty_response(StatusCode::INTERNAL_SERVER_ERROR));
         }
     };
 
@@ -135,7 +172,7 @@ where
             "Did not receive valid CGI headers from FastCGI, buffered so far: {}",
             String::from_utf8_lossy(&header_buf)
         );
-        return Ok(empty_io_response(StatusCode::BAD_GATEWAY));
+        return Ok(empty_response(StatusCode::BAD_GATEWAY));
     }
 
     let header_str = String::from_utf8_lossy(&header_buf);
@@ -163,7 +200,7 @@ where
 
     let fcgi_stream = async_stream::stream! {
         if let Some(first) = first_body_chunk {
-            yield Ok::<_, std::io::Error>(hyper::body::Frame::data(first));
+            yield Ok::<_, std::convert::Infallible>(hyper::body::Frame::data(first));
         }
 
         while let Some(content) = fcgi_res_stream.next().await {
@@ -176,13 +213,16 @@ where
                 }
                 Err(e) => {
                     error!("FastCGI stream chunk error: {}", e);
-                    yield Err(std::io::Error::new(std::io::ErrorKind::BrokenPipe, "fcgi disconnected"));
+                    break;
                 }
             }
         }
     };
 
-    let stream_body = BodyExt::boxed(StreamBody::new(fcgi_stream));
+    let stream_body = BodyExt::boxed(BodyExt::map_err(
+        StreamBody::new(fcgi_stream),
+        |never| match never {},
+    ));
     let response = builder.body(stream_body).unwrap();
 
     let latency = start_time.elapsed().as_millis() as u64;
@@ -198,6 +238,7 @@ where
         bytes_sent: 0,
         referer: String::new(),
         user_agent: String::new(),
+        trace_id: String::new(),
     });
 
     Ok(response)

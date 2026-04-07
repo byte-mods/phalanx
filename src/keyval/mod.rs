@@ -24,6 +24,7 @@ struct Entry {
 }
 
 impl Entry {
+    /// Returns `true` if this entry has a set expiry time and it has passed.
     fn is_expired(&self) -> bool {
         self.expires_at
             .map(|exp| Instant::now() > exp)

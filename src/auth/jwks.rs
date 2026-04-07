@@ -1,25 +1,44 @@
+/// Remote JWKS (JSON Web Key Set) fetching, caching, and key resolution.
+///
+/// Fetches public keys from an OAuth2/OIDC provider's JWKS endpoint and
+/// caches them in memory with automatic periodic refresh. Supports RSA and
+/// EC key types for JWT signature verification.
 use dashmap::DashMap;
 use jsonwebtoken::{Algorithm, DecodingKey};
 use serde::Deserialize;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tracing::{debug, error, info, warn};
+use tracing::{debug, info, warn};
 
+/// How long a cached JWKS response is considered fresh before re-fetching.
 const JWKS_REFRESH_INTERVAL: Duration = Duration::from_secs(300);
+/// Maximum time to wait for a JWKS HTTP response before timing out.
 const JWKS_FETCH_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// A single JSON Web Key from a JWKS endpoint.
+/// A single JSON Web Key from a JWKS endpoint (RFC 7517).
+///
+/// Contains the cryptographic parameters needed to build a verification key.
+/// Only `kty` is mandatory; other fields depend on the key type (RSA vs EC).
 #[derive(Debug, Clone, Deserialize)]
 pub struct Jwk {
+    /// Key type: "RSA" or "EC".
     pub kty: String,
+    /// Key ID -- used to match a specific key when multiple are published.
     pub kid: Option<String>,
+    /// Intended use: typically "sig" (signature) for JWTs.
     #[serde(rename = "use")]
     pub use_: Option<String>,
+    /// Algorithm hint (e.g., "RS256", "ES384").
     pub alg: Option<String>,
+    /// RSA modulus (base64url-encoded).
     pub n: Option<String>,
+    /// RSA public exponent (base64url-encoded).
     pub e: Option<String>,
+    /// EC x-coordinate (base64url-encoded).
     pub x: Option<String>,
+    /// EC y-coordinate (base64url-encoded).
     pub y: Option<String>,
+    /// EC curve name (e.g., "P-256", "P-384").
     pub crv: Option<String>,
 }
 
@@ -43,6 +62,7 @@ pub struct JwksManager {
 }
 
 impl JwksManager {
+    /// Creates a new JWKS manager with an empty cache.
     pub fn new() -> Self {
         Self {
             cache: DashMap::new(),
@@ -107,6 +127,14 @@ impl JwksManager {
     }
 
     /// Builds a `jsonwebtoken::DecodingKey` from a JWK.
+    ///
+    /// Supports RSA (RS256/384/512) and EC (ES256/384) key types.
+    /// Returns both the decoding key and the inferred algorithm so the
+    /// caller can configure JWT validation correctly.
+    ///
+    /// # Errors
+    /// Returns an error string if required key components are missing or
+    /// the key type is unsupported.
     pub fn decoding_key_from_jwk(jwk: &Jwk) -> Result<(DecodingKey, Algorithm), String> {
         match jwk.kty.as_str() {
             "RSA" => {

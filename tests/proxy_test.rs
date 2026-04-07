@@ -974,27 +974,27 @@ mod grpc_web_integration_tests {
             .unwrap()
     }
 
-    #[test]
-    fn test_translate_response_grpc_to_grpc_web() {
-        let resp = translate_response(make_grpc_response("application/grpc"), false);
+    #[tokio::test]
+    async fn test_translate_response_grpc_to_grpc_web() {
+        let resp = translate_response(make_grpc_response("application/grpc"), false).await;
         assert_eq!(
             resp.headers().get(header::CONTENT_TYPE).and_then(|v| v.to_str().ok()),
             Some("application/grpc-web")
         );
     }
 
-    #[test]
-    fn test_translate_response_grpc_to_grpc_web_text() {
-        let resp = translate_response(make_grpc_response("application/grpc"), true);
+    #[tokio::test]
+    async fn test_translate_response_grpc_to_grpc_web_text() {
+        let resp = translate_response(make_grpc_response("application/grpc"), true).await;
         assert_eq!(
             resp.headers().get(header::CONTENT_TYPE).and_then(|v| v.to_str().ok()),
             Some("application/grpc-web-text")
         );
     }
 
-    #[test]
-    fn test_translate_response_adds_cors_expose_headers() {
-        let resp = translate_response(make_grpc_response("application/grpc"), false);
+    #[tokio::test]
+    async fn test_translate_response_adds_cors_expose_headers() {
+        let resp = translate_response(make_grpc_response("application/grpc"), false).await;
         let expose = resp
             .headers()
             .get(header::ACCESS_CONTROL_EXPOSE_HEADERS)
@@ -1735,6 +1735,8 @@ mod mail_proxy_config_tests {
             upstream_pool: "mail_pool".to_string(),
             banner: Some("220 phalanx.example.com".to_string()),
             starttls: true,
+            tls_cert_path: Some("/etc/phalanx/cert.pem".to_string()),
+            tls_key_path: Some("/etc/phalanx/key.pem".to_string()),
         };
         assert_eq!(cfg.protocol, MailProtocol::Smtp);
         assert_eq!(cfg.bind_addr, "0.0.0.0:25");
@@ -1751,6 +1753,8 @@ mod mail_proxy_config_tests {
             upstream_pool: "default".to_string(),
             banner: None,
             starttls: false,
+            tls_cert_path: None,
+            tls_key_path: None,
         };
         assert!(cfg.banner.is_none());
         assert!(!cfg.starttls);
@@ -1780,6 +1784,7 @@ mod rewrite_integration_tests {
                 .map(|(p, r, f)| (p.to_string(), r.to_string(), f.to_string()))
                 .collect::<Vec<_>>(),
         )
+        .expect("rewrite rules should compile")
     }
 
     #[test]
@@ -1853,7 +1858,7 @@ mod rewrite_integration_tests {
 
     #[test]
     fn test_compile_rules_empty_slice() {
-        let r = compile_rules(&[]);
+        let r = compile_rules(&[]).expect("empty rules should compile");
         assert!(r.is_empty());
     }
 
@@ -1909,14 +1914,14 @@ mod rate_limiter_integration_tests {
     #[test]
     fn test_global_rate_stored_correctly() {
         let limiter = PhalanxRateLimiter::new(100, 10, Some(5000), None);
-        assert!(limiter.global_enabled);
-        assert_eq!(limiter.global_rate, Some(5000));
+        assert!(limiter.global_enabled());
+        assert_eq!(limiter.global_rate(), Some(5000));
     }
 
     #[test]
     fn test_no_global_rate_disables_global_limiter() {
         let limiter = PhalanxRateLimiter::new(100, 10, None, None);
-        assert!(!limiter.global_enabled);
+        assert!(!limiter.global_enabled());
     }
 
     #[tokio::test]
@@ -2502,7 +2507,9 @@ mod oidc_tests {
         store.insert("tok-1".to_string(), OidcSession {
             sub: "user-99".to_string(),
             email: Some("u@example.com".to_string()),
+            issuer: Some("https://idp.example.com".to_string()),
             access_token: "at-abc".to_string(),
+            refresh_token: None,
             created_at: now,
             expires_in: 3600,
         });
@@ -2519,7 +2526,9 @@ mod oidc_tests {
         store.insert("old-tok".to_string(), OidcSession {
             sub: "ghost".to_string(),
             email: None,
+            issuer: Some("https://idp.example.com".to_string()),
             access_token: "at".to_string(),
+            refresh_token: None,
             created_at: 1000,
             expires_in: 1,
         });
@@ -2854,6 +2863,8 @@ mod tcp_proxy_integration_tests {
                 }],
                 keepalive: 0,
                 srv_discover: None,
+                health_check_interval_secs: 5,
+                health_check_timeout_secs: 3,
             },
         );
         let discovery = Arc::new(ServiceDiscovery::new("/tmp/phalanx_tcp_test_discovery"));
@@ -2937,6 +2948,8 @@ mod tcp_proxy_integration_tests {
                 backends: vec![], // empty pool
                 keepalive: 0,
                 srv_discover: None,
+                health_check_interval_secs: 5,
+                health_check_timeout_secs: 3,
             },
         );
         let upstreams = Arc::new(UpstreamManager::new(&config, discovery));

@@ -1,3 +1,12 @@
+/// Nginx-style `auth_request` subrequest authentication.
+///
+/// Delegates authentication to an external HTTP service by forwarding the
+/// original request headers along with `X-Original-Method` and `X-Original-URI`.
+/// The auth service's HTTP status code determines the outcome:
+/// - 2xx: allowed (any `X-Auth-*` response headers are forwarded upstream)
+/// - 401: unauthorized
+/// - 403: forbidden
+/// - Other: treated as an error, request is denied
 use hyper::{HeaderMap, StatusCode};
 use tracing::{debug, warn};
 

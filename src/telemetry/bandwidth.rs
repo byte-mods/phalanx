@@ -28,6 +28,7 @@ pub struct ProtocolStats {
 }
 
 impl ProtocolStats {
+    /// Creates a new zeroed-out stats bucket.
     fn new() -> Self {
         Self {
             bytes_in: AtomicU64::new(0),
@@ -37,22 +38,27 @@ impl ProtocolStats {
         }
     }
 
+    /// Records `n` inbound bytes received from the client.
     pub fn add_in(&self, n: u64) {
         self.bytes_in.fetch_add(n, Ordering::Relaxed);
     }
 
+    /// Records `n` outbound bytes sent to the client.
     pub fn add_out(&self, n: u64) {
         self.bytes_out.fetch_add(n, Ordering::Relaxed);
     }
 
+    /// Increments the total request counter by one.
     pub fn inc_requests(&self) {
         self.requests.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// Increments the active connection gauge by one.
     pub fn conn_open(&self) {
         self.active_connections.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// Decrements the active connection gauge by one, saturating at zero.
     pub fn conn_close(&self) {
         // saturate at 0 — never report negative connections
         self.active_connections
@@ -99,13 +105,17 @@ impl Default for ProtocolThreshold {
 pub struct BandwidthTracker {
     stats: DashMap<String, Arc<ProtocolStats>>,
     thresholds: DashMap<String, ProtocolThreshold>,
+    /// Per-upstream-pool traffic counters.
+    pool_stats: DashMap<String, Arc<ProtocolStats>>,
 }
 
 impl BandwidthTracker {
+    /// Creates a new tracker with pre-initialised buckets for all known protocols.
     pub fn new() -> Arc<Self> {
         let tracker = Arc::new(Self {
             stats: DashMap::new(),
             thresholds: DashMap::new(),
+            pool_stats: DashMap::new(),
         });
 
         // Pre-create all known protocol buckets
@@ -126,6 +136,33 @@ impl BandwidthTracker {
             .entry(proto.to_string())
             .or_insert_with(|| Arc::new(ProtocolStats::new()))
             .clone()
+    }
+
+    /// Get (or lazily create) the stats bucket for an upstream pool name.
+    pub fn pool(&self, pool_name: &str) -> Arc<ProtocolStats> {
+        self.pool_stats
+            .entry(pool_name.to_string())
+            .or_insert_with(|| Arc::new(ProtocolStats::new()))
+            .clone()
+    }
+
+    /// Snapshot of all per-pool traffic counters, sorted by total bytes descending.
+    pub fn pool_snapshot(&self) -> Vec<ProtocolSnapshot> {
+        let mut snap: Vec<ProtocolSnapshot> = self
+            .pool_stats
+            .iter()
+            .map(|e| ProtocolSnapshot {
+                protocol: e.key().clone(),
+                bytes_in: e.value().bytes_in.load(Ordering::Relaxed),
+                bytes_out: e.value().bytes_out.load(Ordering::Relaxed),
+                requests: e.value().requests.load(Ordering::Relaxed),
+                active_connections: e.value().active_connections.load(Ordering::Relaxed),
+            })
+            .collect();
+        snap.sort_by(|a, b| {
+            (b.bytes_in + b.bytes_out).cmp(&(a.bytes_in + a.bytes_out))
+        });
+        snap
     }
 
     /// Snapshot of all protocols, sorted by total bytes descending.
@@ -390,5 +427,51 @@ mod tests {
             .collect();
         assert!(positions[0] < positions[1]);
         assert!(positions[1] < positions[2]);
+    }
+
+    // ── Per-pool bandwidth tests ───────────────────────────────────────────
+
+    #[test]
+    fn test_pool_stats_separate_from_protocol() {
+        let tracker = BandwidthTracker::new();
+        tracker.pool("backend_api").add_in(5000);
+        tracker.protocol("http1").add_in(3000);
+        let pool_snap = tracker.pool_snapshot();
+        let proto_snap = tracker.snapshot();
+        let pool_entry = pool_snap.iter().find(|s| s.protocol == "backend_api");
+        assert!(pool_entry.is_some());
+        assert_eq!(pool_entry.unwrap().bytes_in, 5000);
+        // Protocol snapshot should not contain pool names
+        assert!(proto_snap.iter().all(|s| s.protocol != "backend_api"));
+    }
+
+    #[test]
+    fn test_pool_snapshot_sorted_by_total() {
+        let tracker = BandwidthTracker::new();
+        tracker.pool("pool_a").add_in(100);
+        tracker.pool("pool_b").add_in(500);
+        tracker.pool("pool_c").add_out(300);
+        let snap = tracker.pool_snapshot();
+        let positions: Vec<usize> = ["pool_b", "pool_c", "pool_a"]
+            .iter()
+            .map(|name| snap.iter().position(|s| &s.protocol == name).unwrap())
+            .collect();
+        assert!(positions[0] < positions[1]);
+        assert!(positions[1] < positions[2]);
+    }
+
+    #[test]
+    fn test_pool_requests_and_connections() {
+        let tracker = BandwidthTracker::new();
+        let p = tracker.pool("web");
+        p.inc_requests();
+        p.inc_requests();
+        p.conn_open();
+        p.conn_open();
+        p.conn_close();
+        let snap = tracker.pool_snapshot();
+        let web = snap.iter().find(|s| s.protocol == "web").unwrap();
+        assert_eq!(web.requests, 2);
+        assert_eq!(web.active_connections, 1);
     }
 }

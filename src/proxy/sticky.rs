@@ -1,3 +1,18 @@
+//! Sticky session (session affinity) management.
+//!
+//! Ensures that requests belonging to the same user session are consistently
+//! routed to the same backend server. This is critical for stateful applications
+//! that store session data in-process (e.g. shopping carts, WebSocket state).
+//!
+//! Three persistence modes are supported (matching NGINX Plus behavior):
+//!
+//! 1. **Cookie** -- the proxy sets a `Set-Cookie` header with a base64-encoded
+//!    backend address. Subsequent requests carrying this cookie are routed directly.
+//! 2. **Learn** -- the proxy observes a response header (e.g. `X-Session-Id`) and
+//!    remembers which backend served which session key. Entries expire after a timeout.
+//! 3. **Route** -- the proxy extracts a routing key from a request cookie (e.g.
+//!    `jsessionid`) and maps it to a specific backend.
+
 use dashmap::DashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -44,6 +59,7 @@ pub struct StickySessionManager {
 }
 
 impl StickySessionManager {
+    /// Creates a new manager with the given persistence mode and an empty session table.
     pub fn new(mode: StickyMode) -> Self {
         Self {
             mode,
@@ -51,6 +67,7 @@ impl StickySessionManager {
         }
     }
 
+    /// Returns a reference to the configured sticky mode.
     pub fn mode(&self) -> &StickyMode {
         &self.mode
     }
@@ -142,11 +159,15 @@ impl StickySessionManager {
     }
 }
 
+/// Encodes a backend address (e.g. `"10.0.0.1:8080"`) as a URL-safe base64
+/// string for embedding in cookies.
 fn base64_encode_addr(addr: &str) -> String {
     use base64::Engine;
     base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(addr.as_bytes())
 }
 
+/// Decodes a URL-safe base64 cookie value back into a backend address string.
+/// Returns `None` if the base64 is invalid or the decoded bytes are not valid UTF-8.
 pub fn base64_decode_addr(encoded: &str) -> Option<String> {
     use base64::Engine;
     base64::engine::general_purpose::URL_SAFE_NO_PAD

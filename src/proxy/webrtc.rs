@@ -99,6 +99,8 @@ pub struct SfuRoom {
 }
 
 impl SfuRoom {
+    /// Creates a new room with the given ID and an empty track/peer set.
+    /// The returned `Arc<SfuRoom>` is shared among all signalling handlers.
     pub fn new(id: String) -> Arc<Self> {
         let (track_tx, _) = broadcast::channel(64);
         Arc::new(Self {
@@ -135,6 +137,7 @@ pub struct SfuState {
 }
 
 impl SfuState {
+    /// Creates an empty global SFU state (no rooms).
     pub fn new() -> Arc<Self> {
         Arc::new(Self {
             rooms: DashMap::new(),
@@ -172,6 +175,13 @@ impl SfuState {
 // ─── WebRTC API Factory ───────────────────────────────────────────────────────
 
 /// Builds a configured `webrtc::api::API` with VP8, H.264, and Opus codecs registered.
+///
+/// The media engine is pre-loaded with the most common real-time codecs:
+/// - **VP8** (video, payload type 96) -- widely supported, low-latency.
+/// - **H.264** (video, payload type 102) -- hardware-accelerated on most devices.
+/// - **Opus** (audio, payload type 111) -- adaptive bitrate voice/music codec.
+///
+/// Default interceptors (NACK, RTCP, etc.) are registered for reliability.
 fn build_webrtc_api() -> webrtc::error::Result<webrtc::api::API> {
     let mut media_engine = MediaEngine::default();
 

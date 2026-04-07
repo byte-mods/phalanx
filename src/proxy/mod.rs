@@ -1,3 +1,40 @@
+//! Core proxy subsystem -- the heart of Phalanx.
+//!
+//! This module contains the primary multiplexer (`start_proxy`) that accepts
+//! TCP connections, sniffs the application-layer protocol, and dispatches to
+//! the appropriate handler:
+//!
+//! | Protocol    | Handler                                  |
+//! |-------------|------------------------------------------|
+//! | HTTP/1.x    | `handle_http_request` (via hyper HTTP/1) |
+//! | HTTP/2/gRPC | `handle_http2_request` (via hyper HTTP/2)|
+//! | TLS         | TLS termination then HTTP/1 or HTTP/2    |
+//! | Raw TCP     | Discarded on the MUX port (use `tcp.rs`) |
+//!
+//! Each request handler runs through a multi-step pipeline:
+//! 1. Real IP resolution (X-Forwarded-For / PROXY Protocol)
+//! 2. Zone-based concurrent connection limiting
+//! 3. CAPTCHA / bot detection
+//! 4. WAF inspection (URL, headers, body)
+//! 5. GeoIP country blocking
+//! 6. Scripting hooks (PreRoute, PreUpstream, Log)
+//! 7. URL rewrite engine (break/last/redirect/permanent)
+//! 8. Authentication (Basic, JWT, JWKS, OAuth, OIDC, auth_request)
+//! 9. Route matching (longest-prefix)
+//! 10. Static file serving / FastCGI / uWSGI dispatch
+//! 11. Backend selection (round-robin, least-conn, IP hash, AI-weighted)
+//! 12. Sticky session affinity
+//! 13. Request header injection + OpenTelemetry trace context
+//! 14. HTTP proxying with keepalive connection pooling
+//! 15. WebSocket upgrade tunneling
+//! 16. Response caching
+//! 17. Traffic mirroring
+//! 18. Compression (Brotli > gzip)
+//! 19. gRPC-Web response translation
+//! 20. Access logging + Prometheus metrics + AI score updates
+//!
+//! Submodules handle specific concerns (TLS, HTTP/3, TCP/UDP, FastCGI, etc.).
+
 use bytes::{Buf, Bytes, BytesMut};
 use futures_util::StreamExt;
 use http_body_util::{BodyExt, Full, combinators::BoxBody};
@@ -16,7 +53,6 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
-use crate::middleware::CachedResponse;
 use crate::middleware::compression;
 use arc_swap::ArcSwap;
 
@@ -57,9 +93,13 @@ use router::Protocol;
 /// to identify the protocol, but then must hand the connection off to a protocol handler
 /// (like hyper for HTTP) which expects to see those bytes again.
 pub struct PeekableStream {
+    /// The underlying TCP connection to the client.
     stream: TcpStream,
+    /// Bytes that were read during protocol sniffing and must be replayed first.
     buffer: BytesMut,
 }
+
+// ── AsyncRead / AsyncWrite implementations for PeekableStream ───────────────
 
 impl AsyncRead for PeekableStream {
     fn poll_read(
@@ -118,22 +158,15 @@ fn empty_response(status: hyper::StatusCode) -> Response<BoxBody<Bytes, hyper::E
         .unwrap()
 }
 
-/// Constructs an HTTP 429 Too Many Requests response with a Retry-After header.
+/// Constructs an HTTP 429 Too Many Requests response with a configurable Retry-After header.
 ///
-/// ### Example Input / Output
-///
-/// **Input**: (None)
-///
-/// **Output**:
-/// A `Response<BoxBody<Bytes, hyper::Error>>` with:
-/// - Status: 429 Too Many Requests
-/// - Headers: `Retry-After: 1`, `Content-Type: text/plain`
-/// - Body: "429 Too Many Requests\n"
-fn rate_limit_response() -> Response<BoxBody<Bytes, hyper::Error>> {
+/// # Arguments
+/// * `retry_after` - Seconds the client should wait before retrying.
+fn rate_limit_response_with_retry(retry_after: u64) -> Response<BoxBody<Bytes, hyper::Error>> {
     let body = Bytes::from_static(b"429 Too Many Requests\n");
     Response::builder()
         .status(hyper::StatusCode::TOO_MANY_REQUESTS)
-        .header("Retry-After", "1")
+        .header("Retry-After", retry_after.to_string())
         .header("Content-Type", "text/plain")
         .body(
             http_body_util::Full::new(body)
@@ -143,17 +176,228 @@ fn rate_limit_response() -> Response<BoxBody<Bytes, hyper::Error>> {
         .unwrap()
 }
 
+/// Backward-compatible wrapper: 429 with Retry-After: 60.
+fn rate_limit_response() -> Response<BoxBody<Bytes, hyper::Error>> {
+    rate_limit_response_with_retry(60)
+}
+
+/// Constructs a structured error response. Returns JSON when the client accepts it,
+/// otherwise text/plain. Includes a request-scoped trace ID for correlation.
+fn error_response(
+    status: hyper::StatusCode,
+    message: &str,
+    request_id: &str,
+    accept_json: bool,
+) -> Response<BoxBody<Bytes, hyper::Error>> {
+    let reason = status.canonical_reason().unwrap_or("Error");
+    if accept_json {
+        let json = serde_json::json!({
+            "status": status.as_u16(),
+            "error": reason,
+            "message": message,
+            "request_id": request_id,
+        });
+        let body = Bytes::from(serde_json::to_string(&json).unwrap_or_default());
+        Response::builder()
+            .status(status)
+            .header("Content-Type", "application/json")
+            .body(
+                http_body_util::Full::new(body)
+                    .map_err(|never| match never {})
+                    .boxed(),
+            )
+            .unwrap()
+    } else {
+        let body = Bytes::from(format!("{} {}: {}\n", status.as_u16(), reason, message));
+        Response::builder()
+            .status(status)
+            .header("Content-Type", "text/plain")
+            .body(
+                http_body_util::Full::new(body)
+                    .map_err(|never| match never {})
+                    .boxed(),
+            )
+            .unwrap()
+    }
+}
+
+/// Returns true if the Accept header indicates the client wants JSON responses.
+fn client_accepts_json(headers: &hyper::HeaderMap) -> bool {
+    headers
+        .get(hyper::header::ACCEPT)
+        .and_then(|v| v.to_str().ok())
+        .map(|v| v.contains("application/json") || v.contains("*/*"))
+        .unwrap_or(false)
+}
+
+/// Constructs an HTML response with the given status code and body string.
+/// Used for CAPTCHA challenge pages and similar browser-facing responses.
+fn html_response(
+    status: hyper::StatusCode,
+    html: String,
+) -> Response<BoxBody<Bytes, hyper::Error>> {
+    Response::builder()
+        .status(status)
+        .header(hyper::header::CONTENT_TYPE, "text/html; charset=utf-8")
+        .body(
+            Full::new(Bytes::from(html))
+                .map_err(|never| match never {})
+                .boxed(),
+        )
+        .unwrap()
+}
+
+/// Decodes a single URL-encoded form component (percent-decoding + `+` to space).
+fn decode_form_component(input: &str) -> String {
+    let mut out = Vec::with_capacity(input.len());
+    let bytes = input.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            let hex = &input[i + 1..i + 3];
+            if let Ok(v) = u8::from_str_radix(hex, 16) {
+                out.push(v);
+                i += 3;
+                continue;
+            }
+        }
+        if bytes[i] == b'+' {
+            out.push(b' ');
+        } else {
+            out.push(bytes[i]);
+        }
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).to_string()
+}
+
+/// Parses an `application/x-www-form-urlencoded` body into a key-value map.
+fn parse_urlencoded_form(bytes: &[u8]) -> std::collections::HashMap<String, String> {
+    let mut out = std::collections::HashMap::new();
+    let raw = String::from_utf8_lossy(bytes);
+    for pair in raw.split('&') {
+        if pair.is_empty() {
+            continue;
+        }
+        let (k, v) = match pair.split_once('=') {
+            Some((k, v)) => (k, v),
+            None => (pair, ""),
+        };
+        out.insert(decode_form_component(k), decode_form_component(v));
+    }
+    out
+}
+
+/// Reconstructs the original URL (path + query string) for post-CAPTCHA redirect.
+fn build_return_to(path: &str, query: Option<&str>) -> String {
+    match query {
+        Some(q) if !q.is_empty() => format!("{}?{}", path, q),
+        _ => path.to_string(),
+    }
+}
+
+/// Handles the `/__phalanx/captcha/verify` POST endpoint.
+///
+/// Validates the CAPTCHA token submitted by the browser, consumes the
+/// challenge nonce on success, and redirects the user back to the
+/// original page. On failure, re-serves the challenge HTML.
+async fn handle_captcha_verify_request(
+    req: Request<hyper::body::Incoming>,
+    client_ip: &str,
+    captcha_manager: Arc<Option<crate::waf::bot::CaptchaManager>>,
+) -> Result<Response<BoxBody<Bytes, hyper::Error>>, hyper::Error> {
+    let manager = match captcha_manager.as_ref() {
+        Some(m) => m,
+        None => return Ok(empty_response(hyper::StatusCode::NOT_FOUND)),
+    };
+
+    if req.method() != hyper::Method::POST {
+        return Ok(empty_response(hyper::StatusCode::METHOD_NOT_ALLOWED));
+    }
+
+    let body_bytes = match req.into_body().collect().await {
+        Ok(collected) => collected.to_bytes(),
+        Err(_) => return Ok(empty_response(hyper::StatusCode::BAD_REQUEST)),
+    };
+
+    let form_values = parse_urlencoded_form(&body_bytes);
+    let token = match manager.extract_token_from_form(&form_values) {
+        Some(t) => t,
+        None => return Ok(empty_response(hyper::StatusCode::BAD_REQUEST)),
+    };
+    let nonce = match manager.extract_nonce_from_form(&form_values) {
+        Some(n) => n,
+        None => return Ok(empty_response(hyper::StatusCode::BAD_REQUEST)),
+    };
+    let return_to = match manager.return_to_for_valid_nonce(client_ip, &nonce) {
+        Some(p) => p,
+        None => return Ok(empty_response(hyper::StatusCode::BAD_REQUEST)),
+    };
+
+    if token.is_empty() {
+        return Ok(empty_response(hyper::StatusCode::BAD_REQUEST));
+    }
+
+    if manager.verify_token(&token, client_ip).await {
+        manager.consume_challenge(client_ip);
+        return Ok(Response::builder()
+            .status(hyper::StatusCode::SEE_OTHER)
+            .header(hyper::header::LOCATION, return_to)
+            .body(
+                http_body_util::Empty::<Bytes>::new()
+                    .map_err(|never| match never {})
+                    .boxed(),
+            )
+            .unwrap());
+    }
+
+    Ok(html_response(
+        hyper::StatusCode::FORBIDDEN,
+        manager.challenge_html(),
+    ))
+}
+
+// ── Main Proxy Entrypoint ────────────────────────────────────────────────────
+
 /// Starts the primary universal multiplexer (Mux) proxy on the configured port.
-/// This listener accepts raw TCP connections, sniffs the application layer protocol
-/// (HTTP/1, HTTP/2/gRPC, TLS), and spawns appropriate async tasks to handle the requests.
+///
+/// This is the main entry point for all client traffic. It accepts raw TCP
+/// connections, sniffs the first bytes to determine the application protocol
+/// (HTTP/1, HTTP/2/gRPC, TLS, or raw TCP), then hands off to the appropriate
+/// handler.
+///
+/// # Parameters
+///
+/// * `bind_addr`      - Socket address to listen on (e.g. `"0.0.0.0:8080"`).
+/// * `app_config`     - Hot-swappable application configuration (routes, TLS paths, etc.).
+/// * `upstreams`      - Shared upstream pool manager with health-checked backends.
+/// * `tls_acceptor`   - Hot-swappable TLS acceptor (reloaded on SIGHUP).
+/// * `_waf`           - Web Application Firewall engine for request inspection.
+/// * `rate_limiter`   - IP-based and global rate limiter.
+/// * `_ai_engine`     - AI/ML-powered load balancing score tracker.
+/// * `cache`          - Response cache (L1 in-memory, L2 disk).
+/// * `hook_engine`    - Rhai scripting hook engine (PreRoute, PreUpstream, Log).
+/// * `metrics`        - Prometheus metrics collector.
+/// * `access_logger`  - Structured access log writer.
+/// * `geo_db`         - Optional GeoIP database for country-based routing/blocking.
+/// * `geo_policy`     - Country allow/deny policy.
+/// * `sticky`         - Optional sticky session manager.
+/// * `zone_limiter`   - Per-zone concurrent connection limiter.
+/// * `captcha_manager`- Optional CAPTCHA challenge manager.
+/// * `wasm_plugins`   - WebAssembly plugin manager for custom request/response transforms.
+/// * `gslb_router`    - Optional GSLB router for geo-based pool selection.
+/// * `k8s_controller` - Optional Kubernetes Ingress controller.
+/// * `bandwidth`      - Per-protocol bandwidth tracker.
+/// * `shutdown`       - Cancellation token for graceful shutdown.
+/// * `oidc_sessions`  - OIDC session store for OpenID Connect authentication.
 pub async fn start_proxy(
     bind_addr: &str,
     app_config: Arc<ArcSwap<AppConfig>>,
     upstreams: Arc<UpstreamManager>,
     tls_acceptor: Arc<ArcSwap<Option<tokio_rustls::TlsAcceptor>>>,
-    _waf: Arc<crate::waf::WafEngine>,
+    waf: Arc<crate::waf::WafEngine>,
     rate_limiter: Arc<crate::middleware::ratelimit::PhalanxRateLimiter>,
-    _ai_engine: Arc<dyn AiRouter>,
+    ai_engine: Arc<dyn AiRouter>,
     cache: Arc<AdvancedCache>,
     hook_engine: Arc<crate::scripting::HookEngine>,
     metrics: Arc<ProxyMetrics>,
@@ -162,11 +406,28 @@ pub async fn start_proxy(
     geo_policy: Arc<crate::geo::GeoPolicy>,
     sticky: Arc<Option<crate::proxy::sticky::StickySessionManager>>,
     zone_limiter: Arc<crate::middleware::connlimit::ZoneLimiter>,
+    captcha_manager: Arc<Option<crate::waf::bot::CaptchaManager>>,
+    wasm_plugins: Arc<crate::wasm::WasmPluginManager>,
+    gslb_router: Arc<Option<crate::gslb::GslbRouter>>,
+    k8s_controller: Arc<Option<crate::k8s::IngressController>>,
+    bandwidth: Arc<crate::telemetry::bandwidth::BandwidthTracker>,
     shutdown: CancellationToken,
     oidc_sessions: crate::auth::oidc::OidcSessionStore,
 ) {
-    let addr: SocketAddr = bind_addr.parse().expect("Invalid proxy bind address");
-    let listener = TcpListener::bind(&addr).await.unwrap();
+    let addr: SocketAddr = match bind_addr.parse() {
+        Ok(a) => a,
+        Err(e) => {
+            error!("Invalid proxy bind address '{}': {}", bind_addr, e);
+            return;
+        }
+    };
+    let listener = match TcpListener::bind(&addr).await {
+        Ok(l) => l,
+        Err(e) => {
+            error!("Failed to bind proxy listener on {}: {}", addr, e);
+            return;
+        }
+    };
     info!("Mux Proxy listening on {}", addr);
 
     loop {
@@ -191,8 +452,8 @@ pub async fn start_proxy(
         let upstreams_clone = Arc::clone(&upstreams);
         let config_clone = Arc::clone(&app_config);
         let tls_acceptor_clone = Arc::clone(&tls_acceptor);
-        let waf_spawn_clone = Arc::clone(&_waf);
-        let ai_spawn_clone = Arc::clone(&_ai_engine);
+        let waf_spawn_clone = Arc::clone(&waf);
+        let ai_spawn_clone = Arc::clone(&ai_engine);
         let rl_clone = Arc::clone(&rate_limiter);
         let cache_clone = Arc::clone(&cache);
         let hook_clone = Arc::clone(&hook_engine);
@@ -202,6 +463,11 @@ pub async fn start_proxy(
         let geo_policy_clone = Arc::clone(&geo_policy);
         let sticky_clone = Arc::clone(&sticky);
         let zone_clone = Arc::clone(&zone_limiter);
+        let captcha_clone = Arc::clone(&captcha_manager);
+        let wasm_clone = Arc::clone(&wasm_plugins);
+        let gslb_clone = Arc::clone(&gslb_router);
+        let k8s_clone = Arc::clone(&k8s_controller);
+        let bw_clone = Arc::clone(&bandwidth);
         let oidc_clone = Arc::clone(&oidc_sessions);
 
         // Spawn a new green thread per connection (Tokio task)
@@ -259,8 +525,9 @@ pub async fn start_proxy(
                             buffer: prefix_buf,
                         };
                         let io = TokioIo::new(peekable);
+                        let retry_after = config_clone.load().rate_limit_retry_after.unwrap_or(60);
                         let svc = service_fn(move |_req| async move {
-                            Ok::<_, hyper::Error>(rate_limit_response())
+                            Ok::<_, hyper::Error>(rate_limit_response_with_retry(retry_after))
                         });
                         let _ = http1::Builder::new().serve_connection(io, svc).await;
                         return;
@@ -297,6 +564,11 @@ pub async fn start_proxy(
                         let geo_policy_svc = Arc::clone(&geo_policy_clone);
                         let sticky_svc = Arc::clone(&sticky_clone);
                         let zone_svc = Arc::clone(&zone_clone);
+                        let captcha_svc = Arc::clone(&captcha_clone);
+                        let wasm_svc = Arc::clone(&wasm_clone);
+                        let gslb_svc = Arc::clone(&gslb_clone);
+                        let k8s_svc = Arc::clone(&k8s_clone);
+                        let bw_svc = Arc::clone(&bw_clone);
                         let oidc_svc = Arc::clone(&oidc_h1);
                         async move {
                             handle_http_request(
@@ -314,6 +586,11 @@ pub async fn start_proxy(
                                 geo_policy_svc,
                                 sticky_svc,
                                 zone_svc,
+                                captcha_svc,
+                                wasm_svc,
+                                gslb_svc,
+                                k8s_svc,
+                                bw_svc,
                                 oidc_svc,
                             )
                             .await
@@ -341,6 +618,11 @@ pub async fn start_proxy(
                         let geo_policy_svc = Arc::clone(&geo_policy_clone);
                         let sticky_svc = Arc::clone(&sticky_clone);
                         let zone_svc = Arc::clone(&zone_clone);
+                        let captcha_svc = Arc::clone(&captcha_clone);
+                        let wasm_svc = Arc::clone(&wasm_clone);
+                        let gslb_svc = Arc::clone(&gslb_clone);
+                        let k8s_svc = Arc::clone(&k8s_clone);
+                        let bw_svc = Arc::clone(&bw_clone);
                         let oidc_svc = Arc::clone(&oidc_h2);
                         async move {
                             handle_http2_request(
@@ -358,6 +640,11 @@ pub async fn start_proxy(
                                 geo_policy_svc,
                                 sticky_svc,
                                 zone_svc,
+                                captcha_svc,
+                                wasm_svc,
+                                gslb_svc,
+                                k8s_svc,
+                                bw_svc,
                                 oidc_svc,
                             )
                             .await
@@ -400,6 +687,11 @@ pub async fn start_proxy(
                                         let geo_policy_svc = Arc::clone(&geo_policy_clone);
                                         let sticky_svc = Arc::clone(&sticky_clone);
                                         let zone_svc = Arc::clone(&zone_clone);
+                                        let captcha_svc = Arc::clone(&captcha_clone);
+                                        let wasm_svc = Arc::clone(&wasm_clone);
+                                        let gslb_svc = Arc::clone(&gslb_clone);
+                                        let k8s_svc = Arc::clone(&k8s_clone);
+                                        let bw_svc = Arc::clone(&bw_clone);
                                         let oidc_svc = Arc::clone(&oidc_tls_h2);
                                         async move {
                                             handle_http2_request(
@@ -417,6 +709,11 @@ pub async fn start_proxy(
                                                 geo_policy_svc,
                                                 sticky_svc,
                                                 zone_svc,
+                                                captcha_svc,
+                                                wasm_svc,
+                                                gslb_svc,
+                                                k8s_svc,
+                                                bw_svc,
                                                 oidc_svc,
                                             )
                                             .await
@@ -445,6 +742,11 @@ pub async fn start_proxy(
                                         let geo_policy_svc = Arc::clone(&geo_policy_clone);
                                         let sticky_svc = Arc::clone(&sticky_clone);
                                         let zone_svc = Arc::clone(&zone_clone);
+                                        let captcha_svc = Arc::clone(&captcha_clone);
+                                        let wasm_svc = Arc::clone(&wasm_clone);
+                                        let gslb_svc = Arc::clone(&gslb_clone);
+                                        let k8s_svc = Arc::clone(&k8s_clone);
+                                        let bw_svc = Arc::clone(&bw_clone);
                                         let oidc_svc = Arc::clone(&oidc_tls_h1);
                                         async move {
                                             handle_http_request(
@@ -462,6 +764,11 @@ pub async fn start_proxy(
                                                 geo_policy_svc,
                                                 sticky_svc,
                                                 zone_svc,
+                                                captcha_svc,
+                                                wasm_svc,
+                                                gslb_svc,
+                                                k8s_svc,
+                                                bw_svc,
                                                 oidc_svc,
                                             )
                                             .await
@@ -562,6 +869,11 @@ async fn handle_http_request(
     geo_policy: Arc<crate::geo::GeoPolicy>,
     sticky: Arc<Option<crate::proxy::sticky::StickySessionManager>>,
     zone_limiter: Arc<crate::middleware::connlimit::ZoneLimiter>,
+    captcha_manager: Arc<Option<crate::waf::bot::CaptchaManager>>,
+    wasm_plugins: Arc<crate::wasm::WasmPluginManager>,
+    gslb_router: Arc<Option<crate::gslb::GslbRouter>>,
+    k8s_controller: Arc<Option<crate::k8s::IngressController>>,
+    bandwidth: Arc<crate::telemetry::bandwidth::BandwidthTracker>,
     oidc_sessions: crate::auth::oidc::OidcSessionStore,
 ) -> Result<Response<BoxBody<Bytes, hyper::Error>>, hyper::Error> {
     let app_config = app_config.load_full();
@@ -572,21 +884,37 @@ async fn handle_http_request(
     debug!("Handling HTTP request: {}", path);
     let start_time = std::time::Instant::now();
     let method_str = req.method().to_string();
+    let req_accepts_json = client_accepts_json(req.headers());
+    // Generate a request-scoped trace ID for correlation across logs/errors
+    let (req_trace_id, _req_span_id) = generate_trace_context_ids();
 
-    // 0. Resolve real client IP (respects X-Forwarded-For from trusted proxies)
+    // ── Step 0: Resolve Real Client IP ────────────────────────────────────────
+    // Respects X-Forwarded-For from trusted proxies, falls back to socket peer
     let trusted_proxies = realip::TrustedProxies::from_cidrs(&app_config.trusted_proxies);
     let real_ip = realip::resolve_client_ip(&_peer, req.headers(), &trusted_proxies);
     let ip_str = real_ip.to_string();
 
-    // Zone-based concurrent request limit (RAII guard: releases slot on any exit path)
+    // ── CAPTCHA Verification Endpoint (short-circuit) ───────────────────────
+    if path == "/__phalanx/captcha/verify" {
+        return handle_captcha_verify_request(req, &ip_str, captcha_manager).await;
+    }
+
+    // ── Step 1: Zone-Based Connection Limiting ────────────────────────────────
+    // RAII guard: releases the slot automatically on any exit path
     let _zone_guard = {
         if !zone_limiter.acquire_connection(&ip_str) {
-            return Ok(empty_response(hyper::StatusCode::SERVICE_UNAVAILABLE));
+            return Ok(error_response(
+                hyper::StatusCode::SERVICE_UNAVAILABLE,
+                "Server at capacity",
+                &req_trace_id,
+                req_accepts_json,
+            ));
         }
         crate::middleware::connlimit::ConnectionGuard::new(Arc::clone(&zone_limiter), ip_str.clone())
     };
 
-    // gRPC-Web detection (must happen before into_parts())
+    // ── Step 2: gRPC-Web Detection ────────────────────────────────────────────
+    // Must happen before into_parts() consumes the request
     let is_grpc_web_req = grpc_web::is_grpc_web(&req);
     let is_grpc_web_text = req
         .headers()
@@ -595,7 +923,45 @@ async fn handle_http_request(
         .map(|ct| ct.starts_with("application/grpc-web-text"))
         .unwrap_or(false);
 
-    // PreRoute hook phase: may rewrite path, inject headers, or short-circuit
+    // ── Step 2b: Wasm OnRequestHeaders ─────────────────────────────────────────
+    // Execute Wasm plugins before scripting hooks; short-circuit on direct_response
+    if wasm_plugins.plugin_count() > 0 {
+        let wasm_req_ctx = crate::wasm::WasmRequestContext {
+            method: method_str.clone(),
+            path: path.clone(),
+            query: req.uri().query().map(str::to_string),
+            headers: req
+                .headers()
+                .iter()
+                .filter_map(|(k, v)| v.to_str().ok().map(|v| (k.to_string(), v.to_string())))
+                .collect(),
+            body: None,
+            client_ip: ip_str.clone(),
+            protocol: "http/1.1".to_string(),
+        };
+        let result = wasm_plugins.execute_request_headers(&wasm_req_ctx);
+        if let Some(direct) = result.direct_response {
+            let sc = hyper::StatusCode::from_u16(direct.status_code)
+                .unwrap_or(hyper::StatusCode::INTERNAL_SERVER_ERROR);
+            return Ok(Response::builder()
+                .status(sc)
+                .body(Full::new(Bytes::from(direct.body)).map_err(|never| match never {}).boxed())
+                .unwrap());
+        }
+        if let Some(hdrs) = result.headers {
+            for (k, v) in hdrs {
+                if let (Ok(hk), Ok(hv)) = (
+                    hyper::header::HeaderName::from_bytes(k.as_bytes()),
+                    hyper::header::HeaderValue::from_str(&v),
+                ) {
+                    req.headers_mut().insert(hk, hv);
+                }
+            }
+        }
+    }
+
+    // ── Step 3: PreRoute Scripting Hooks ──────────────────────────────────────
+    // May rewrite path, inject headers, or short-circuit with a canned response
     if hook_engine.has_hooks(crate::scripting::HookPhase::PreRoute) {
         let hook_ctx = crate::scripting::HookContext {
             client_ip: ip_str.clone(),
@@ -638,7 +1004,7 @@ async fn handle_http_request(
         }
     }
 
-    // WAF Inspection
+    // ── Step 4: WAF + Bot Detection + CAPTCHA ─────────────────────────────────
     let query = req.uri().query();
     let user_agent = req
         .headers()
@@ -654,6 +1020,25 @@ async fn handle_http_request(
     let client_accepts_brotli = crate::middleware::brotli::accepts_brotli(accept_encoding);
 
     let waf_enabled = app_config.waf_enabled.unwrap_or(false);
+    if let Some(manager) = captcha_manager.as_ref() {
+        match manager.evaluate(&ip_str, user_agent.unwrap_or("")) {
+            crate::waf::bot::CaptchaAction::Allow => {}
+            crate::waf::bot::CaptchaAction::Block => {
+                metrics
+                    .waf_blocks_total
+                    .with_label_values(&["captcha_bot_block"])
+                    .inc();
+                return Ok(empty_response(hyper::StatusCode::FORBIDDEN));
+            }
+            crate::waf::bot::CaptchaAction::Challenge => {
+                let return_to = build_return_to(&path, query);
+                return Ok(html_response(
+                    hyper::StatusCode::FORBIDDEN,
+                    manager.challenge_html_for(&ip_str, &return_to),
+                ));
+            }
+        }
+    }
     if waf_enabled {
         if let crate::waf::WafAction::Block(reason) = waf.inspect(&ip_str, &path, query, user_agent)
         {
@@ -663,7 +1048,8 @@ async fn handle_http_request(
         }
     }
 
-    // GeoIP check (enforces allow/deny country policy and injects X-Geo-* headers)
+    // ── Step 5: GeoIP Country Check ───────────────────────────────────────────
+    // Enforces allow/deny country policy and injects X-Geo-* headers
     if let Some(ref db) = *geo_db {
         if let Some(geo_result) = db.lookup(&real_ip) {
             if !geo_policy.is_allowed(&geo_result.country_code) {
@@ -674,12 +1060,12 @@ async fn handle_http_request(
         }
     }
 
-    // gRPC-Web CORS preflight: return 204 No Content with CORS headers for OPTIONS
+    // ── Step 6: gRPC-Web CORS Preflight ───────────────────────────────────────
     if *req.method() == hyper::Method::OPTIONS && is_grpc_web_req {
         return Ok(grpc_web::cors_preflight_response());
     }
 
-    // Check for WebSocket upgrade request
+    // ── Step 7: WebSocket Upgrade Detection ───────────────────────────────────
     let is_websocket = is_websocket_upgrade(&req);
     // If it's a WebSocket upgrade, we must extract the `OnUpgrade` future from the hyper request
     // before the request body is consumed and sent to the backend.
@@ -689,54 +1075,6 @@ async fn handle_http_request(
     } else {
         None
     };
-
-    // Buffer request body once so we can inspect payloads and still forward unchanged bytes.
-    let (parts, body) = req.into_parts();
-    let body_bytes = match body.collect().await {
-        Ok(collected) => collected.to_bytes(),
-        Err(e) => {
-            error!("Failed to read request body: {}", e);
-            return Ok(empty_response(hyper::StatusCode::BAD_REQUEST));
-        }
-    };
-    if waf_enabled && !body_bytes.is_empty() {
-        let body_text = String::from_utf8_lossy(&body_bytes);
-        if let crate::waf::WafAction::Block(reason) = waf.inspect_body(&ip_str, &body_text) {
-            warn!("WAF blocked request body from {}: {}", ip_str, reason);
-            metrics.waf_blocks_total.with_label_values(&[&reason]).inc();
-            return Ok(empty_response(hyper::StatusCode::FORBIDDEN));
-        }
-    }
-    
-    // Dispatch request metadata to Machine Learning Fraud Engine (Async/OOB)
-    let ml_event = crate::waf::ml_fraud::MlEvent {
-        ip: ip_str.clone(),
-        method: parts.method.as_str().to_string(),
-        path: parts.uri.path().to_string(),
-        query: parts.uri.query().map(|s| s.to_string()),
-        timestamp: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs(),
-        header_count: parts.headers.len(),
-        user_agent_len: parts.headers.get(hyper::header::USER_AGENT).map(|v| v.len()).unwrap_or(0),
-        body_len: body_bytes.len(),
-        body_snippet: String::from_utf8_lossy(&body_bytes).chars().take(200).collect(),
-    };
-    waf.ml_engine.queue_inspection(ml_event);
-
-    // Save request metadata for traffic mirroring (fire-and-forget after response)
-    let mirror_req_headers = parts.headers.clone();
-    let mirror_req_body = body_bytes.clone();
-    let mirror_req_uri = parts.uri.to_string();
-    let mirror_req_method = parts.method.to_string();
-
-    let mut req = Request::from_parts(parts, Full::new(body_bytes));
-
-    // gRPC-Web: rewrite content-type to application/grpc and add TE: trailers
-    if is_grpc_web_req {
-        req = grpc_web::translate_request(req);
-    }
-
-    // Inject X-Forwarded-For, X-Real-IP, X-Forwarded-Proto headers into upstream request
-    realip::inject_forwarding_headers(req.headers_mut(), &real_ip, false);
 
     // ── Rewrite Engine ────────────────────────────────────────────────────────
     // Apply rewrite rules for the matched route BEFORE final dispatch.
@@ -754,7 +1092,13 @@ async fn handle_http_request(
         // Only run rewrite rules when a matching route has any
         if let Some((_r_path, r_config)) = best_match {
             if !r_config.rewrite_rules.is_empty() {
-                let rules = compile_rules(&r_config.rewrite_rules);
+                let rules = match compile_rules(&r_config.rewrite_rules) {
+                    Ok(rules) => rules,
+                    Err(e) => {
+                        error!("Invalid rewrite rule configuration: {}", e);
+                        return Ok(empty_response(hyper::StatusCode::INTERNAL_SERVER_ERROR));
+                    }
+                };
                 match apply_rewrites(&rules, &path) {
                     RewriteResult::Redirect { status, location } => {
                         debug!("Rewrite redirect {} -> {} ({})", path, location, status);
@@ -795,6 +1139,30 @@ async fn handle_http_request(
 
     // 1. Prefix path routing matching Nginx-like config
     // We sort routes by length descending at config load, or we find the longest matching prefix.
+    // K8s Ingress routes are checked as additional pool-name overrides when no config route matches.
+    let k8s_pool_override: Option<String> = if let Some(ref ctrl) = *k8s_controller {
+        let host_header = req
+            .headers()
+            .get(hyper::header::HOST)
+            .and_then(|h| h.to_str().ok())
+            .unwrap_or("")
+            .split(':')
+            .next()
+            .unwrap_or("");
+        let k8s_routes = ctrl.get_routes_for_host(host_header);
+        let mut best: Option<&crate::k8s::PhalanxRoute> = None;
+        let mut best_len = 0usize;
+        for kr in &k8s_routes {
+            if path.starts_with(&kr.path) && kr.path.len() > best_len {
+                best = Some(kr);
+                best_len = kr.path.len();
+            }
+        }
+        best.map(|kr| kr.upstream_pool.clone())
+    } else {
+        None
+    };
+
     let route = {
         let mut best_match = None;
         let mut best_len = 0;
@@ -807,6 +1175,67 @@ async fn handle_http_request(
         // Fallback to exactly "/" if no longest prefix found
         best_match.or_else(|| app_config.routes.get_key_value("/"))
     };
+
+    // ── CORS Middleware ─────────────────────────────────────────────────────
+    // After route matching, before auth: handle CORS preflight and response headers.
+    if let Some((_r_path, r_config)) = route {
+        if r_config.cors_enabled {
+            let origin = req
+                .headers()
+                .get("origin")
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_string);
+
+            let is_origin_allowed = if let Some(ref orig) = origin {
+                r_config.cors_allowed_origins.is_empty()
+                    || r_config.cors_allowed_origins.iter().any(|o| o == orig)
+            } else {
+                false
+            };
+
+            // Handle OPTIONS preflight request
+            if req.method() == hyper::Method::OPTIONS && is_origin_allowed {
+                let allowed_origin = if r_config.cors_allowed_origins.is_empty() {
+                    "*".to_string()
+                } else {
+                    origin.clone().unwrap_or_default()
+                };
+                let methods_str = r_config.cors_allowed_methods.join(", ");
+                let headers_str = r_config.cors_allowed_headers.join(", ");
+                let max_age_str = r_config.cors_max_age_secs.to_string();
+
+                let mut resp = Response::new(
+                    http_body_util::Empty::new()
+                        .map_err(|never| match never {})
+                        .boxed(),
+                );
+                *resp.status_mut() = hyper::StatusCode::NO_CONTENT;
+                resp.headers_mut().insert(
+                    "access-control-allow-origin",
+                    allowed_origin.parse().unwrap(),
+                );
+                resp.headers_mut().insert(
+                    "access-control-allow-methods",
+                    methods_str.parse().unwrap(),
+                );
+                resp.headers_mut().insert(
+                    "access-control-allow-headers",
+                    headers_str.parse().unwrap(),
+                );
+                resp.headers_mut().insert(
+                    "access-control-max-age",
+                    max_age_str.parse().unwrap(),
+                );
+                if r_config.cors_allow_credentials {
+                    resp.headers_mut().insert(
+                        "access-control-allow-credentials",
+                        "true".parse().unwrap(),
+                    );
+                }
+                return Ok(resp);
+            }
+        }
+    }
 
     // ── Authentication Middleware ────────────────────────────────────────────
     // Runs after WAF+Rewrite, before backend dispatch.
@@ -983,6 +1412,19 @@ async fn handle_http_request(
             match result {
                 AuthResult::Allowed => {
                     if let Some(s) = session {
+                        if let Some(ref issuer) = r_config.auth_oidc_issuer {
+                            if !crate::auth::oidc::session_matches_issuer(&s, issuer) {
+                                let mut resp = Response::new(
+                                    http_body_util::Full::new(Bytes::from(
+                                        "OIDC issuer mismatch",
+                                    ))
+                                    .map_err(|_| unreachable!())
+                                    .boxed(),
+                                );
+                                *resp.status_mut() = hyper::StatusCode::UNAUTHORIZED;
+                                return Ok(resp);
+                            }
+                        }
                         if let Ok(val) = s.sub.parse::<hyper::header::HeaderValue>() {
                             req.headers_mut().insert(
                                 hyper::header::HeaderName::from_static("x-auth-sub"), val);
@@ -996,7 +1438,7 @@ async fn handle_http_request(
                     }
                 }
                 AuthResult::Denied(status, msg) => {
-                    if let Some(ref _issuer) = r_config.auth_oidc_issuer {
+                    if r_config.auth_oidc_issuer.is_some() {
                         let mut resp = Response::new(
                             http_body_util::Full::new(Bytes::from("Authentication required"))
                                 .map_err(|_| unreachable!())
@@ -1015,7 +1457,164 @@ async fn handle_http_request(
                 }
             }
         }
+        // 6. auth_request subrequest (nginx-style external auth)
+        else if let Some(ref auth_url) = r_config.auth_request_url {
+            let (result, auth_headers) =
+                crate::auth::auth_request::check(req.headers(), auth_url, &method_str, &path).await;
+            match result {
+                AuthResult::Allowed => {
+                    for (k, v) in auth_headers {
+                        if let (Ok(name), Ok(val)) = (
+                            hyper::header::HeaderName::from_bytes(k.as_bytes()),
+                            v.parse::<hyper::header::HeaderValue>(),
+                        ) {
+                            req.headers_mut().insert(name, val);
+                        }
+                    }
+                }
+                AuthResult::Denied(status, msg) => {
+                    debug!("auth_request denied from {}: {}", ip_str, msg);
+                    let mut resp = Response::new(
+                        http_body_util::Full::new(Bytes::from(msg))
+                            .map_err(|_| unreachable!())
+                            .boxed(),
+                    );
+                    *resp.status_mut() = status;
+                    return Ok(resp);
+                }
+            }
+        }
+        // 7. Global auth_request fallback (not per-route)
+        else if let Some(ref auth_url) = app_config.auth_request_url {
+            let (result, auth_headers) =
+                crate::auth::auth_request::check(req.headers(), auth_url, &method_str, &path).await;
+            match result {
+                AuthResult::Allowed => {
+                    for (k, v) in auth_headers {
+                        if let (Ok(name), Ok(val)) = (
+                            hyper::header::HeaderName::from_bytes(k.as_bytes()),
+                            v.parse::<hyper::header::HeaderValue>(),
+                        ) {
+                            req.headers_mut().insert(name, val);
+                        }
+                    }
+                }
+                AuthResult::Denied(status, msg) => {
+                    debug!("auth_request denied from {}: {}", ip_str, msg);
+                    let mut resp = Response::new(
+                        http_body_util::Full::new(Bytes::from(msg))
+                            .map_err(|_| unreachable!())
+                            .boxed(),
+                    );
+                    *resp.status_mut() = status;
+                    return Ok(resp);
+                }
+            }
+        }
     }
+
+    // ── Body Size Limit Check ────────────────────────────────────────────────
+    // Enforce client_max_body_size before buffering/forwarding the request body.
+    let max_body = {
+        let route_limit = route.map(|(_, r)| r.client_max_body_size).unwrap_or(0);
+        if route_limit > 0 { route_limit } else { app_config.client_max_body_size }
+    };
+    if max_body > 0 {
+        if let Some(cl) = req.headers().get(hyper::header::CONTENT_LENGTH) {
+            if let Ok(len) = cl.to_str().unwrap_or("0").parse::<usize>() {
+                if len > max_body {
+                    warn!("Request body too large from {}: {} > {} bytes", ip_str, len, max_body);
+                    return Ok(empty_response(hyper::StatusCode::PAYLOAD_TOO_LARGE));
+                }
+            }
+        }
+    }
+
+    // Route-level/body-dependent features should buffer only when needed.
+    let route_has_mirror = route
+        .and_then(|(_, r)| r.mirror_pool.as_ref())
+        .is_some()
+        || app_config.mirror_pool.is_some();
+    let should_buffer_request_body = waf_enabled
+        || is_grpc_web_req
+        || route_has_mirror
+        || app_config.ml_fraud_model_path.is_some();
+
+    let (parts, body) = req.into_parts();
+    let mirror_req_headers = parts.headers.clone();
+    let mirror_req_uri = parts.uri.to_string();
+    let mirror_req_method = parts.method.to_string();
+    let ml_method = parts.method.as_str().to_string();
+    let ml_path = parts.uri.path().to_string();
+    let ml_query = parts.uri.query().map(|s| s.to_string());
+    let ml_header_count = parts.headers.len();
+    let ml_user_agent_len = parts
+        .headers
+        .get(hyper::header::USER_AGENT)
+        .map(|v| v.len())
+        .unwrap_or(0);
+
+    let mut mirror_req_body = Bytes::new();
+    let mut ml_body_len = 0usize;
+    let mut ml_body_snippet = String::new();
+
+    let mut req = if should_buffer_request_body {
+        let body_bytes = match body.collect().await {
+            Ok(collected) => collected.to_bytes(),
+            Err(e) => {
+                error!("Failed to read request body: {}", e);
+                return Ok(empty_response(hyper::StatusCode::BAD_REQUEST));
+            }
+        };
+        if waf_enabled && !body_bytes.is_empty() {
+            let body_text = String::from_utf8_lossy(&body_bytes);
+            if let crate::waf::WafAction::Block(reason) = waf.inspect_body(&ip_str, &body_text) {
+                warn!("WAF blocked request body from {}: {}", ip_str, reason);
+                metrics.waf_blocks_total.with_label_values(&[&reason]).inc();
+                return Ok(empty_response(hyper::StatusCode::FORBIDDEN));
+            }
+        }
+        ml_body_len = body_bytes.len();
+        ml_body_snippet = String::from_utf8_lossy(&body_bytes).chars().take(200).collect();
+        mirror_req_body = body_bytes.clone();
+
+        if is_grpc_web_req {
+            let req_full = grpc_web::translate_request(Request::from_parts(parts, Full::new(body_bytes)));
+            let (parts, body) = req_full.into_parts();
+            Request::from_parts(parts, body.map_err(|never| match never {}).boxed())
+        } else {
+            Request::from_parts(
+                parts,
+                Full::new(body_bytes)
+                    .map_err(|never| match never {})
+                    .boxed(),
+            )
+        }
+    } else {
+        Request::from_parts(parts, body.map_err(|e| e).boxed())
+    };
+
+    // Dispatch request metadata to Machine Learning Fraud Engine (Async/OOB).
+    // For streaming pass-through requests we intentionally avoid full buffering,
+    // so body metrics are left as zero/empty.
+    let ml_event = crate::waf::ml_fraud::MlEvent {
+        ip: ip_str.clone(),
+        method: ml_method,
+        path: ml_path,
+        query: ml_query,
+        timestamp: std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs(),
+        header_count: ml_header_count,
+        user_agent_len: ml_user_agent_len,
+        body_len: ml_body_len,
+        body_snippet: ml_body_snippet,
+    };
+    waf.ml_engine.queue_inspection(ml_event);
+
+    // Inject forwarding headers only on the outbound upstream request.
+    realip::inject_forwarding_headers(req.headers_mut(), &real_ip, false);
 
     // Extract Host Header to fallback if no specific path match is found
     let host = req
@@ -1040,17 +1639,7 @@ async fn handle_http_request(
                     &ip_str,
                 )
                 .await;
-                return res.map(|r| {
-                    r.map(|b| {
-                        b.map_err(|_e| {
-                            // Can't cast io::Error to hyper::Error natively
-                            panic!(
-                                "hyper::Error conversion bypassed on static stream read failure"
-                            );
-                        })
-                        .boxed()
-                    })
-                });
+                return res;
             }
 
             if let Some(ref fastcgi_pass) = r.fastcgi_pass {
@@ -1064,15 +1653,7 @@ async fn handle_http_request(
                     &ip_str,
                 )
                 .await;
-                return res.map(|r| {
-                    r.map(|b| {
-                        b.map_err(|_e| {
-                            // Convert fastcgi error
-                            panic!("hyper::Error conversion bypassed on proxy stream failure");
-                        })
-                        .boxed()
-                    })
-                });
+                return res;
             }
 
             if let Some(ref uwsgi_pass) = r.uwsgi_pass {
@@ -1086,20 +1667,32 @@ async fn handle_http_request(
                     &ip_str,
                 )
                 .await;
-                return res.map(|r| {
-                    r.map(|b| {
-                        b.map_err(|_e| {
-                            // Convert uwsgi error
-                            panic!("hyper::Error conversion bypassed on proxy stream failure");
-                        })
-                        .boxed()
-                    })
-                });
+                return res;
             }
 
             r.upstream.clone().unwrap_or_else(|| host_name.to_string())
         }
         None => host_name.to_string(),
+    };
+
+    // K8s Ingress route override: if a K8s-generated route matches, prefer its pool
+    let pool_name = k8s_pool_override.unwrap_or(pool_name);
+
+    // GSLB override: if a GSLB router is configured, use the client's geo country to
+    // select a geographically appropriate upstream pool instead.
+    let pool_name = if let Some(ref router) = *gslb_router {
+        let country_code = req
+            .headers()
+            .get("x-geo-country-code")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        if !country_code.is_empty() {
+            router.route(country_code).unwrap_or(pool_name)
+        } else {
+            pool_name
+        }
+    } else {
+        pool_name
     };
 
     // ── Resolve gzip + brotli + cache + mirror flags from matched route config ──
@@ -1241,7 +1834,12 @@ async fn handle_http_request(
             .or_else(|| p.get_next_backend(Some(&_peer.ip()), Some(Arc::clone(&ai_engine))))
         {
             Some(b) => b,
-            None => return Ok(empty_response(hyper::StatusCode::BAD_GATEWAY)),
+            None => return Ok(error_response(
+                hyper::StatusCode::BAD_GATEWAY,
+                "No healthy backends available",
+                &req_trace_id,
+                req_accepts_json,
+            )),
         }
     };
 
@@ -1259,50 +1857,197 @@ async fn handle_http_request(
     let (trace_id, span_id) = generate_trace_context_ids();
     crate::telemetry::otel::inject_trace_context(req.headers_mut(), &trace_id, &span_id, true);
 
-    // 4. Forward the request to physical backend IP
-    backend.active_connections.fetch_add(1, Ordering::Relaxed);
-    metrics.active_connections.inc();
-    let pool_ref = Arc::clone(pool.as_ref().expect("pool presence already validated"));
+    // ── Resolve timeout + retry settings: route -> global -> hardcoded defaults ──
+    let connect_timeout = std::time::Duration::from_secs({
+        let rt = route.map(|(_, r)| r.proxy_connect_timeout_secs).unwrap_or(0);
+        if rt > 0 { rt } else if app_config.proxy_connect_timeout_secs > 0 { app_config.proxy_connect_timeout_secs } else { 10 }
+    });
+    let read_timeout = std::time::Duration::from_secs({
+        let rt = route.map(|(_, r)| r.proxy_read_timeout_secs).unwrap_or(0);
+        if rt > 0 { rt } else if app_config.proxy_read_timeout_secs > 0 { app_config.proxy_read_timeout_secs } else { 60 }
+    });
+    let max_retries = {
+        let rt = route.map(|(_, r)| r.proxy_next_upstream_tries).unwrap_or(0);
+        if rt > 0 { rt } else { app_config.proxy_next_upstream_tries }
+    };
+    let retry_timeout_secs = {
+        let rt = route.map(|(_, r)| r.proxy_next_upstream_timeout_secs).unwrap_or(0);
+        if rt > 0 { rt } else { app_config.proxy_next_upstream_timeout_secs }
+    };
+    let is_idempotent_method = matches!(
+        req.method(),
+        &hyper::Method::GET | &hyper::Method::HEAD | &hyper::Method::OPTIONS
+            | &hyper::Method::PUT | &hyper::Method::DELETE
+    );
+    let can_retry_connect = is_idempotent_method && max_retries > 0;
+    let retry_deadline = if retry_timeout_secs > 0 {
+        Some(std::time::Instant::now() + std::time::Duration::from_secs(retry_timeout_secs))
+    } else {
+        None
+    };
 
-    // Establish TCP connection to backend (using keepalive pool if enabled)
-    let stream = match pool_ref
-        .connection_pool
-        .acquire(&backend.config.address)
-        .await
-    {
-        Ok(s) => s,
-        Err(e) => {
-            error!(
-                "Failed to connect to backend {}: {}",
-                backend.config.address, e
-            );
-            backend.active_connections.fetch_sub(1, Ordering::Relaxed);
-            return Ok(empty_response(hyper::StatusCode::SERVICE_UNAVAILABLE));
+    // 4. Forward the request to physical backend IP (with connect + read timeouts)
+    let mut current_backend = backend;
+    let mut retries_left = if can_retry_connect { max_retries } else { 0u32 };
+    current_backend.active_connections.fetch_add(1, Ordering::Relaxed);
+    metrics.active_connections.inc();
+    let Some(pool_ref) = pool.as_ref() else {
+        error!("Upstream pool unexpectedly missing after backend selection");
+        current_backend.active_connections.fetch_sub(1, Ordering::Relaxed);
+        metrics.active_connections.dec();
+        return Ok(error_response(
+            hyper::StatusCode::BAD_GATEWAY,
+            "Upstream pool configuration error",
+            &req_trace_id,
+            req_accepts_json,
+        ));
+    };
+    let pool_ref = Arc::clone(pool_ref);
+
+    // Establish TCP connection to backend with connect timeout + retry loop
+    let stream = loop {
+        let connect_result = tokio::time::timeout(
+            connect_timeout,
+            pool_ref.connection_pool.acquire(&current_backend.config.address),
+        ).await;
+        match connect_result {
+            Ok(Ok(s)) => break s,
+            Ok(Err(e)) => {
+                error!("Failed to connect to backend {}: {}", current_backend.config.address, e);
+                let phase = "connect".to_string();
+                metrics.backend_errors_total
+                    .with_label_values(&[&current_backend.config.address, &pool_name, &phase])
+                    .inc();
+                current_backend.record_failure();
+            }
+            Err(_elapsed) => {
+                warn!("Connect timeout to backend {} after {:?}", current_backend.config.address, connect_timeout);
+                let phase = "timeout".to_string();
+                metrics.backend_errors_total
+                    .with_label_values(&[&current_backend.config.address, &pool_name, &phase])
+                    .inc();
+                current_backend.record_failure();
+            }
         }
+        // Retry with next backend if allowed
+        if retries_left > 0 {
+            retries_left -= 1;
+            current_backend.active_connections.fetch_sub(1, Ordering::Relaxed);
+            metrics.active_connections.dec();
+            if let Some(dl) = retry_deadline {
+                if std::time::Instant::now() >= dl {
+                    return Ok(error_response(hyper::StatusCode::GATEWAY_TIMEOUT, "Upstream retry timeout exceeded", &req_trace_id, req_accepts_json));
+                }
+            }
+            if let Some(p) = pool.as_ref() {
+                if let Some(next) = p.get_next_backend(Some(&_peer.ip()), Some(Arc::clone(&ai_engine))) {
+                    warn!("Retrying connect to next upstream {} (retries left: {})", next.config.address, retries_left);
+                    current_backend = next;
+                    current_backend.active_connections.fetch_add(1, Ordering::Relaxed);
+                    metrics.active_connections.inc();
+                    continue;
+                }
+            }
+            return Ok(error_response(hyper::StatusCode::GATEWAY_TIMEOUT, "All upstream connect attempts failed", &req_trace_id, req_accepts_json));
+        }
+        current_backend.active_connections.fetch_sub(1, Ordering::Relaxed);
+        metrics.active_connections.dec();
+        return Ok(error_response(hyper::StatusCode::GATEWAY_TIMEOUT, "Backend connect failed", &req_trace_id, req_accepts_json));
     };
 
     let io = TokioIo::new(stream);
 
-    // Perform hyper client handshake over the TCP connection
+    // Check if route requests HTTP/2 backend forwarding (e.g. for gRPC backends)
+    let use_h2_backend = route
+        .and_then(|(_, r)| r.proxy_http_version.as_deref())
+        .map(|v| v == "2")
+        .unwrap_or(false);
+
+    // HTTP/2 backend path: complete early-return block.
+    // HTTP/2 does not support 101 WebSocket upgrades, so we skip that handling entirely.
+    if use_h2_backend {
+        let (mut sender, conn) =
+            match hyper::client::conn::http2::handshake(executor::TokioExecutor, io).await {
+                Ok(handshake) => handshake,
+                Err(e) => {
+                    error!("HTTP/2 handshake failed with backend {}: {}", current_backend.config.address, e);
+                    let phase = "connect".to_string();
+                    metrics.backend_errors_total
+                        .with_label_values(&[&current_backend.config.address, &pool_name, &phase])
+                        .inc();
+                    current_backend.active_connections.fetch_sub(1, Ordering::Relaxed);
+                    return Ok(error_response(hyper::StatusCode::SERVICE_UNAVAILABLE, "Backend HTTP/2 handshake failed", &req_trace_id, req_accepts_json));
+                }
+            };
+        tokio::spawn(async move {
+            if let Err(e) = conn.await {
+                debug!("Backend HTTP/2 connection error: {:?}", e);
+            }
+        });
+        let res = match tokio::time::timeout(read_timeout, sender.send_request(req)).await {
+            Ok(r) => r,
+            Err(_) => {
+                warn!("Read timeout from backend {} after {:?}", current_backend.config.address, read_timeout);
+                current_backend.record_failure();
+                current_backend.active_connections.fetch_sub(1, Ordering::Relaxed);
+                metrics.active_connections.dec();
+                return Ok(error_response(hyper::StatusCode::GATEWAY_TIMEOUT, "Backend read timeout", &req_trace_id, req_accepts_json));
+            }
+        };
+        current_backend.active_connections.fetch_sub(1, Ordering::Relaxed);
+        metrics.active_connections.dec();
+        let backend_addr = current_backend.config.address.clone();
+        match res {
+            Ok(response) => {
+                let response = response.map(|b| b.map_err(|e: hyper::Error| e).boxed());
+                return Ok(response);
+            }
+            Err(e) => {
+                error!("HTTP/2 request to backend {} failed: {}", backend_addr, e);
+                current_backend.record_failure();
+                return Ok(error_response(hyper::StatusCode::BAD_GATEWAY, "Backend request failed", &req_trace_id, req_accepts_json));
+            }
+        }
+    }
+
+    // HTTP/1 backend path: conn stays in scope for WebSocket upgrade handling.
     let (mut sender, conn) = match hyper::client::conn::http1::handshake(io).await {
         Ok(handshake) => handshake,
         Err(e) => {
             error!(
                 "Handshake failed with backend {}: {}",
-                backend.config.address, e
+                current_backend.config.address, e
             );
-            backend.active_connections.fetch_sub(1, Ordering::Relaxed);
-            return Ok(empty_response(hyper::StatusCode::SERVICE_UNAVAILABLE));
+            let phase = "connect".to_string();
+            metrics
+                .backend_errors_total
+                .with_label_values(&[&current_backend.config.address, &pool_name, &phase])
+                .inc();
+            current_backend.active_connections.fetch_sub(1, Ordering::Relaxed);
+            return Ok(error_response(
+                hyper::StatusCode::SERVICE_UNAVAILABLE,
+                "Backend handshake failed",
+                &req_trace_id,
+                req_accepts_json,
+            ));
         }
     };
 
-    // Send the proxy request
-    let res = sender.send_request(req).await;
-    // Client has responded locally, decrement active proxy connection count
-    backend.active_connections.fetch_sub(1, Ordering::Relaxed);
+    // Send the proxy request with read timeout
+    let res = match tokio::time::timeout(read_timeout, sender.send_request(req)).await {
+        Ok(r) => r,
+        Err(_) => {
+            warn!("Read timeout from backend {} after {:?}", current_backend.config.address, read_timeout);
+            current_backend.record_failure();
+            current_backend.active_connections.fetch_sub(1, Ordering::Relaxed);
+            metrics.active_connections.dec();
+            return Ok(error_response(hyper::StatusCode::GATEWAY_TIMEOUT, "Backend read timeout", &req_trace_id, req_accepts_json));
+        }
+    };
+    current_backend.active_connections.fetch_sub(1, Ordering::Relaxed);
     metrics.active_connections.dec();
 
-    let backend_addr = backend.config.address.clone();
+    let backend_addr = current_backend.config.address.clone();
 
     match res {
         Ok(mut response) => {
@@ -1329,13 +2074,32 @@ async fn handle_http_request(
                                 let mut client_io = TokioIo::new(client_upgraded);
                                 let mut backend_io = TokioIo::new(backend_upgraded);
 
-                                // Relay bytes bidirectionally
-                                match crate::proxy::zero_copy::copy_bidirectional_fallback(
-                                    &mut client_io,
-                                    &mut backend_io,
-                                )
-                                .await
-                                {
+                                // Relay bytes bidirectionally with optional idle timeout
+                                let ws_timeout = app_config.websocket_idle_timeout_secs;
+                                let tunnel_result = if ws_timeout > 0 {
+                                    tokio::time::timeout(
+                                        std::time::Duration::from_secs(ws_timeout),
+                                        crate::proxy::zero_copy::copy_bidirectional_fallback(
+                                            &mut client_io,
+                                            &mut backend_io,
+                                        ),
+                                    )
+                                    .await
+                                    .unwrap_or_else(|_| {
+                                        debug!(
+                                            "WebSocket tunnel idle timeout ({}s) to {}",
+                                            ws_timeout, backend_addr_clone
+                                        );
+                                        Ok((0, 0))
+                                    })
+                                } else {
+                                    crate::proxy::zero_copy::copy_bidirectional_fallback(
+                                        &mut client_io,
+                                        &mut backend_io,
+                                    )
+                                    .await
+                                };
+                                match tunnel_result {
                                     Ok((from_client, from_backend)) => {
                                         debug!(
                                             "WebSocket tunnel closed normally to {}, client sent {} bytes, backend sent {} bytes",
@@ -1375,6 +2139,30 @@ async fn handle_http_request(
                 .with_label_values(&[method_str.as_str(), &pool_name])
                 .observe(start_time.elapsed().as_secs_f64());
 
+            // Per-backend metrics
+            metrics
+                .backend_request_duration
+                .with_label_values(&[&backend_addr, &pool_name])
+                .observe(start_time.elapsed().as_secs_f64());
+            if response.status().is_server_error() {
+                metrics
+                    .backend_errors_total
+                    .with_label_values(&[&backend_addr, &pool_name, &"5xx".to_string()])
+                    .inc();
+            }
+
+            // HSTS header injection
+            if let Some(max_age) = app_config.hsts_max_age {
+                if let Ok(hv) = hyper::header::HeaderValue::from_str(
+                    &format!("max-age={}", max_age),
+                ) {
+                    response.headers_mut().insert(
+                        hyper::header::STRICT_TRANSPORT_SECURITY,
+                        hv,
+                    );
+                }
+            }
+
             // 5. Response Header Injection Phase (from config)
             if let Some((_, r)) = route {
                 for (k, v) in &r.add_headers {
@@ -1383,6 +2171,30 @@ async fn handle_http_request(
                         hyper::header::HeaderValue::from_str(v),
                     ) {
                         response.headers_mut().insert(hk, hv);
+                    }
+                }
+
+                // 5b. CORS response headers for normal (non-preflight) requests
+                if r.cors_enabled {
+                    // We don't have access to request headers here since `req` was consumed.
+                    // Use wildcard for simple case, or first origin from allowed list.
+                    let cors_origin = if r.cors_allowed_origins.is_empty() {
+                        "*".to_string()
+                    } else if let Some(first) = r.cors_allowed_origins.first() {
+                        first.clone()
+                    } else {
+                        "*".to_string()
+                    };
+                    if let Ok(hv) = cors_origin.parse::<hyper::header::HeaderValue>() {
+                        response
+                            .headers_mut()
+                            .insert("access-control-allow-origin", hv);
+                    }
+                    if r.cors_allow_credentials {
+                        response.headers_mut().insert(
+                            "access-control-allow-credentials",
+                            "true".parse().unwrap(),
+                        );
                     }
                 }
             }
@@ -1495,7 +2307,7 @@ async fn handle_http_request(
 
             // gRPC-Web: rewrite response content-type back to grpc-web and add CORS headers
             if is_grpc_web_req {
-                final_resp = grpc_web::translate_response(final_resp, is_grpc_web_text);
+                final_resp = grpc_web::translate_response(final_resp, is_grpc_web_text).await;
             }
 
             // Sticky session: set cookie (Cookie mode) or learn from response header (Learn mode)
@@ -1537,6 +2349,41 @@ async fn handle_http_request(
                 }
             }
 
+            // Bandwidth tracking: record bytes in/out for this protocol
+            let bw_proto = if is_websocket { "ws" } else { "http1" };
+            let bw_stats = bandwidth.protocol(bw_proto);
+            bw_stats.inc_requests();
+            bw_stats.add_out(body_len as u64);
+
+            // Per-pool bandwidth tracking
+            let pool_bw = bandwidth.pool(&pool_name);
+            pool_bw.inc_requests();
+            pool_bw.add_out(body_len as u64);
+
+            // Wasm OnResponseHeaders: execute plugins on response
+            if wasm_plugins.plugin_count() > 0 {
+                let wasm_resp_ctx = crate::wasm::WasmResponseContext {
+                    status_code,
+                    headers: final_resp
+                        .headers()
+                        .iter()
+                        .filter_map(|(k, v)| v.to_str().ok().map(|v| (k.to_string(), v.to_string())))
+                        .collect(),
+                    body: None,
+                };
+                let result = wasm_plugins.execute_response_headers(&wasm_resp_ctx);
+                if let Some(hdrs) = result.headers {
+                    for (k, v) in hdrs {
+                        if let (Ok(hk), Ok(hv)) = (
+                            hyper::header::HeaderName::from_bytes(k.as_bytes()),
+                            hyper::header::HeaderValue::from_str(&v),
+                        ) {
+                            final_resp.headers_mut().insert(hk, hv);
+                        }
+                    }
+                }
+            }
+
             // Structured Access Log
             access_logger.log(AccessLogEntry {
                 timestamp: chrono_timestamp(),
@@ -1550,6 +2397,7 @@ async fn handle_http_request(
                 bytes_sent: body_len as u64,
                 referer: String::new(),
                 user_agent: String::new(),
+                trace_id: req_trace_id.clone(),
             });
 
             // Log hook: post-response auditing (fire-and-forget, non-blocking)
@@ -1571,7 +2419,10 @@ async fn handle_http_request(
         Err(e) => {
             error!("Failed to proxy request to backend {}: {}", backend_addr, e);
             // Passive health check: record this failure against the backend
-            backend.record_failure();
+            current_backend.record_failure();
+            metrics.backend_errors_total
+                .with_label_values(&[&backend_addr, &pool_name, &"connect".to_string()])
+                .inc();
 
             // Log the error in access log
             access_logger.log(AccessLogEntry {
@@ -1586,30 +2437,54 @@ async fn handle_http_request(
                 bytes_sent: 0,
                 referer: String::new(),
                 user_agent: String::new(),
+                trace_id: req_trace_id.clone(),
             });
 
-            Ok(empty_response(hyper::StatusCode::BAD_GATEWAY))
+            Ok(error_response(
+                hyper::StatusCode::BAD_GATEWAY,
+                "Failed to proxy request to backend",
+                &req_trace_id,
+                req_accepts_json,
+            ))
         }
     }
 }
 
+// ── HTTP/2 Handler ──────────────────────────────────────────────────────────
+
 /// The main worker function for HTTP/2.x and gRPC traffic.
-/// Now has full parity with HTTP/1: rewrites, auth, gzip/brotli, cache.
+///
+/// Has full feature parity with `handle_http_request` (HTTP/1): rewrites,
+/// authentication (Basic/JWT/JWKS/OAuth/OIDC/auth_request), WAF, gzip
+/// compression, response caching, and access logging.
+///
+/// Key differences from the HTTP/1 handler:
+/// - Uses `hyper::client::conn::http2::handshake` for backend connections.
+/// - Detects native gRPC (`application/grpc`) and records `grpc-status` metrics.
+/// - Does not support WebSocket upgrades (HTTP/2 uses different mechanisms).
+/// - Does not support traffic mirroring or Brotli compression (planned).
+/// - The backend HTTP/2 connection is spawned as a background task since HTTP/2
+///   multiplexes streams over a single TCP connection.
 async fn handle_http2_request(
-    req: Request<hyper::body::Incoming>,
+    mut req: Request<hyper::body::Incoming>,
     _peer: SocketAddr,
     upstreams: Arc<UpstreamManager>,
     app_config: Arc<ArcSwap<AppConfig>>,
     waf: Arc<crate::waf::WafEngine>,
     ai_engine: Arc<dyn crate::ai::AiRouter>,
     cache: Arc<AdvancedCache>,
-    _hook_engine: Arc<crate::scripting::HookEngine>,
+    hook_engine: Arc<crate::scripting::HookEngine>,
     metrics: Arc<ProxyMetrics>,
     access_logger: Arc<AccessLogger>,
-    _geo_db: Arc<Option<crate::geo::GeoIpDatabase>>,
-    _geo_policy: Arc<crate::geo::GeoPolicy>,
-    _sticky: Arc<Option<crate::proxy::sticky::StickySessionManager>>,
-    _zone_limiter: Arc<crate::middleware::connlimit::ZoneLimiter>,
+    geo_db: Arc<Option<crate::geo::GeoIpDatabase>>,
+    geo_policy: Arc<crate::geo::GeoPolicy>,
+    sticky: Arc<Option<crate::proxy::sticky::StickySessionManager>>,
+    zone_limiter: Arc<crate::middleware::connlimit::ZoneLimiter>,
+    captcha_manager: Arc<Option<crate::waf::bot::CaptchaManager>>,
+    wasm_plugins: Arc<crate::wasm::WasmPluginManager>,
+    gslb_router: Arc<Option<crate::gslb::GslbRouter>>,
+    k8s_controller: Arc<Option<crate::k8s::IngressController>>,
+    bandwidth: Arc<crate::telemetry::bandwidth::BandwidthTracker>,
     oidc_sessions: crate::auth::oidc::OidcSessionStore,
 ) -> Result<Response<BoxBody<Bytes, hyper::Error>>, hyper::Error> {
     let app_config = app_config.load_full();
@@ -1631,24 +2506,143 @@ async fn handle_http2_request(
 
     let start_time = std::time::Instant::now();
     let method_str = req.method().to_string();
+    let req_accepts_json = client_accepts_json(req.headers());
+    let (req_trace_id, _req_span_id) = generate_trace_context_ids();
 
-    // 0. WAF Inspection
-    let ip_str = _peer.ip().to_string();
-    let query = req.uri().query();
-    let user_agent = req
+    // ── Step 0: Real IP resolution (parity with HTTP/1) ──
+    let trusted_proxies = realip::TrustedProxies::from_cidrs(&app_config.trusted_proxies);
+    let real_ip = realip::resolve_client_ip(&_peer, req.headers(), &trusted_proxies);
+    let ip_str = real_ip.to_string();
+
+    if path == "/__phalanx/captcha/verify" {
+        return handle_captcha_verify_request(req, &ip_str, captcha_manager).await;
+    }
+
+    // ── Step 1: Zone-Based Connection Limiting ──
+    let _zone_guard = {
+        if !zone_limiter.acquire_connection(&ip_str) {
+            return Ok(empty_response(hyper::StatusCode::SERVICE_UNAVAILABLE));
+        }
+        crate::middleware::connlimit::ConnectionGuard::new(Arc::clone(&zone_limiter), ip_str.clone())
+    };
+
+    let query_str = req.uri().query().map(str::to_string);
+    let user_agent_str = req
         .headers()
         .get(hyper::header::USER_AGENT)
-        .and_then(|v| v.to_str().ok());
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string);
 
-    let client_accepts_gzip = compression::accepts_gzip(
-        req.headers()
-            .get(hyper::header::ACCEPT_ENCODING)
-            .and_then(|v| v.to_str().ok()),
-    );
+    let accept_encoding_str = req
+        .headers()
+        .get(hyper::header::ACCEPT_ENCODING)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string);
+    let client_accepts_gzip = compression::accepts_gzip(accept_encoding_str.as_deref());
+    let client_accepts_brotli = crate::middleware::brotli::accepts_brotli(accept_encoding_str.as_deref());
 
+    // ── Step 2: Wasm OnRequestHeaders ──
+    if wasm_plugins.plugin_count() > 0 {
+        let wasm_req_ctx = crate::wasm::WasmRequestContext {
+            method: method_str.clone(),
+            path: path.clone(),
+            query: query_str.clone(),
+            headers: req
+                .headers()
+                .iter()
+                .filter_map(|(k, v)| v.to_str().ok().map(|v| (k.to_string(), v.to_string())))
+                .collect(),
+            body: None,
+            client_ip: ip_str.clone(),
+            protocol: if is_grpc { "grpc".to_string() } else { "h2".to_string() },
+        };
+        let result = wasm_plugins.execute_request_headers(&wasm_req_ctx);
+        if let Some(direct) = result.direct_response {
+            let sc = hyper::StatusCode::from_u16(direct.status_code)
+                .unwrap_or(hyper::StatusCode::INTERNAL_SERVER_ERROR);
+            return Ok(Response::builder()
+                .status(sc)
+                .body(Full::new(Bytes::from(direct.body)).map_err(|never| match never {}).boxed())
+                .unwrap());
+        }
+        if let Some(hdrs) = result.headers {
+            for (k, v) in hdrs {
+                if let (Ok(hk), Ok(hv)) = (
+                    hyper::header::HeaderName::from_bytes(k.as_bytes()),
+                    hyper::header::HeaderValue::from_str(&v),
+                ) {
+                    req.headers_mut().insert(hk, hv);
+                }
+            }
+        }
+    }
+
+    // ── Step 3: PreRoute Hooks ──
+    if hook_engine.has_hooks(crate::scripting::HookPhase::PreRoute) {
+        let hook_ctx = crate::scripting::HookContext {
+            client_ip: ip_str.clone(),
+            method: method_str.clone(),
+            path: path.clone(),
+            query: req.uri().query().map(str::to_string),
+            headers: req
+                .headers()
+                .iter()
+                .filter_map(|(k, v)| v.to_str().ok().map(|v| (k.to_string(), v.to_string())))
+                .collect(),
+            status: None,
+            response_headers: Default::default(),
+        };
+        for result in hook_engine.execute(crate::scripting::HookPhase::PreRoute, &hook_ctx) {
+            match result {
+                crate::scripting::HookResult::Respond { status, body, .. } => {
+                    let sc = hyper::StatusCode::from_u16(status)
+                        .unwrap_or(hyper::StatusCode::INTERNAL_SERVER_ERROR);
+                    return Ok(Response::builder()
+                        .status(sc)
+                        .body(Full::new(Bytes::from(body)).map_err(|never| match never {}).boxed())
+                        .unwrap());
+                }
+                crate::scripting::HookResult::RewritePath(new_path) => {
+                    path = new_path;
+                }
+                crate::scripting::HookResult::SetHeaders(hdrs) => {
+                    for (k, v) in hdrs {
+                        if let (Ok(hk), Ok(hv)) = (
+                            hyper::header::HeaderName::from_bytes(k.as_bytes()),
+                            hyper::header::HeaderValue::from_str(&v),
+                        ) {
+                            req.headers_mut().insert(hk, hv);
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    // ── Step 4: WAF + CAPTCHA ──
     let waf_enabled = app_config.waf_enabled.unwrap_or(false);
+    if let Some(manager) = captcha_manager.as_ref() {
+        match manager.evaluate(&ip_str, user_agent_str.as_deref().unwrap_or("")) {
+            crate::waf::bot::CaptchaAction::Allow => {}
+            crate::waf::bot::CaptchaAction::Block => {
+                metrics
+                    .waf_blocks_total
+                    .with_label_values(&["captcha_bot_block"])
+                    .inc();
+                return Ok(empty_response(hyper::StatusCode::FORBIDDEN));
+            }
+            crate::waf::bot::CaptchaAction::Challenge => {
+                let return_to = build_return_to(&path, query_str.as_deref());
+                return Ok(html_response(
+                    hyper::StatusCode::FORBIDDEN,
+                    manager.challenge_html_for(&ip_str, &return_to),
+                ));
+            }
+        }
+    }
     if waf_enabled {
-        if let crate::waf::WafAction::Block(reason) = waf.inspect(&ip_str, &path, query, user_agent)
+        if let crate::waf::WafAction::Block(reason) = waf.inspect(&ip_str, &path, query_str.as_deref(), user_agent_str.as_deref())
         {
             warn!("WAF blocked HTTP/2 request from {}: {}", ip_str, reason);
             metrics.waf_blocks_total.with_label_values(&[&reason]).inc();
@@ -1656,25 +2650,16 @@ async fn handle_http2_request(
         }
     }
 
-    let (parts, body) = req.into_parts();
-    let body_bytes = match body.collect().await {
-        Ok(collected) => collected.to_bytes(),
-        Err(e) => {
-            error!("Failed to read HTTP/2 request body: {}", e);
-            return Ok(empty_response(hyper::StatusCode::BAD_REQUEST));
-        }
-    };
-    if waf_enabled && !body_bytes.is_empty() {
-        let body_text = String::from_utf8_lossy(&body_bytes);
-        if let crate::waf::WafAction::Block(reason) = waf.inspect_body(&ip_str, &body_text) {
-            warn!(
-                "WAF blocked HTTP/2 request body from {}: {}",
-                ip_str, reason
-            );
-            return Ok(empty_response(hyper::StatusCode::FORBIDDEN));
+    // ── Step 5: GeoIP Country Check ──
+    if let Some(ref db) = *geo_db {
+        if let Some(geo_result) = db.lookup(&real_ip) {
+            if !geo_policy.is_allowed(&geo_result.country_code) {
+                warn!("GeoIP blocked HTTP/2 request from {} (country: {})", ip_str, geo_result.country_code);
+                return Ok(empty_response(hyper::StatusCode::FORBIDDEN));
+            }
+            crate::geo::inject_geo_headers(req.headers_mut(), &geo_result);
         }
     }
-    let mut req = Request::from_parts(parts, Full::new(body_bytes));
 
     // ── Rewrite Engine (parity with HTTP/1) ──
     'rewrite: loop {
@@ -1688,7 +2673,13 @@ async fn handle_http2_request(
         }
         if let Some((_r_path, r_config)) = best_match {
             if !r_config.rewrite_rules.is_empty() {
-                let rules = compile_rules(&r_config.rewrite_rules);
+                let rules = match compile_rules(&r_config.rewrite_rules) {
+                    Ok(rules) => rules,
+                    Err(e) => {
+                        error!("Invalid rewrite rule configuration: {}", e);
+                        return Ok(empty_response(hyper::StatusCode::INTERNAL_SERVER_ERROR));
+                    }
+                };
                 match apply_rewrites(&rules, &path) {
                     RewriteResult::Redirect { status, location } => {
                         let mut resp = Response::new(
@@ -1724,7 +2715,30 @@ async fn handle_http2_request(
         break 'rewrite;
     }
 
-    // 1. Prefix path routing
+    // 1. Prefix path routing (with K8s Ingress route fallback)
+    let k8s_pool_override: Option<String> = if let Some(ref ctrl) = *k8s_controller {
+        let host_header = req
+            .headers()
+            .get(hyper::header::HOST)
+            .and_then(|h| h.to_str().ok())
+            .unwrap_or("")
+            .split(':')
+            .next()
+            .unwrap_or("");
+        let k8s_routes = ctrl.get_routes_for_host(host_header);
+        let mut best: Option<&crate::k8s::PhalanxRoute> = None;
+        let mut best_len = 0usize;
+        for kr in &k8s_routes {
+            if path.starts_with(&kr.path) && kr.path.len() > best_len {
+                best = Some(kr);
+                best_len = kr.path.len();
+            }
+        }
+        best.map(|kr| kr.upstream_pool.clone())
+    } else {
+        None
+    };
+
     let route = {
         let mut best_match = None;
         let mut best_len = 0;
@@ -1736,6 +2750,65 @@ async fn handle_http2_request(
         }
         best_match.or_else(|| app_config.routes.get_key_value("/"))
     };
+
+    // ── CORS Middleware (parity with HTTP/1) ──
+    if let Some((_r_path, r_config)) = route {
+        if r_config.cors_enabled {
+            let origin = req
+                .headers()
+                .get("origin")
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_string);
+
+            let is_origin_allowed = if let Some(ref orig) = origin {
+                r_config.cors_allowed_origins.is_empty()
+                    || r_config.cors_allowed_origins.iter().any(|o| o == orig)
+            } else {
+                false
+            };
+
+            if req.method() == hyper::Method::OPTIONS && is_origin_allowed {
+                let allowed_origin = if r_config.cors_allowed_origins.is_empty() {
+                    "*".to_string()
+                } else {
+                    origin.clone().unwrap_or_default()
+                };
+                let methods_str = r_config.cors_allowed_methods.join(", ");
+                let headers_str = r_config.cors_allowed_headers.join(", ");
+                let max_age_str = r_config.cors_max_age_secs.to_string();
+
+                let mut resp = Response::new(
+                    http_body_util::Empty::new()
+                        .map_err(|never| match never {})
+                        .boxed(),
+                );
+                *resp.status_mut() = hyper::StatusCode::NO_CONTENT;
+                resp.headers_mut().insert(
+                    "access-control-allow-origin",
+                    allowed_origin.parse().unwrap(),
+                );
+                resp.headers_mut().insert(
+                    "access-control-allow-methods",
+                    methods_str.parse().unwrap(),
+                );
+                resp.headers_mut().insert(
+                    "access-control-allow-headers",
+                    headers_str.parse().unwrap(),
+                );
+                resp.headers_mut().insert(
+                    "access-control-max-age",
+                    max_age_str.parse().unwrap(),
+                );
+                if r_config.cors_allow_credentials {
+                    resp.headers_mut().insert(
+                        "access-control-allow-credentials",
+                        "true".parse().unwrap(),
+                    );
+                }
+                return Ok(resp);
+            }
+        }
+    }
 
     // ── Authentication Middleware (parity with HTTP/1) ──
     if let Some((_r_path, r_config)) = route {
@@ -1900,6 +2973,19 @@ async fn handle_http2_request(
             match result {
                 AuthResult::Allowed => {
                     if let Some(s) = session {
+                        if let Some(ref issuer) = r_config.auth_oidc_issuer {
+                            if !crate::auth::oidc::session_matches_issuer(&s, issuer) {
+                                let mut resp = Response::new(
+                                    http_body_util::Full::new(Bytes::from(
+                                        "OIDC issuer mismatch",
+                                    ))
+                                    .map_err(|_| unreachable!())
+                                    .boxed(),
+                                );
+                                *resp.status_mut() = hyper::StatusCode::UNAUTHORIZED;
+                                return Ok(resp);
+                            }
+                        }
                         if let Ok(val) = s.sub.parse::<hyper::header::HeaderValue>() {
                             req.headers_mut().insert(
                                 hyper::header::HeaderName::from_static("x-auth-sub"), val);
@@ -1913,7 +2999,7 @@ async fn handle_http2_request(
                     }
                 }
                 AuthResult::Denied(status, msg) => {
-                    if let Some(ref _issuer) = r_config.auth_oidc_issuer {
+                    if r_config.auth_oidc_issuer.is_some() {
                         let mut resp = Response::new(
                             http_body_util::Full::new(Bytes::from("Authentication required"))
                                 .map_err(|_| unreachable!())
@@ -1932,26 +3018,144 @@ async fn handle_http2_request(
                 }
             }
         }
+        // 6. auth_request subrequest (nginx-style external auth)
+        else if let Some(ref auth_url) = r_config.auth_request_url {
+            let (result, auth_headers) =
+                crate::auth::auth_request::check(req.headers(), auth_url, &method_str, &path).await;
+            match result {
+                AuthResult::Allowed => {
+                    for (k, v) in auth_headers {
+                        if let (Ok(name), Ok(val)) = (
+                            hyper::header::HeaderName::from_bytes(k.as_bytes()),
+                            v.parse::<hyper::header::HeaderValue>(),
+                        ) {
+                            req.headers_mut().insert(name, val);
+                        }
+                    }
+                }
+                AuthResult::Denied(status, msg) => {
+                    debug!("auth_request denied from {}: {}", ip_str, msg);
+                    let mut resp = Response::new(
+                        http_body_util::Full::new(Bytes::from(msg))
+                            .map_err(|_| unreachable!())
+                            .boxed(),
+                    );
+                    *resp.status_mut() = status;
+                    return Ok(resp);
+                }
+            }
+        }
+        // 7. Global auth_request fallback
+        else if let Some(ref auth_url) = app_config.auth_request_url {
+            let (result, auth_headers) =
+                crate::auth::auth_request::check(req.headers(), auth_url, &method_str, &path).await;
+            match result {
+                AuthResult::Allowed => {
+                    for (k, v) in auth_headers {
+                        if let (Ok(name), Ok(val)) = (
+                            hyper::header::HeaderName::from_bytes(k.as_bytes()),
+                            v.parse::<hyper::header::HeaderValue>(),
+                        ) {
+                            req.headers_mut().insert(name, val);
+                        }
+                    }
+                }
+                AuthResult::Denied(status, msg) => {
+                    debug!("auth_request denied from {}: {}", ip_str, msg);
+                    let mut resp = Response::new(
+                        http_body_util::Full::new(Bytes::from(msg))
+                            .map_err(|_| unreachable!())
+                            .boxed(),
+                    );
+                    *resp.status_mut() = status;
+                    return Ok(resp);
+                }
+            }
+        }
     }
+
+    // ── Body Size Limit Check (HTTP/2) ────────────────────────────────────────
+    let h2_max_body = {
+        let route_limit = route.map(|(_, r)| r.client_max_body_size).unwrap_or(0);
+        if route_limit > 0 { route_limit } else { app_config.client_max_body_size }
+    };
+    if h2_max_body > 0 {
+        if let Some(cl) = req.headers().get(hyper::header::CONTENT_LENGTH) {
+            if let Ok(len) = cl.to_str().unwrap_or("0").parse::<usize>() {
+                if len > h2_max_body {
+                    warn!("HTTP/2 request body too large from {}: {} > {} bytes", ip_str, len, h2_max_body);
+                    return Ok(empty_response(hyper::StatusCode::PAYLOAD_TOO_LARGE));
+                }
+            }
+        }
+    }
+
+    let route_has_mirror = route
+        .and_then(|(_, r)| r.mirror_pool.as_ref())
+        .is_some()
+        || app_config.mirror_pool.is_some();
+    let should_buffer_request_body = waf_enabled
+        || route_has_mirror
+        || app_config.ml_fraud_model_path.is_some();
+    let (parts, body) = req.into_parts();
+    let mirror_req_headers = parts.headers.clone();
+    let mirror_req_uri = parts.uri.to_string();
+    let mirror_req_method = parts.method.to_string();
+    let mut mirror_req_body = Bytes::new();
+    let mut req = if should_buffer_request_body {
+        let body_bytes = match body.collect().await {
+            Ok(collected) => collected.to_bytes(),
+            Err(e) => {
+                error!("Failed to read HTTP/2 request body: {}", e);
+                return Ok(empty_response(hyper::StatusCode::BAD_REQUEST));
+            }
+        };
+        if !body_bytes.is_empty() {
+            let body_text = String::from_utf8_lossy(&body_bytes);
+            if let crate::waf::WafAction::Block(reason) = waf.inspect_body(&ip_str, &body_text) {
+                warn!(
+                    "WAF blocked HTTP/2 request body from {}: {}",
+                    ip_str, reason
+                );
+                metrics.waf_blocks_total.with_label_values(&[&reason]).inc();
+                return Ok(empty_response(hyper::StatusCode::FORBIDDEN));
+            }
+        }
+        mirror_req_body = body_bytes.clone();
+        Request::from_parts(
+            parts,
+            Full::new(body_bytes)
+                .map_err(|never| match never {})
+                .boxed(),
+        )
+    } else {
+        Request::from_parts(parts, body.map_err(|e| e).boxed())
+    };
 
     let host = req
         .headers()
         .get(hyper::header::HOST)
         .and_then(|h| h.to_str().ok())
-        .unwrap_or("default");
-    let host_name = host.split(':').next().unwrap_or("default");
+        .unwrap_or("default")
+        .to_string();
+    let host_name = host.split(':').next().unwrap_or("default").to_string();
 
-    // ── Resolve gzip + cache flags from matched route config ──
-    let (route_gzip, route_gzip_min, route_cache, route_cache_ttl) = match route {
+    // ── Resolve gzip + brotli + cache + mirror flags from matched route config ──
+    let (route_gzip, route_gzip_min, route_cache, route_cache_ttl, route_brotli, route_mirror) = match route {
         Some((_, r)) => (
             r.gzip,
             r.gzip_min_length,
             r.proxy_cache,
             r.proxy_cache_valid_secs,
+            r.brotli,
+            r.mirror_pool.clone(),
         ),
-        None => (false, 1024, false, 60),
+        None => (false, 1024, false, 60, false, None),
     };
     let accepts_gzip = client_accepts_gzip && route_gzip;
+    let accepts_brotli = client_accepts_brotli && (route_brotli || app_config.brotli_enabled);
+    // Mirror pool: route-level overrides global
+    let mirror_pool = route_mirror.or_else(|| app_config.mirror_pool.clone());
 
     let pool_name = match route {
         Some((r_path, r)) => {
@@ -1966,16 +3170,7 @@ async fn handle_http2_request(
                     &ip_str,
                 )
                 .await;
-                return res.map(|r| {
-                    r.map(|b| {
-                        b.map_err(|_e| {
-                            panic!(
-                                "hyper::Error conversion bypassed on static stream read failure"
-                            );
-                        })
-                        .boxed()
-                    })
-                });
+                return res;
             }
 
             if let Some(ref fastcgi_pass) = r.fastcgi_pass {
@@ -1989,14 +3184,7 @@ async fn handle_http2_request(
                     &ip_str,
                 )
                 .await;
-                return res.map(|r| {
-                    r.map(|b| {
-                        b.map_err(|_e| {
-                            panic!("hyper::Error conversion bypassed on proxy stream failure");
-                        })
-                        .boxed()
-                    })
-                });
+                return res;
             }
 
             if let Some(ref uwsgi_pass) = r.uwsgi_pass {
@@ -2010,14 +3198,7 @@ async fn handle_http2_request(
                     &ip_str,
                 )
                 .await;
-                return res.map(|r| {
-                    r.map(|b| {
-                        b.map_err(|_e| {
-                            panic!("hyper::Error conversion bypassed on proxy stream failure");
-                        })
-                        .boxed()
-                    })
-                });
+                return res;
             }
 
             r.upstream.clone().unwrap_or_else(|| host_name.to_string())
@@ -2025,10 +3206,73 @@ async fn handle_http2_request(
         None => host_name.to_string(),
     };
 
+    // K8s Ingress route override
+    let pool_name = k8s_pool_override.unwrap_or(pool_name);
+
+    // GSLB override: geographic pool selection
+    let pool_name = if let Some(ref router) = *gslb_router {
+        let country_code = req
+            .headers()
+            .get("x-geo-country-code")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        if !country_code.is_empty() {
+            router.route(country_code).unwrap_or(pool_name)
+        } else {
+            pool_name
+        }
+    } else {
+        pool_name
+    };
+
+    // ── PreUpstream Hooks ──
+    if hook_engine.has_hooks(crate::scripting::HookPhase::PreUpstream) {
+        let hook_ctx = crate::scripting::HookContext {
+            client_ip: ip_str.clone(),
+            method: method_str.clone(),
+            path: path.clone(),
+            query: req.uri().query().map(str::to_string),
+            headers: req
+                .headers()
+                .iter()
+                .filter_map(|(k, v)| v.to_str().ok().map(|v| (k.to_string(), v.to_string())))
+                .collect(),
+            status: None,
+            response_headers: Default::default(),
+        };
+        for result in hook_engine.execute(crate::scripting::HookPhase::PreUpstream, &hook_ctx) {
+            match result {
+                crate::scripting::HookResult::Respond { status, body, .. } => {
+                    let sc = hyper::StatusCode::from_u16(status)
+                        .unwrap_or(hyper::StatusCode::INTERNAL_SERVER_ERROR);
+                    return Ok(Response::builder()
+                        .status(sc)
+                        .body(
+                            Full::new(Bytes::from(body))
+                                .map_err(|never| match never {})
+                                .boxed(),
+                        )
+                        .unwrap());
+                }
+                crate::scripting::HookResult::SetHeaders(hdrs) => {
+                    for (k, v) in hdrs {
+                        if let (Ok(hk), Ok(hv)) = (
+                            hyper::header::HeaderName::from_bytes(k.as_bytes()),
+                            hyper::header::HeaderValue::from_str(&v),
+                        ) {
+                            req.headers_mut().insert(hk, hv);
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
     // ── Response Cache: lookup for GET requests ──
     let is_get = method_str == "GET";
     let cache_key = if route_cache && is_get {
-        let ck = build_cache_key("GET", host_name, &path, req.uri().query(), &[]);
+        let ck = build_cache_key("GET", &host_name, &path, req.uri().query(), &[]);
         if let Some(cached) = cache.get(&ck).await {
             debug!("H2 Cache HIT for {}", ck);
             metrics.cache_hits_total.with_label_values(&["hit"]).inc();
@@ -2056,20 +3300,58 @@ async fn handle_http2_request(
         None
     };
 
-    // 2. Fetch healthy backend from pool manager
+    // 2. Fetch healthy backend from pool manager, respecting sticky session preference
     let pool = upstreams
         .get_pool(pool_name.as_str())
         .or_else(|| upstreams.get_pool("default"));
 
-    let backend = match pool {
-        Some(p) => match p.get_next_backend(Some(&_peer.ip()), Some(Arc::clone(&ai_engine))) {
+    let backend = {
+        let p = match &pool {
+            Some(p) => p,
+            None => return Ok(empty_response(hyper::StatusCode::NOT_FOUND)),
+        };
+        // Sticky session: look up preferred backend from request cookie
+        let sticky_preferred = if let Some(ref mgr) = *sticky {
+            let cookie_hdr = req
+                .headers()
+                .get(hyper::header::COOKIE)
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("");
+            mgr.extract_from_cookie(cookie_hdr)
+                .and_then(|key| match mgr.mode() {
+                    crate::proxy::sticky::StickyMode::Cookie { .. } => {
+                        crate::proxy::sticky::base64_decode_addr(&key)
+                    }
+                    _ => mgr.lookup(&key),
+                })
+                .and_then(|addr| {
+                    p.backends
+                        .load()
+                        .iter()
+                        .find(|b| {
+                            b.config.address == addr
+                                && b.is_healthy.load(Ordering::Acquire)
+                        })
+                        .cloned()
+                })
+        } else {
+            None
+        };
+        match sticky_preferred
+            .or_else(|| p.get_next_backend(Some(&_peer.ip()), Some(Arc::clone(&ai_engine))))
+        {
             Some(b) => b,
-            None => return Ok(empty_response(hyper::StatusCode::BAD_GATEWAY)),
-        },
-        None => return Ok(empty_response(hyper::StatusCode::NOT_FOUND)),
+            None => return Ok(error_response(
+                hyper::StatusCode::BAD_GATEWAY,
+                "No healthy backends available",
+                &req_trace_id,
+                req_accepts_json,
+            )),
+        }
     };
 
-    // 3. Request Header Injection Phase (from config)
+    // 3. Request Header Injection Phase (from config) + forwarding headers
+    realip::inject_forwarding_headers(req.headers_mut(), &real_ip, false);
     if let Some((_, r)) = route {
         for (k, v) in &r.add_headers {
             if let (Ok(hk), Ok(hv)) = (
@@ -2080,19 +3362,44 @@ async fn handle_http2_request(
             }
         }
     }
+    let (trace_id, span_id) = generate_trace_context_ids();
+    crate::telemetry::otel::inject_trace_context(req.headers_mut(), &trace_id, &span_id, true);
 
-    // 4. Forward the request to physical backend IP
+    // ── Resolve timeout settings: route -> global -> hardcoded defaults ──
+    let h2_connect_timeout = std::time::Duration::from_secs({
+        let rt = route.map(|(_, r)| r.proxy_connect_timeout_secs).unwrap_or(0);
+        if rt > 0 { rt } else if app_config.proxy_connect_timeout_secs > 0 { app_config.proxy_connect_timeout_secs } else { 10 }
+    });
+    let h2_read_timeout = std::time::Duration::from_secs({
+        let rt = route.map(|(_, r)| r.proxy_read_timeout_secs).unwrap_or(0);
+        if rt > 0 { rt } else if app_config.proxy_read_timeout_secs > 0 { app_config.proxy_read_timeout_secs } else { 60 }
+    });
+
+    // 4. Forward the request to physical backend IP (with connect + read timeouts)
     backend.active_connections.fetch_add(1, Ordering::Relaxed);
+    metrics.active_connections.inc();
+    let Some(pool_ref) = pool.as_ref() else {
+        error!("Upstream pool unexpectedly missing after backend selection");
+        backend.active_connections.fetch_sub(1, Ordering::Relaxed);
+        metrics.active_connections.dec();
+        return Ok(error_response(hyper::StatusCode::BAD_GATEWAY, "Upstream pool configuration error", &req_trace_id, req_accepts_json));
+    };
+    let pool_ref = Arc::clone(pool_ref);
 
-    let stream = match TcpStream::connect(&backend.config.address).await {
-        Ok(s) => s,
-        Err(e) => {
-            error!(
-                "Failed to connect to backend {}: {}",
-                backend.config.address, e
-            );
+    let stream = match tokio::time::timeout(h2_connect_timeout, pool_ref.connection_pool.acquire(&backend.config.address)).await {
+        Ok(Ok(s)) => s,
+        Ok(Err(e)) => {
+            error!("Failed to connect to backend {}: {}", backend.config.address, e);
+            metrics.backend_errors_total.with_label_values(&[&backend.config.address, &pool_name, &"connect".to_string()]).inc();
             backend.active_connections.fetch_sub(1, Ordering::Relaxed);
-            return Ok(empty_response(hyper::StatusCode::SERVICE_UNAVAILABLE));
+            return Ok(error_response(hyper::StatusCode::SERVICE_UNAVAILABLE, "Failed to connect to backend", &req_trace_id, req_accepts_json));
+        }
+        Err(_) => {
+            warn!("Connect timeout to backend {} after {:?}", backend.config.address, h2_connect_timeout);
+            metrics.backend_errors_total.with_label_values(&[&backend.config.address, &pool_name, &"timeout".to_string()]).inc();
+            backend.active_connections.fetch_sub(1, Ordering::Relaxed);
+            backend.record_failure();
+            return Ok(error_response(hyper::StatusCode::GATEWAY_TIMEOUT, "Backend connect timeout", &req_trace_id, req_accepts_json));
         }
     };
 
@@ -2102,12 +3409,10 @@ async fn handle_http2_request(
         match hyper::client::conn::http2::handshake(executor::TokioExecutor, io).await {
             Ok(handshake) => handshake,
             Err(e) => {
-                error!(
-                    "HTTP/2 Handshake failed with backend {}: {}",
-                    backend.config.address, e
-                );
+                error!("HTTP/2 Handshake failed with backend {}: {}", backend.config.address, e);
+                metrics.backend_errors_total.with_label_values(&[&backend.config.address, &pool_name, &"handshake".to_string()]).inc();
                 backend.active_connections.fetch_sub(1, Ordering::Relaxed);
-                return Ok(empty_response(hyper::StatusCode::SERVICE_UNAVAILABLE));
+                return Ok(error_response(hyper::StatusCode::SERVICE_UNAVAILABLE, "HTTP/2 handshake failed with backend", &req_trace_id, req_accepts_json));
             }
         };
 
@@ -2117,7 +3422,15 @@ async fn handle_http2_request(
         }
     });
 
-    let res = sender.send_request(req).await;
+    let res = match tokio::time::timeout(h2_read_timeout, sender.send_request(req)).await {
+        Ok(r) => r,
+        Err(_) => {
+            warn!("Read timeout from backend {} after {:?}", backend.config.address, h2_read_timeout);
+            backend.record_failure();
+            backend.active_connections.fetch_sub(1, Ordering::Relaxed);
+            return Ok(error_response(hyper::StatusCode::GATEWAY_TIMEOUT, "Backend read timeout", &req_trace_id, req_accepts_json));
+        }
+    };
     backend.active_connections.fetch_sub(1, Ordering::Relaxed);
 
     let backend_addr = backend.config.address.clone();
@@ -2156,6 +3469,30 @@ async fn handle_http2_request(
                 .with_label_values(&[method_str.as_str(), &pool_name])
                 .observe(start_time.elapsed().as_secs_f64());
 
+            // Per-backend metrics
+            metrics
+                .backend_request_duration
+                .with_label_values(&[&backend_addr, &pool_name])
+                .observe(start_time.elapsed().as_secs_f64());
+            if response.status().is_server_error() {
+                metrics
+                    .backend_errors_total
+                    .with_label_values(&[&backend_addr, &pool_name, &"5xx".to_string()])
+                    .inc();
+            }
+
+            // HSTS header injection
+            if let Some(max_age) = app_config.hsts_max_age {
+                if let Ok(hv) = hyper::header::HeaderValue::from_str(
+                    &format!("max-age={}", max_age),
+                ) {
+                    response.headers_mut().insert(
+                        hyper::header::STRICT_TRANSPORT_SECURITY,
+                        hv,
+                    );
+                }
+            }
+
             // 5. Response Header Injection Phase
             if let Some((_, r)) = route {
                 for (k, v) in &r.add_headers {
@@ -2164,6 +3501,28 @@ async fn handle_http2_request(
                         hyper::header::HeaderValue::from_str(v),
                     ) {
                         response.headers_mut().insert(hk, hv);
+                    }
+                }
+
+                // 5b. CORS response headers (parity with HTTP/1)
+                if r.cors_enabled {
+                    let cors_origin = if r.cors_allowed_origins.is_empty() {
+                        "*".to_string()
+                    } else if let Some(first) = r.cors_allowed_origins.first() {
+                        first.clone()
+                    } else {
+                        "*".to_string()
+                    };
+                    if let Ok(hv) = cors_origin.parse::<hyper::header::HeaderValue>() {
+                        response
+                            .headers_mut()
+                            .insert("access-control-allow-origin", hv);
+                    }
+                    if r.cors_allow_credentials {
+                        response.headers_mut().insert(
+                            "access-control-allow-credentials",
+                            "true".parse().unwrap(),
+                        );
                     }
                 }
             }
@@ -2211,15 +3570,37 @@ async fn handle_http2_request(
                 }
             }
 
-            // ── Compression ──
-            let (final_body, is_compressed) = if should_compress {
+            // ── Traffic Mirroring: fire-and-forget copy to shadow pool (parity with HTTP/1) ──
+            if let Some(ref mp_name) = mirror_pool {
+                mirror::mirror_request(
+                    &mirror_req_method,
+                    &mirror_req_uri,
+                    mirror_req_headers,
+                    mirror_req_body,
+                    mp_name.clone(),
+                    Arc::clone(&upstreams),
+                );
+            }
+
+            // ── Compression: prefer Brotli > Gzip (parity with HTTP/1) ──
+            let should_brotli = accepts_brotli
+                && compression::is_compressible(Some(&content_type))
+                && body_len >= crate::middleware::brotli::MIN_BROTLI_SIZE;
+
+            let (final_body, content_encoding) = if should_brotli {
+                match crate::middleware::brotli::brotli_compress(&body_bytes, 6) {
+                    Some(compressed) => (compressed, "br"),
+                    None => (body_bytes, ""),
+                }
+            } else if should_compress {
                 match compression::gzip_compress(&body_bytes) {
-                    Some(compressed) => (compressed, true),
-                    None => (body_bytes, false),
+                    Some(compressed) => (compressed, "gzip"),
+                    None => (body_bytes, ""),
                 }
             } else {
-                (body_bytes, false)
+                (body_bytes, "")
             };
+            let is_compressed = !content_encoding.is_empty();
 
             let mut final_resp = Response::builder()
                 .status(status_code)
@@ -2237,7 +3618,7 @@ async fn handle_http2_request(
             if is_compressed {
                 final_resp.headers_mut().insert(
                     hyper::header::CONTENT_ENCODING,
-                    hyper::header::HeaderValue::from_static("gzip"),
+                    hyper::header::HeaderValue::from_static(content_encoding),
                 );
                 final_resp.headers_mut().insert(
                     hyper::header::HeaderName::from_static("vary"),
@@ -2248,15 +3629,71 @@ async fn handle_http2_request(
                     .remove(hyper::header::CONTENT_LENGTH);
             }
 
+            // Sticky session cookie (parity with HTTP/1)
+            if let Some(ref mgr) = *sticky {
+                match mgr.mode() {
+                    crate::proxy::sticky::StickyMode::Cookie { .. } => {
+                        if let Some(cookie_val) = mgr.set_cookie_header(&backend_addr) {
+                            if let Ok(hv) = hyper::header::HeaderValue::from_str(&cookie_val) {
+                                final_resp.headers_mut().insert(hyper::header::SET_COOKIE, hv);
+                            }
+                        }
+                    }
+                    crate::proxy::sticky::StickyMode::Learn { .. } => {
+                        if let Some(session_key) =
+                            mgr.extract_from_response_header(final_resp.headers())
+                        {
+                            mgr.learn(session_key, backend_addr.clone());
+                        }
+                    }
+                    _ => {}
+                }
+            }
+
+            // Bandwidth tracking
+            let bw_proto = if is_grpc { "grpc" } else { "http2" };
+            let bw_stats = bandwidth.protocol(bw_proto);
+            bw_stats.inc_requests();
+            bw_stats.add_out(body_len as u64);
+
+            // Per-pool bandwidth tracking
+            let pool_bw = bandwidth.pool(&pool_name);
+            pool_bw.inc_requests();
+            pool_bw.add_out(body_len as u64);
+
+            // Wasm OnResponseHeaders
+            if wasm_plugins.plugin_count() > 0 {
+                let wasm_resp_ctx = crate::wasm::WasmResponseContext {
+                    status_code,
+                    headers: final_resp
+                        .headers()
+                        .iter()
+                        .filter_map(|(k, v)| v.to_str().ok().map(|v| (k.to_string(), v.to_string())))
+                        .collect(),
+                    body: None,
+                };
+                let result = wasm_plugins.execute_response_headers(&wasm_resp_ctx);
+                if let Some(hdrs) = result.headers {
+                    for (k, v) in hdrs {
+                        if let (Ok(hk), Ok(hv)) = (
+                            hyper::header::HeaderName::from_bytes(k.as_bytes()),
+                            hyper::header::HeaderValue::from_str(&v),
+                        ) {
+                            final_resp.headers_mut().insert(hk, hv);
+                        }
+                    }
+                }
+            }
+
             access_logger.log(AccessLogEntry {
                 timestamp: chrono_timestamp(),
-                client_ip: ip_str,
+                client_ip: ip_str.clone(),
                 method: if is_grpc {
                     format!("gRPC:{}", method_str)
                 } else {
-                    method_str
+                    method_str.clone()
                 },
-                path,
+                path: path.clone(),
                 status: status_code,
                 latency_ms: latency,
                 backend: backend_addr,
@@ -2264,12 +3701,31 @@ async fn handle_http2_request(
                 bytes_sent: body_len as u64,
                 referer: String::new(),
                 user_agent: String::new(),
+                trace_id: req_trace_id.clone(),
             });
+
+            // Log hook (parity with HTTP/1)
+            if hook_engine.has_hooks(crate::scripting::HookPhase::Log) {
+                let log_ctx = crate::scripting::HookContext {
+                    client_ip: ip_str,
+                    method: method_str,
+                    path,
+                    query: None,
+                    headers: Default::default(),
+                    status: Some(status_code),
+                    response_headers: Default::default(),
+                };
+                hook_engine.execute(crate::scripting::HookPhase::Log, &log_ctx);
+            }
 
             Ok(final_resp)
         }
         Err(e) => {
             error!("Failed to proxy request to backend {}: {}", backend_addr, e);
+            backend.record_failure();
+            metrics.backend_errors_total
+                .with_label_values(&[&backend_addr, &pool_name, &"proxy".to_string()])
+                .inc();
 
             access_logger.log(AccessLogEntry {
                 timestamp: chrono_timestamp(),
@@ -2283,14 +3739,28 @@ async fn handle_http2_request(
                 bytes_sent: 0,
                 referer: String::new(),
                 user_agent: String::new(),
+                trace_id: req_trace_id.clone(),
             });
-            backend.record_failure();
 
-            Ok(empty_response(hyper::StatusCode::BAD_GATEWAY))
+            Ok(error_response(
+                hyper::StatusCode::BAD_GATEWAY,
+                "Failed to proxy request to backend",
+                &req_trace_id,
+                req_accepts_json,
+            ))
         }
     }
 }
 
+// ── OpenTelemetry Trace Context Helpers ──────────────────────────────────────
+
+/// Generates random W3C Trace Context IDs for distributed tracing.
+///
+/// Returns `(trace_id, span_id)` where:
+/// - `trace_id` is a 32-character hex string (128-bit random).
+/// - `span_id` is a 16-character hex string (64-bit random).
+///
+/// These are injected into the `traceparent` header on upstream requests.
 fn generate_trace_context_ids() -> (String, String) {
     let mut trace = [0u8; 16];
     let mut span = [0u8; 8];
@@ -2302,7 +3772,10 @@ fn generate_trace_context_ids() -> (String, String) {
     (trace_id, span_id)
 }
 
-/// Helper for access logs (shared across proxy handlers)
+/// Generates an ISO-8601-ish timestamp string for access log entries.
+///
+/// Format: `{unix_seconds}.{milliseconds}Z` (e.g. `"1712505600.042Z"`).
+/// Uses `SystemTime` rather than chrono to avoid the dependency.
 pub fn chrono_timestamp() -> String {
     use std::time::SystemTime;
     let now = SystemTime::now()
@@ -2311,7 +3784,16 @@ pub fn chrono_timestamp() -> String {
     format!("{}.{:03}Z", now.as_secs(), now.subsec_millis())
 }
 
-/// Helper to safely resolve a path against a base directory to prevent Directory Traversal
+/// Safely resolves a requested path against a base directory, preventing
+/// directory traversal attacks (e.g. `../../etc/passwd`).
+///
+/// # Algorithm
+/// 1. Strip the leading `/` and query string from `requested`.
+/// 2. Join with `base` to form the candidate path.
+/// 3. Canonicalize (resolves symlinks and `..` segments).
+/// 4. Verify the canonical path still starts with the canonical `base`.
+///
+/// Returns `None` if the file does not exist or the path escapes the base.
 fn sanitize_path(base: &std::path::Path, requested: &str) -> Option<std::path::PathBuf> {
     // Remove leading slash and query params
     let req_path = requested
@@ -2335,19 +3817,27 @@ fn sanitize_path(base: &std::path::Path, requested: &str) -> Option<std::path::P
     }
 }
 
-/// Helper for empty std::io::Error responses
-fn empty_io_response(status: hyper::StatusCode) -> Response<BoxBody<Bytes, std::io::Error>> {
-    Response::builder()
-        .status(status)
-        .body(
-            http_body_util::Empty::<Bytes>::new()
-                .map_err(|never| match never {})
-                .boxed(),
-        )
-        .unwrap()
-}
+// ── Static File Server ──────────────────────────────────────────────────────
 
-/// Asynchronously streams a file from disk directly to the TCP socket using Tokio.
+/// Serves a static file from disk, streaming it directly to the client.
+///
+/// Supports `GET` and `HEAD` methods only. If the path resolves to a
+/// directory, it automatically tries to serve `index.html` within it.
+///
+/// # Arguments
+///
+/// * `route_path`    - The matched route prefix (stripped from `req_path`).
+/// * `req_path`      - The full request URI path.
+/// * `root_dir`      - Filesystem root directory for this route.
+/// * `_req`          - The HTTP request (unused beyond method check).
+/// * `access_logger` - Logger for structured access log entries.
+/// * `method_str`    - HTTP method (`"GET"` or `"HEAD"`).
+/// * `ip_str`        - Client IP address string for logging.
+///
+/// # Returns
+///
+/// 200 with streamed file body, 404 if not found, 403 for directory traversal
+/// attempts, or 405 for non-GET/HEAD methods.
 async fn serve_static_file<T>(
     route_path: &str,
     req_path: &str,
@@ -2356,13 +3846,13 @@ async fn serve_static_file<T>(
     access_logger: Arc<AccessLogger>,
     method_str: &str,
     ip_str: &str,
-) -> Result<Response<BoxBody<Bytes, std::io::Error>>, hyper::Error> {
+) -> Result<Response<BoxBody<Bytes, hyper::Error>>, hyper::Error> {
     let start_time = std::time::Instant::now();
     let base_path = std::path::Path::new(&root_dir);
 
     // Only allow GET or HEAD requests for static files
     if method_str != "GET" && method_str != "HEAD" {
-        return Ok(empty_io_response(hyper::StatusCode::METHOD_NOT_ALLOWED));
+        return Ok(empty_response(hyper::StatusCode::METHOD_NOT_ALLOWED));
     }
 
     // Strip the route prefix from the requested path
@@ -2384,7 +3874,7 @@ async fn serve_static_file<T>(
                 // Try serving index.html if it's a directory
                 match sanitize_path(base_path, &format!("{}/index.html", relative_path)) {
                     Some(idx) => idx,
-                    None => return Ok(empty_io_response(hyper::StatusCode::FORBIDDEN)),
+                    None => return Ok(empty_response(hyper::StatusCode::FORBIDDEN)),
                 }
             } else {
                 p
@@ -2403,19 +3893,20 @@ async fn serve_static_file<T>(
                 bytes_sent: 0,
                 referer: String::new(),
                 user_agent: String::new(),
+                trace_id: String::new(),
             });
-            return Ok(empty_io_response(hyper::StatusCode::NOT_FOUND));
+            return Ok(empty_response(hyper::StatusCode::NOT_FOUND));
         }
     };
 
     let file = match tokio::fs::File::open(&safe_path).await {
         Ok(f) => f,
-        Err(_) => return Ok(empty_io_response(hyper::StatusCode::NOT_FOUND)),
+        Err(_) => return Ok(empty_response(hyper::StatusCode::NOT_FOUND)),
     };
 
     let metadata = match file.metadata().await {
         Ok(m) => m,
-        Err(_) => return Ok(empty_io_response(hyper::StatusCode::INTERNAL_SERVER_ERROR)),
+        Err(_) => return Ok(empty_response(hyper::StatusCode::INTERNAL_SERVER_ERROR)),
     };
 
     let file_size = metadata.len();
@@ -2439,10 +3930,11 @@ async fn serve_static_file<T>(
         bytes_sent: file_size,
         referer: String::new(),
         user_agent: String::new(),
+        trace_id: String::new(),
     });
 
     if method_str == "HEAD" {
-        let mut resp = empty_io_response(hyper::StatusCode::OK);
+        let mut resp = empty_response(hyper::StatusCode::OK);
         resp.headers_mut().insert(
             hyper::header::CONTENT_TYPE,
             hyper::header::HeaderValue::from_str(&mime_type).unwrap(),
@@ -2457,19 +3949,21 @@ async fn serve_static_file<T>(
     // Fast-path: Convert Tokio File -> ReaderStream -> StreamBody -> BoxBody
     // This allows Zero-Copy OS byte streaming straight down the socket.
     let reader_stream = tokio_util::io::ReaderStream::new(file);
-    // Since hyper::Error doesn't implement From<std::io::Error> generically and its `new` constructor is private,
-    // we convert the IO Stream frames directly, mapping the stream error into an empty synthetic error variant
-    // or dropping the connection when ReaderStream fails.
-    // To match hyper's strict internal types, we unfortunately must create a dummy `empty_response()` mapping.
-    // In practice, since this is streaming, an error mid-stream will just terminate the connection.
-    let stream_body = http_body_util::StreamBody::new(
-        reader_stream.map(|result| result.map(hyper::body::Frame::data)),
+    let stream = async_stream::stream! {
+        let mut reader_stream = reader_stream;
+        while let Some(item) = reader_stream.next().await {
+            match item {
+                Ok(chunk) => yield Ok::<_, std::convert::Infallible>(hyper::body::Frame::data(chunk)),
+                Err(e) => {
+                    error!("Static file stream read error: {}", e);
+                    break;
+                }
+            }
+        }
+    };
+    let boxed_body = BodyExt::boxed(
+        http_body_util::StreamBody::new(stream).map_err(|never| match never {}),
     );
-
-    // Map the internal StreamBody std::io::Error into a synthetic hyper::Error using generic into/mapping
-    // Actually, `hyper::Error` CANNOT be constructed. So we just use `anyhow` or a string locally if needed,
-    // OR we change the function return type to `std::io::Error` and map it at the HTTP connection boundary.
-    let boxed_body = BodyExt::boxed(stream_body);
 
     let mut response = Response::builder()
         .status(hyper::StatusCode::OK)
@@ -2562,14 +4056,102 @@ mod tests {
     }
 
     #[test]
-    fn test_empty_io_response_status() {
-        let resp = empty_io_response(hyper::StatusCode::NOT_FOUND);
+    fn test_empty_response_status() {
+        let resp = empty_response(hyper::StatusCode::NOT_FOUND);
         assert_eq!(resp.status(), hyper::StatusCode::NOT_FOUND);
     }
 
     #[test]
-    fn test_empty_io_response_ok() {
-        let resp = empty_io_response(hyper::StatusCode::OK);
+    fn test_empty_response_ok() {
+        let resp = empty_response(hyper::StatusCode::OK);
         assert_eq!(resp.status(), hyper::StatusCode::OK);
+    }
+
+    #[test]
+    fn test_rate_limit_response_status() {
+        let resp = rate_limit_response();
+        assert_eq!(resp.status(), hyper::StatusCode::TOO_MANY_REQUESTS);
+    }
+
+    #[test]
+    fn test_rate_limit_response_with_custom_retry() {
+        let resp = rate_limit_response_with_retry(120);
+        assert_eq!(resp.status(), hyper::StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(
+            resp.headers().get("Retry-After").unwrap().to_str().unwrap(),
+            "120"
+        );
+    }
+
+    #[test]
+    fn test_error_response_json() {
+        let resp = error_response(
+            hyper::StatusCode::BAD_GATEWAY,
+            "Backend unavailable",
+            "trace-123",
+            true,
+        );
+        assert_eq!(resp.status(), hyper::StatusCode::BAD_GATEWAY);
+        assert_eq!(
+            resp.headers()
+                .get(hyper::header::CONTENT_TYPE)
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            "application/json"
+        );
+    }
+
+    #[test]
+    fn test_error_response_text() {
+        let resp = error_response(
+            hyper::StatusCode::SERVICE_UNAVAILABLE,
+            "Service down",
+            "trace-456",
+            false,
+        );
+        assert_eq!(resp.status(), hyper::StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            resp.headers()
+                .get(hyper::header::CONTENT_TYPE)
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            "text/plain"
+        );
+    }
+
+    #[test]
+    fn test_client_accepts_json_true() {
+        let req = Request::builder()
+            .header(hyper::header::ACCEPT, "application/json")
+            .body(Full::new(Bytes::new()))
+            .unwrap();
+        assert!(client_accepts_json(req.headers()));
+    }
+
+    #[test]
+    fn test_client_accepts_json_false() {
+        let req = Request::builder()
+            .header(hyper::header::ACCEPT, "text/html")
+            .body(Full::new(Bytes::new()))
+            .unwrap();
+        assert!(!client_accepts_json(req.headers()));
+    }
+
+    #[test]
+    fn test_generate_trace_context_ids_format() {
+        let (trace_id, span_id) = generate_trace_context_ids();
+        assert_eq!(trace_id.len(), 32, "trace_id should be 32 hex chars");
+        assert_eq!(span_id.len(), 16, "span_id should be 16 hex chars");
+        assert!(trace_id.chars().all(|c| c.is_ascii_hexdigit()));
+        assert!(span_id.chars().all(|c| c.is_ascii_hexdigit()));
+    }
+
+    #[test]
+    fn test_generate_trace_ids_unique() {
+        let (t1, _) = generate_trace_context_ids();
+        let (t2, _) = generate_trace_context_ids();
+        assert_ne!(t1, t2);
     }
 }

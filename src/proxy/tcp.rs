@@ -1,3 +1,13 @@
+//! Raw TCP (Layer 4) proxy server.
+//!
+//! Unlike the main multiplexer which speaks HTTP, this module opens a dedicated
+//! TCP listen port and blindly forwards bytes between clients and upstream
+//! backends. It is useful for protocols like databases, MQTT, or custom
+//! binary protocols where Phalanx acts as a transparent load-balancing relay.
+//!
+//! On Linux, the data path uses kernel `splice(2)` for true zero-copy I/O.
+//! On other platforms it falls back to `tokio::io::copy_bidirectional`.
+
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::net::{TcpListener, TcpStream};
@@ -8,14 +18,28 @@ use crate::routing::UpstreamManager;
 use std::sync::atomic::Ordering;
 
 /// Starts a dedicated raw TCP proxy server.
+///
 /// This runs on a separate port from the main multiplexer and blindly forwards
-/// bytes in both directions between the client and a backend server from the "default" pool.
+/// bytes in both directions between the client and a backend server from the
+/// "default" upstream pool.
+///
+/// # Arguments
+///
+/// * `bind_addr` - Socket address to listen on (e.g. `"0.0.0.0:9000"`).
+/// * `upstreams` - Shared upstream pool manager used to select a healthy backend.
+/// * `shutdown`  - Cancellation token that triggers graceful shutdown.
 pub async fn start_tcp_proxy(
     bind_addr: &str,
     upstreams: Arc<UpstreamManager>,
     shutdown: CancellationToken,
 ) {
-    let addr: SocketAddr = bind_addr.parse().expect("Invalid TCP proxy bind address");
+    let addr: SocketAddr = match bind_addr.parse() {
+        Ok(a) => a,
+        Err(e) => {
+            error!("Invalid TCP proxy bind address '{}': {}", bind_addr, e);
+            return;
+        }
+    };
     let listener = match TcpListener::bind(&addr).await {
         Ok(l) => l,
         Err(e) => {

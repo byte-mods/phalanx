@@ -1,26 +1,39 @@
+//! GeoIP database, country-based access policies, and request header enrichment.
+//!
+//! Loads CIDR-to-country mappings from a CSV file and provides O(n) lookup
+//! with an in-memory cache for hot IPs. Policies can allow or deny traffic
+//! by country code. Matched results are injected as `X-Geo-Country-Code` and
+//! `X-Geo-Country` headers for upstream consumption.
+
+use arc_swap::ArcSwap;
 use dashmap::DashMap;
-use std::collections::HashMap;
 use std::net::IpAddr;
-use std::path::Path;
 use std::sync::Arc;
-use tracing::{info, warn};
+use tracing::info;
 
 /// GeoIP-based access control and request enrichment.
 ///
 /// Uses a simple CSV-based database of CIDR → country code mappings.
 /// For production, integrate MaxMind GeoLite2 via the `maxminddb` crate.
 pub struct GeoIpDatabase {
-    /// IP range → country code lookup table
-    entries: Vec<GeoEntry>,
+    /// IP range → country code lookup table (hot-swappable via ArcSwap for SIGHUP reload)
+    entries: ArcSwap<Vec<GeoEntry>>,
     /// Cached lookups for hot IPs
     cache: DashMap<IpAddr, GeoResult>,
 }
 
+/// Internal representation of a CIDR range and its associated country.
+#[derive(Clone)]
 struct GeoEntry {
+    /// Network address as a 128-bit integer (IPv4 uses the low 32 bits).
     network: u128,
+    /// Bitmask derived from the CIDR prefix length.
     mask: u128,
+    /// `true` for IPv4 entries, `false` for IPv6.
     is_v4: bool,
+    /// ISO 3166-1 alpha-2 country code (upper-case).
     country_code: String,
+    /// Human-readable country name.
     country_name: String,
 }
 
@@ -67,7 +80,7 @@ impl GeoIpDatabase {
     /// Creates an empty GeoIP database.
     pub fn new() -> Self {
         Self {
-            entries: Vec::new(),
+            entries: ArcSwap::from_pointee(Vec::new()),
             cache: DashMap::new(),
         }
     }
@@ -76,10 +89,30 @@ impl GeoIpDatabase {
     /// Format: `cidr,country_code,country_name`
     /// Example: `1.0.0.0/24,AU,Australia`
     pub fn load_csv(&mut self, path: &str) -> Result<(), String> {
+        let new_entries = Self::parse_csv_file(path)?;
+        let count = new_entries.len();
+        self.entries.store(Arc::new(new_entries));
+        info!("Loaded {} GeoIP entries from {}", count, path);
+        Ok(())
+    }
+
+    /// Reloads the GeoIP database from a CSV file, atomically swapping entries
+    /// and clearing the lookup cache. On error, the existing database is preserved.
+    pub fn reload(&self, path: &str) -> Result<(), String> {
+        let new_entries = Self::parse_csv_file(path)?;
+        let count = new_entries.len();
+        self.entries.store(Arc::new(new_entries));
+        self.cache.clear();
+        info!("GeoIP database reloaded: {} entries from {}", count, path);
+        Ok(())
+    }
+
+    /// Parses a CSV file into a Vec of GeoEntry (shared by load_csv and reload).
+    fn parse_csv_file(path: &str) -> Result<Vec<GeoEntry>, String> {
         let content =
             std::fs::read_to_string(path).map_err(|e| format!("Failed to read {}: {}", path, e))?;
 
-        let mut count = 0;
+        let mut entries = Vec::new();
         for line in content.lines() {
             let line = line.trim();
             if line.is_empty() || line.starts_with('#') {
@@ -91,13 +124,10 @@ impl GeoIpDatabase {
             }
 
             if let Some(entry) = parse_geo_entry(parts[0], parts[1], parts[2]) {
-                self.entries.push(entry);
-                count += 1;
+                entries.push(entry);
             }
         }
-
-        info!("Loaded {} GeoIP entries from {}", count, path);
-        Ok(())
+        Ok(entries)
     }
 
     /// Looks up the country for an IP address.
@@ -108,8 +138,9 @@ impl GeoIpDatabase {
 
         let ip_bits = ip_to_u128(ip);
         let is_v4 = ip.is_ipv4();
+        let entries = self.entries.load();
 
-        for entry in &self.entries {
+        for entry in entries.iter() {
             if entry.is_v4 != is_v4 {
                 continue;
             }
@@ -127,13 +158,17 @@ impl GeoIpDatabase {
     }
 
     /// Adds custom geo entries from config (for simple setups without an external DB).
-    pub fn add_entry(&mut self, cidr: &str, country_code: &str, country_name: &str) {
+    pub fn add_entry(&self, cidr: &str, country_code: &str, country_name: &str) {
         if let Some(entry) = parse_geo_entry(cidr, country_code, country_name) {
-            self.entries.push(entry);
+            let mut entries: Vec<GeoEntry> = (**self.entries.load()).clone();
+            entries.push(entry);
+            self.entries.store(Arc::new(entries));
         }
     }
 }
 
+/// Parses a CIDR string (e.g. `"1.0.0.0/24"`) into a `GeoEntry` with the
+/// computed network address and bitmask. Returns `None` if the CIDR is invalid.
 fn parse_geo_entry(cidr: &str, code: &str, name: &str) -> Option<GeoEntry> {
     let (addr_str, prefix_str) = cidr.split_once('/')?;
     let ip: IpAddr = addr_str.trim().parse().ok()?;
@@ -164,6 +199,8 @@ fn parse_geo_entry(cidr: &str, code: &str, name: &str) -> Option<GeoEntry> {
     })
 }
 
+/// Converts an `IpAddr` to a 128-bit integer for bitwise CIDR matching.
+/// IPv4 addresses occupy the low 32 bits.
 fn ip_to_u128(ip: &IpAddr) -> u128 {
     match ip {
         IpAddr::V4(v4) => u32::from(*v4) as u128,
@@ -211,7 +248,7 @@ mod tests {
 
     #[test]
     fn test_geo_lookup() {
-        let mut db = GeoIpDatabase::new();
+        let db = GeoIpDatabase::new();
         db.add_entry("1.0.0.0/24", "AU", "Australia");
         db.add_entry("8.8.8.0/24", "US", "United States");
 
@@ -222,5 +259,31 @@ mod tests {
         let result = db.lookup(&"8.8.8.8".parse().unwrap());
         assert!(result.is_some());
         assert_eq!(result.unwrap().country_code, "US");
+    }
+
+    #[test]
+    fn test_geo_reload_missing_file() {
+        let db = GeoIpDatabase::new();
+        db.add_entry("1.0.0.0/24", "AU", "Australia");
+
+        // Reload with nonexistent file should return error
+        let result = db.reload("/nonexistent/geo.csv");
+        assert!(result.is_err());
+
+        // Existing entries should still be intact
+        let lookup = db.lookup(&"1.0.0.1".parse().unwrap());
+        assert!(lookup.is_some());
+        assert_eq!(lookup.unwrap().country_code, "AU");
+    }
+
+    #[test]
+    fn test_geo_add_entry_clears_not_needed_for_new_entries() {
+        let db = GeoIpDatabase::new();
+        db.add_entry("1.0.0.0/24", "AU", "Australia");
+        db.add_entry("8.8.8.0/24", "US", "United States");
+
+        // Both should be lookupable
+        assert!(db.lookup(&"1.0.0.1".parse().unwrap()).is_some());
+        assert!(db.lookup(&"8.8.8.8".parse().unwrap()).is_some());
     }
 }

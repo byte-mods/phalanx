@@ -1,3 +1,9 @@
+/// Gzip response compression middleware.
+///
+/// Compresses response bodies using the `flate2` crate when the client
+/// advertises `Accept-Encoding: gzip` and the content type is text-based.
+/// Bodies smaller than [`MIN_COMPRESS_SIZE`] (1 KB) are left uncompressed
+/// because the compression overhead is not worth the savings at that scale.
 use bytes::Bytes;
 use flate2::Compression;
 use flate2::write::GzEncoder;

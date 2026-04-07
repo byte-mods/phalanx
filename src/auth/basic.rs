@@ -1,3 +1,8 @@
+/// HTTP Basic Authentication implementation (RFC 7617).
+///
+/// Validates `Authorization: Basic <base64(user:pass)>` headers against a
+/// configured user store. Supports both plaintext and bcrypt-hashed passwords.
+/// Uses constant-time comparison for plaintext to mitigate timing attacks.
 use super::AuthResult;
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use hyper::{HeaderMap, StatusCode};

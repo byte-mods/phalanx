@@ -1,5 +1,25 @@
+//! # Routing & Upstream Management
+//!
+//! This module implements the core backend selection and health management layer:
+//!
+//! - **`BackendNode`**: A single backend server with atomic health tracking,
+//!   passive failure detection, slow-start weight ramping, and a three-state
+//!   circuit breaker (CLOSED -> OPEN -> HALF_OPEN -> CLOSED).
+//!
+//! - **`UpstreamPool`**: A group of backends with a configured load balancing
+//!   algorithm. Supports 8 algorithms: RoundRobin, LeastConnections, IpHash,
+//!   Random, WeightedRoundRobin, AIPredictive, ConsistentHash, and LeastTime.
+//!
+//! - **`UpstreamManager`**: Global registry of named pools, shared across all
+//!   Tokio tasks. Handles hot-reload by diffing old/new config and restarting
+//!   health check loops.
+//!
+//! - **Active health check loop**: Periodic TCP/HTTP probes that transition
+//!   backends between UP/DOWN and advance the circuit breaker state machine.
+
 use arc_swap::ArcSwap;
 use dashmap::DashMap;
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -65,6 +85,9 @@ pub struct BackendNode {
 }
 
 impl BackendNode {
+    /// Creates a new backend node from static configuration.
+    /// All health tracking fields are initialized to "healthy, no failures, no recovery".
+    /// The circuit breaker starts in CLOSED state with the configured initial backoff.
     pub fn new(config: BackendConfig) -> Self {
         let initial_backoff = config.circuit_initial_backoff_secs;
         Self {
@@ -174,6 +197,21 @@ impl BackendNode {
         );
     }
 
+    /// Returns the current failure count for this backend.
+    pub fn fail_count(&self) -> u32 {
+        self.fail_count.load(Ordering::Relaxed)
+    }
+
+    /// Returns the circuit breaker state as a human-readable string.
+    pub fn circuit_state_str(&self) -> &'static str {
+        match self.circuit_state.load(Ordering::Acquire) {
+            CIRCUIT_CLOSED => "closed",
+            CIRCUIT_OPEN => "open",
+            CIRCUIT_HALF_OPEN => "half_open",
+            _ => "unknown",
+        }
+    }
+
     /// Effective weight for WRR and ConsistentHash selection, accounting for slow-start.
     ///
     /// Returns a value in `0..=config.weight`:
@@ -204,16 +242,25 @@ impl BackendNode {
 // ─── UpstreamPool ────────────────────────────────────────────────────────────
 
 /// A logical grouping of backends with its own load balancing algorithm.
+///
+/// The backend list is stored behind an `ArcSwap` so it can be atomically replaced
+/// during hot-reload or DNS discovery updates without blocking in-flight requests.
+/// The round-robin counter is a simple atomic that wraps modulo the backend count.
 pub struct UpstreamPool {
+    /// The load balancing strategy for this pool.
     pub algorithm: LoadBalancingAlgorithm,
+    /// Lock-free swappable list of backends; supports concurrent reads during hot-reload writes.
     pub backends: ArcSwap<Vec<Arc<BackendNode>>>,
-    /// Counter for Round-Robin / Weighted-RR selection
+    /// Monotonically increasing counter for Round-Robin / Weighted-RR index selection.
     round_robin_index: AtomicUsize,
-    /// Keepalive connection pool
+    /// Shared TCP connection pool for keepalive reuse across requests.
     pub connection_pool: Arc<crate::proxy::pool::ConnectionPool>,
+    /// Notification channel for queue-based waiting when all backends are at max_conns.
+    queue_notify: Arc<tokio::sync::Notify>,
 }
 
 impl UpstreamPool {
+    /// Constructs a new pool from its config, creating a `BackendNode` for each backend.
     pub fn new(config: &UpstreamPoolConfig) -> Self {
         let backends: Vec<Arc<BackendNode>> = config
             .backends
@@ -226,13 +273,19 @@ impl UpstreamPool {
             backends: ArcSwap::from_pointee(backends),
             round_robin_index: AtomicUsize::new(0),
             connection_pool: Arc::new(crate::proxy::pool::ConnectionPool::new(config.keepalive)),
+            queue_notify: Arc::new(tokio::sync::Notify::new()),
         }
     }
 
     /// Dynamically add a backend to this pool (used by Admin API + DNS discovery).
+    ///
+    /// Deduplicates by address: if a backend with the same address already exists,
+    /// the add is silently ignored. Uses ArcSwap's copy-on-write pattern so readers
+    /// are never blocked.
     pub fn add_backend(&self, config: BackendConfig) {
         let new_node = Arc::new(BackendNode::new(config));
         let mut current_backends = self.backends.load().as_ref().clone();
+        // Avoid duplicates: only add if no existing backend has the same address
         if !current_backends
             .iter()
             .any(|b| b.config.address == new_node.config.address)
@@ -249,9 +302,19 @@ impl UpstreamPool {
         self.backends.store(Arc::new(current_backends));
     }
 
-    /// Select the next healthy backend using the configured algorithm.
-    /// Respects backup servers: they are only used when all primary backends are DOWN.
-    /// Also enforces max_conns limits.
+    /// Select the next healthy backend using the configured load balancing algorithm.
+    ///
+    /// # Selection pipeline
+    /// 1. Split backends into primary vs backup; use backup only if all primaries are DOWN.
+    /// 2. Filter out backends that exceed `max_conns` or have an open circuit breaker.
+    /// 3. Dispatch to the algorithm-specific selection logic.
+    ///
+    /// # Arguments
+    /// * `client_ip` - Used by IpHash and ConsistentHash for sticky routing.
+    /// * `ai_engine` - Optional AI router for the AIPredictive algorithm.
+    ///
+    /// # Returns
+    /// `Some(backend)` on success, or `None` if no healthy backend is available.
     pub fn get_next_backend(
         &self,
         client_ip: Option<&std::net::IpAddr>,
@@ -297,7 +360,9 @@ impl UpstreamPool {
         let healthy = available;
 
         match self.algorithm {
-            // ── AI Predictive ──────────────────────────────────────────
+            // ── Algorithm 1: AI Predictive ────────────────────────────
+            // Delegates to the configured AI bandit algorithm (epsilon-greedy, UCB1,
+            // softmax, or Thompson sampling). Falls back to round-robin if no AI engine.
             LoadBalancingAlgorithm::AIPredictive => {
                 if let Some(ai) = ai_engine {
                     ai.predict_best_backend(&healthy)
@@ -308,18 +373,23 @@ impl UpstreamPool {
                 }
             }
 
-            // ── Round Robin ───────────────────────────────────────────
+            // ── Algorithm 2: Round Robin ─────────────────────────────
+            // Simple sequential rotation. The atomic counter wraps via modulo.
             LoadBalancingAlgorithm::RoundRobin => {
                 let idx = self.round_robin_index.fetch_add(1, Ordering::Relaxed) % healthy.len();
                 Some(Arc::clone(&healthy[idx]))
             }
 
-            // ── Least Connections ─────────────────────────────────────
+            // ── Algorithm 3: Least Connections ───────────────────────
+            // Picks the backend with the fewest in-flight requests. Optimal for
+            // heterogeneous backends with varying response times.
             LoadBalancingAlgorithm::LeastConnections => healthy
                 .into_iter()
                 .min_by_key(|b| b.active_connections.load(Ordering::Relaxed)),
 
-            // ── Random ────────────────────────────────────────────────
+            // ── Algorithm 4: Random ──────────────────────────────────
+            // Uses sub-second nanosecond entropy for lightweight random selection.
+            // Good enough for load spreading without the overhead of a full RNG.
             LoadBalancingAlgorithm::Random => {
                 let ts = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
@@ -329,20 +399,26 @@ impl UpstreamPool {
                 Some(Arc::clone(&healthy[idx]))
             }
 
-            // ── IP Hash ───────────────────────────────────────────────
+            // ── Algorithm 5: IP Hash ─────────────────────────────────
+            // Hashes the client IP to a deterministic backend index. Provides
+            // session affinity without cookies, but shifts all traffic when a
+            // backend goes down (unlike ConsistentHash which minimizes disruption).
             LoadBalancingAlgorithm::IpHash => {
                 use std::hash::{Hash, Hasher};
                 let mut hasher = std::collections::hash_map::DefaultHasher::new();
                 if let Some(ip) = client_ip {
                     ip.hash(&mut hasher);
                 } else {
+                    // No client IP available (e.g. TCP proxy): fall back to time-based
                     now_secs().hash(&mut hasher);
                 }
                 let idx = (hasher.finish() as usize) % healthy.len();
                 Some(Arc::clone(&healthy[idx]))
             }
 
-            // ── Weighted Round Robin (with slow-start effective weight) ──
+            // ── Algorithm 6: Weighted Round Robin ────────────────────
+            // Distributes traffic proportional to each backend's effective weight.
+            // Uses slow-start effective_weight() so recovering backends ramp gradually.
             LoadBalancingAlgorithm::WeightedRoundRobin => {
                 let total_weight: u32 = healthy.iter().map(|b| b.effective_weight()).sum();
                 if total_weight == 0 {
@@ -360,9 +436,10 @@ impl UpstreamPool {
                 None
             }
 
-            // ── Least Time ──────────────────────────────────────────
+            // ── Algorithm 7: Least Time ──────────────────────────────
             // Selects the backend with the fewest active connections,
-            // breaking ties by preferring lower weight (proxy for lower latency).
+            // breaking ties by preferring higher effective weight as a proxy for
+            // capacity. This combines connection awareness with weight awareness.
             LoadBalancingAlgorithm::LeastTime => healthy
                 .into_iter()
                 .min_by(|a, b| {
@@ -373,9 +450,12 @@ impl UpstreamPool {
                         .then_with(|| a.effective_weight().cmp(&b.effective_weight()).reverse())
                 }),
 
-            // ── Consistent Hashing ────────────────────────────────────
-            // Uses a virtual node ring so the same client IP always lands
-            // on the same backend (unless it becomes unhealthy).
+            // ── Algorithm 8: Consistent Hashing ──────────────────────
+            // Builds a virtual-node ring where each backend gets
+            // `160 * effective_weight` hash positions. The client IP is hashed
+            // and mapped to the nearest ring position via binary search.
+            // When a backend is removed, only its ring segment is redistributed,
+            // minimizing cache and session disruption (Karger et al., 1997).
             LoadBalancingAlgorithm::ConsistentHash => {
                 use std::hash::{Hash, Hasher};
 
@@ -391,8 +471,9 @@ impl UpstreamPool {
                 };
 
                 // Build a sorted virtual-node ring from backend addresses.
-                // Each backend gets `weight` virtual nodes spaced around a u64 ring.
-                let virtual_nodes_per_backend = 40u32;
+                // Each backend gets `weight * 160` virtual nodes spaced around a
+                // u64 ring, matching NGINX's default for better key distribution.
+                let virtual_nodes_per_backend = 160u32;
                 let mut ring: Vec<(u64, usize)> = Vec::new();
                 for (idx, backend) in healthy.iter().enumerate() {
                     let w = backend.effective_weight().max(1);
@@ -417,16 +498,87 @@ impl UpstreamPool {
             }
         }
     }
+
+    /// Selects a backend with queue-based waiting when all backends are at max_conns.
+    ///
+    /// If `get_next_backend()` returns `None` and any backend has `queue_size > 0`,
+    /// this method waits up to `queue_timeout_ms` for a backend slot to open.
+    /// Other callers signal availability via `notify_queue()` when a connection ends.
+    pub async fn get_next_backend_queued(
+        &self,
+        client_ip: Option<&std::net::IpAddr>,
+        ai_engine: Option<Arc<dyn crate::ai::AiRouter>>,
+    ) -> Option<Arc<BackendNode>> {
+        // Fast path: try immediate selection
+        if let Some(backend) = self.get_next_backend(client_ip, ai_engine.clone()) {
+            return Some(backend);
+        }
+
+        // Check if any backend supports queuing
+        let current_backends = self.backends.load();
+        let max_queue_size = current_backends
+            .iter()
+            .map(|b| b.config.queue_size)
+            .max()
+            .unwrap_or(0);
+
+        if max_queue_size == 0 {
+            return None; // No queuing configured
+        }
+
+        let timeout_ms = current_backends
+            .iter()
+            .map(|b| b.config.queue_timeout_ms)
+            .max()
+            .unwrap_or(5000);
+
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(timeout_ms);
+
+        // Wait loop: retry selection when notified or until timeout
+        loop {
+            match tokio::time::timeout_at(deadline, self.queue_notify.notified()).await {
+                Ok(()) => {
+                    // Notified that a slot may be available — retry
+                    if let Some(backend) = self.get_next_backend(client_ip, ai_engine.clone()) {
+                        return Some(backend);
+                    }
+                    // Spurious wakeup or slot taken by another waiter, continue waiting
+                }
+                Err(_) => {
+                    // Timeout — one last try
+                    return self.get_next_backend(client_ip, ai_engine.clone());
+                }
+            }
+        }
+    }
+
+    /// Notifies waiting requests that a backend connection slot has been freed.
+    ///
+    /// Call this after decrementing `active_connections` on a backend to wake
+    /// any requests queued by `get_next_backend_queued()`.
+    pub fn notify_queue(&self) {
+        self.queue_notify.notify_waiters();
+    }
 }
 
 // ─── UpstreamManager ─────────────────────────────────────────────────────────
 
-/// Global registry for all Upstream Pools, shared across Tokio tasks.
+/// Global registry for all named upstream pools, shared across Tokio tasks.
+///
+/// Uses `DashMap` for lock-free concurrent reads (hot path) with sharded write
+/// locking (cold path: config reload, admin API mutations). Each pool entry
+/// owns its own health check and DNS watcher tasks.
 pub struct UpstreamManager {
+    /// Map from pool name (e.g. "default", "backend_api") to its `UpstreamPool`.
     pools: DashMap<String, Arc<UpstreamPool>>,
 }
 
 impl UpstreamManager {
+    /// Initializes the manager from the global config, creating a pool for each
+    /// `upstream` block. For every pool, it:
+    /// 1. Loads any previously-discovered backends from the RocksDB service registry.
+    /// 2. Spawns an active health check loop (TCP or HTTP probes every 5 seconds).
+    /// 3. Spawns DNS watchers for hostname-based backends (if `dns_resolver` is set).
     pub fn new(
         config: &crate::config::AppConfig,
         discovery: Arc<crate::discovery::ServiceDiscovery>,
@@ -460,7 +612,12 @@ impl UpstreamManager {
             manager.pools.insert(name.clone(), pool.clone());
 
             // Active health check loop (HTTP or TCP probe)
-            tokio::spawn(health_check_loop(name.clone(), pool.clone()));
+            tokio::spawn(health_check_loop(
+                name.clone(),
+                pool.clone(),
+                pool_config.health_check_interval_secs,
+                pool_config.health_check_timeout_secs,
+            ));
 
             // DNS watcher — spawned for any backend whose address is a hostname
             if let Some(ref resolver_addr) = config.dns_resolver {
@@ -483,8 +640,86 @@ impl UpstreamManager {
         manager
     }
 
+    /// Looks up a pool by name. Returns `None` if the pool does not exist.
     pub fn get_pool(&self, key: &str) -> Option<Arc<UpstreamPool>> {
         self.pools.get(key).map(|p| Arc::clone(&p))
+    }
+
+    /// Rebuilds upstream pools from a fresh config snapshot during SIGHUP hot reload.
+    ///
+    /// Performs a three-way diff: removes pools no longer in config, updates existing
+    /// pools with new backends/algorithm, and adds newly-configured pools. Each
+    /// updated/added pool gets fresh health check loops and DNS watchers.
+    pub fn reload_from_config(
+        &self,
+        config: &crate::config::AppConfig,
+        discovery: Arc<crate::discovery::ServiceDiscovery>,
+    ) {
+        let desired_names: HashSet<String> = config.upstreams.keys().cloned().collect();
+        let existing_names: Vec<String> = self.pools.iter().map(|e| e.key().clone()).collect();
+
+        for name in existing_names {
+            if !desired_names.contains(&name) {
+                self.pools.remove(&name);
+                info!("Removed upstream pool '{}' via hot reload", name);
+            }
+        }
+
+        for (name, pool_config) in &config.upstreams {
+            let pool = Arc::new(UpstreamPool::new(pool_config));
+
+            // Reload statically discovered (RocksDB-persisted) backends.
+            let discovered = discovery.list_backends(name);
+            for d in discovered {
+                pool.add_backend(BackendConfig {
+                    address: d.address.clone(),
+                    weight: d.weight,
+                    health_check_path: pool_config
+                        .backends
+                        .first()
+                        .and_then(|b| b.health_check_path.clone()),
+                    health_check_status: pool_config
+                        .backends
+                        .first()
+                        .map(|b| b.health_check_status)
+                        .unwrap_or(200),
+                    ..Default::default()
+                });
+            }
+
+            let existed = self.pools.insert(name.clone(), Arc::clone(&pool)).is_some();
+
+            // Restart health checks with the latest backend set.
+            tokio::spawn(health_check_loop(
+                name.clone(),
+                Arc::clone(&pool),
+                pool_config.health_check_interval_secs,
+                pool_config.health_check_timeout_secs,
+            ));
+
+            // Restart DNS watchers for hostname backends.
+            if let Some(ref resolver_addr) = config.dns_resolver {
+                for backend in &pool_config.backends {
+                    if !is_ip_literal(&backend.address) {
+                        let (hostname, port) = split_host_port(&backend.address);
+                        crate::discovery::spawn_dns_watcher(
+                            name.clone(),
+                            hostname,
+                            port,
+                            Arc::clone(&pool),
+                            resolver_addr.clone(),
+                            backend.clone(),
+                        );
+                    }
+                }
+            }
+
+            if existed {
+                info!("Updated upstream pool '{}' via hot reload", name);
+            } else {
+                info!("Added upstream pool '{}' via hot reload", name);
+            }
+        }
     }
 
     /// Returns all pool names and their corresponding pools.
@@ -517,9 +752,26 @@ fn split_host_port(addr: &str) -> (String, String) {
 
 // ─── Active health check loop ─────────────────────────────────────────────────
 
-async fn health_check_loop(pool_name: String, pool: Arc<UpstreamPool>) {
-    let interval = Duration::from_secs(5);
-    info!("Starting health check loop for pool: {}", pool_name);
+/// Active health check loop that runs as a background Tokio task for each upstream pool.
+///
+/// Every 5 seconds, it iterates over all backends and:
+/// - For DOWN backends or those in HALF_OPEN circuit state: runs a health probe
+///   (HTTP GET or TCP connect) and transitions state accordingly.
+/// - For UP backends: runs a health probe to detect newly-failed backends.
+/// - Manages the circuit breaker state machine: OPEN -> HALF_OPEN (after backoff)
+///   -> CLOSED (on success) or back to OPEN with doubled backoff (on failure).
+async fn health_check_loop(
+    pool_name: String,
+    pool: Arc<UpstreamPool>,
+    interval_secs: u64,
+    timeout_secs: u64,
+) {
+    let interval = Duration::from_secs(if interval_secs > 0 { interval_secs } else { 5 });
+    let _timeout = Duration::from_secs(if timeout_secs > 0 { timeout_secs } else { 3 });
+    info!(
+        "Starting health check loop for pool: {} (interval: {}s, timeout: {}s)",
+        pool_name, interval.as_secs(), _timeout.as_secs()
+    );
 
     loop {
         sleep(interval).await;
@@ -564,7 +816,7 @@ async fn health_check_loop(pool_name: String, pool: Arc<UpstreamPool>) {
                 let probe_ok = if let Some(ref path) = backend.config.health_check_path {
                     let url = format!("http://{}{}", address, path);
                     let expected = backend.config.health_check_status;
-                    match reqwest_health_get(&url, expected).await {
+                    match reqwest_health_get(&url, expected, _timeout).await {
                         Ok(true) => true,
                         Ok(false) => {
                             warn!(
@@ -582,7 +834,10 @@ async fn health_check_loop(pool_name: String, pool: Arc<UpstreamPool>) {
                         }
                     }
                 } else {
-                    matches!(TcpStream::connect(address).await, Ok(_))
+                    matches!(
+                        tokio::time::timeout(_timeout, TcpStream::connect(address)).await,
+                        Ok(Ok(_))
+                    )
                 };
 
                 match (was_healthy, probe_ok) {
@@ -606,9 +861,12 @@ async fn health_check_loop(pool_name: String, pool: Arc<UpstreamPool>) {
                 let still_ok = if let Some(ref path) = backend.config.health_check_path {
                     let url = format!("http://{}{}", address, path);
                     let expected = backend.config.health_check_status;
-                    matches!(reqwest_health_get(&url, expected).await, Ok(true))
+                    matches!(reqwest_health_get(&url, expected, _timeout).await, Ok(true))
                 } else {
-                    matches!(TcpStream::connect(address).await, Ok(_))
+                    matches!(
+                        tokio::time::timeout(_timeout, TcpStream::connect(address)).await,
+                        Ok(Ok(_))
+                    )
                 };
 
                 if !still_ok {
@@ -622,9 +880,9 @@ async fn health_check_loop(pool_name: String, pool: Arc<UpstreamPool>) {
 }
 
 /// Perform an HTTP GET to `url`; return `Ok(true)` if status matches `expected`.
-async fn reqwest_health_get(url: &str, expected_status: u16) -> Result<bool, String> {
+async fn reqwest_health_get(url: &str, expected_status: u16, timeout: Duration) -> Result<bool, String> {
     let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(3))
+        .timeout(timeout)
         .build()
         .map_err(|e| e.to_string())?;
     let resp = client.get(url).send().await.map_err(|e| e.to_string())?;
@@ -773,6 +1031,8 @@ mod tests {
             ],
             keepalive: 0,
             srv_discover: None,
+            health_check_interval_secs: 5,
+            health_check_timeout_secs: 3,
         };
         let pool = UpstreamPool::new(&pool_config);
         let ip: IpAddr = "192.168.1.42".parse().unwrap();
@@ -897,6 +1157,8 @@ mod tests {
             ],
             keepalive: 0,
             srv_discover: None,
+            health_check_interval_secs: 5,
+            health_check_timeout_secs: 3,
         };
         let pool = UpstreamPool::new(&pool_config);
 
@@ -924,6 +1186,8 @@ mod tests {
             ],
             keepalive: 0,
             srv_discover: None,
+            health_check_interval_secs: 5,
+            health_check_timeout_secs: 3,
         };
         let pool = UpstreamPool::new(&pool_config);
         let ip: std::net::IpAddr = "192.168.1.100".parse().unwrap();

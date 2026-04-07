@@ -1,3 +1,13 @@
+//! UDP (Layer 4) proxy server.
+//!
+//! Provides session-aware UDP load balancing. Each unique client address is
+//! assigned a dedicated backend socket, ensuring that all datagrams for a given
+//! "session" are forwarded to the same upstream backend. A background reaper
+//! task garbage-collects idle sessions after `SESSION_TIMEOUT`.
+//!
+//! This is useful for protocols like DNS, QUIC (when not using HTTP/3 mode),
+//! gaming, and VoIP where the proxy must maintain per-client affinity.
+
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -9,20 +19,40 @@ use tracing::{debug, error, info};
 
 use crate::routing::UpstreamManager;
 
+/// Maximum datagram size. Matches the theoretical maximum UDP payload (64 KiB).
 const UDP_BUF_SIZE: usize = 65535;
-const SESSION_TIMEOUT: Duration = Duration::from_secs(60);
 
+/// Default duration after which an idle client session is garbage-collected.
+/// Overridden by `udp_session_timeout_secs` in config.
+const DEFAULT_SESSION_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// Tracks a single client's UDP session: which backend it talks to and its
+/// dedicated ephemeral socket for backend communication.
 struct UdpSession {
+    /// Socket bound to an ephemeral port for sending/receiving with the backend.
     backend_socket: Arc<UdpSocket>,
+    /// The resolved backend address this session is pinned to.
     backend_addr: SocketAddr,
+    /// Last time a datagram was sent or received for this session.
     last_active: Instant,
 }
 
-/// Starts a UDP stream proxy that load-balances datagrams to upstream backends.
-/// Each unique client address gets a dedicated backend socket for the session.
+/// Starts a UDP proxy that load-balances datagrams to upstream backends.
+///
+/// Each unique client address gets a dedicated backend socket for the session,
+/// providing natural affinity.
+///
+/// # Arguments
+///
+/// * `bind_addr`          - UDP socket address to listen on (e.g. `"0.0.0.0:5353"`).
+/// * `upstreams`          - Shared upstream pool manager for backend selection.
+/// * `session_timeout`    - Idle session timeout. Sessions without traffic for this
+///                          duration are garbage-collected.
+/// * `shutdown`           - Cancellation token for graceful shutdown.
 pub async fn start_udp_proxy(
     bind_addr: &str,
     upstreams: Arc<UpstreamManager>,
+    session_timeout: Duration,
     shutdown: CancellationToken,
 ) {
     let addr: SocketAddr = match bind_addr.parse() {
@@ -49,13 +79,14 @@ pub async fn start_udp_proxy(
     // Spawn a reaper task to clean up expired sessions
     let sessions_reaper = Arc::clone(&sessions);
     let shutdown_reaper = shutdown.clone();
+    let reaper_timeout = session_timeout;
     tokio::spawn(async move {
         loop {
             tokio::select! {
                 _ = tokio::time::sleep(Duration::from_secs(30)) => {
                     let mut map = sessions_reaper.lock().await;
                     map.retain(|_client, session| {
-                        session.last_active.elapsed() < SESSION_TIMEOUT
+                        session.last_active.elapsed() < reaper_timeout
                     });
                 }
                 _ = shutdown_reaper.cancelled() => break,
@@ -184,18 +215,17 @@ mod tests {
     use super::*;
 
     const UDP_BUF_SIZE: usize = 65535;
-    const SESSION_TIMEOUT: Duration = Duration::from_secs(60);
 
     #[test]
     fn test_constants_defined() {
         assert_eq!(UDP_BUF_SIZE, 65535);
-        assert_eq!(SESSION_TIMEOUT, Duration::from_secs(60));
+        assert_eq!(super::DEFAULT_SESSION_TIMEOUT, Duration::from_secs(60));
     }
 
     #[test]
     fn test_session_timeout_is_reasonable() {
-        // Session timeout should be at least 30 seconds
-        assert!(SESSION_TIMEOUT >= Duration::from_secs(30));
+        // Default session timeout should be at least 30 seconds
+        assert!(super::DEFAULT_SESSION_TIMEOUT >= Duration::from_secs(30));
     }
 
     #[test]
@@ -204,5 +234,15 @@ mod tests {
         assert!(UDP_BUF_SIZE >= 512);
         // And not excessively large
         assert!(UDP_BUF_SIZE <= 1024 * 1024);
+    }
+
+    #[test]
+    fn test_custom_session_timeout() {
+        // Verify custom timeouts can be created from config values
+        let custom_timeout = Duration::from_secs(120);
+        assert_eq!(custom_timeout.as_secs(), 120);
+
+        let min_timeout = Duration::from_secs(10);
+        assert!(min_timeout < super::DEFAULT_SESSION_TIMEOUT);
     }
 }

@@ -1,14 +1,35 @@
+/// OWASP Top 10 regex-based attack pattern detection.
+///
+/// Pre-compiles multiple [`RegexSet`]s at construction time so that runtime
+/// matching is a single DFA pass per category. Each category covers a major
+/// attack class: SQL injection, XSS, path traversal/LFI, command injection,
+/// and malicious bot User-Agent signatures.
 use regex::RegexSet;
 
+/// Compiled WAF rule sets for payload and User-Agent inspection.
+///
+/// Each field holds a [`RegexSet`] with one or more patterns for a specific
+/// vulnerability category. Using `RegexSet` allows matching against all
+/// patterns in a category in a single pass.
 pub struct WafRules {
+    /// SQL injection patterns (UNION SELECT, OR 1=1, comment injection, etc.).
     sqli_set: RegexSet,
+    /// Cross-site scripting patterns (script tags, event handlers, JS URIs).
     xss_set: RegexSet,
+    /// Local/remote file inclusion and path traversal patterns (../, /etc/passwd).
     lfi_rfi_set: RegexSet,
+    /// OS command injection and NoSQL operator patterns.
     cmd_injection_set: RegexSet,
+    /// Known malicious scanner and bot User-Agent signatures.
     bot_ua_set: RegexSet,
 }
 
 impl WafRules {
+    /// Compiles all OWASP regex rule sets.
+    ///
+    /// This is moderately expensive (regex compilation) and should be called
+    /// once at startup, not per-request. The resulting `WafRules` is then
+    /// shared via `Arc` across all request handlers.
     pub fn new() -> Self {
         // OWASP Top 10 - Injection (SQLi)
         let sqli_patterns = vec![

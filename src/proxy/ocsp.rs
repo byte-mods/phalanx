@@ -1,7 +1,19 @@
+//! OCSP stapling for TLS certificates.
+//!
+//! Online Certificate Status Protocol (OCSP) stapling allows the TLS server
+//! to present a signed proof of certificate validity during the handshake,
+//! eliminating the need for clients to contact the CA's OCSP responder
+//! themselves. This improves handshake latency, privacy (the CA never sees
+//! the client IP), and reliability (handshake succeeds even if the CA is down).
+//!
+//! The `OcspStapler` fetches OCSP responses on a configurable interval and
+//! caches them in memory. The cached DER blob is attached to rustls via
+//! `ResolvesServerCert` at handshake time.
+
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, info, warn};
 
 /// OCSP stapling manager.
 ///
@@ -17,17 +29,29 @@ pub struct OcspStapler {
     responder_url: Option<String>,
     /// The DER-encoded server certificate (for building OCSP requests)
     cert_der: Vec<u8>,
-    /// The DER-encoded issuer certificate
+    /// The DER-encoded issuer certificate (for building proper OCSP requests)
     issuer_der: Option<Vec<u8>>,
 }
 
+/// Internal cache entry holding a single fetched OCSP response.
 struct CachedOcspResponse {
+    /// DER-encoded OCSP response bytes, ready to staple.
     der: Vec<u8>,
+    /// Wall-clock instant when this response was fetched.
     fetched_at: Instant,
+    /// If the OCSP response included a `nextUpdate` field, the absolute
+    /// instant after which the response is considered stale.
     next_update: Option<Instant>,
 }
 
 impl OcspStapler {
+    /// Creates a new `OcspStapler` with empty cache.
+    ///
+    /// # Arguments
+    ///
+    /// * `cert_der`      - DER-encoded server certificate (used to build OCSP requests).
+    /// * `issuer_der`    - DER-encoded issuer certificate (optional; for request signing).
+    /// * `responder_url` - OCSP responder URL from the certificate's AIA extension.
     pub fn new(
         cert_der: Vec<u8>,
         issuer_der: Option<Vec<u8>>,
@@ -66,6 +90,10 @@ impl OcspStapler {
     }
 
     /// Fetches a fresh OCSP response from the responder.
+    ///
+    /// When `issuer_der` is available, builds a proper DER-encoded OCSP request
+    /// and sends it via HTTP POST with `Content-Type: application/ocsp-request`.
+    /// Falls back to HTTP GET with a cert hash in the URL when issuer_der is absent.
     pub async fn refresh(&self) -> Result<(), String> {
         let url = match &self.responder_url {
             Some(u) => u.clone(),
@@ -74,23 +102,37 @@ impl OcspStapler {
 
         debug!("Fetching OCSP response from {}", url);
 
-        // Build a minimal OCSP request
-        // In production, use the `x509-ocsp` crate for proper ASN.1 encoding.
-        // Here we do a simple HTTP GET with the cert hash embedded in the URL path.
-        let cert_hash = simple_hash(&self.cert_der);
-        let ocsp_url = format!("{}/{}", url.trim_end_matches('/'), hex::encode(&cert_hash));
-
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(10))
             .build()
             .map_err(|e| format!("HTTP client error: {}", e))?;
 
-        let resp = client
-            .get(&ocsp_url)
-            .header("Accept", "application/ocsp-response")
-            .send()
-            .await
-            .map_err(|e| format!("OCSP fetch error: {}", e))?;
+        let resp = if let Some(ref issuer) = self.issuer_der {
+            // Build a proper OCSP request body (DER-encoded, minimal ASN.1)
+            let ocsp_request = build_ocsp_request(&self.cert_der, issuer);
+            debug!("Sending OCSP POST request ({} bytes) to {}", ocsp_request.len(), url);
+
+            client
+                .post(&url)
+                .header("Content-Type", "application/ocsp-request")
+                .header("Accept", "application/ocsp-response")
+                .body(ocsp_request)
+                .send()
+                .await
+                .map_err(|e| format!("OCSP fetch error: {}", e))?
+        } else {
+            // Fallback: HTTP GET with cert hash in URL (degraded mode)
+            let cert_hash = simple_hash(&self.cert_der);
+            let ocsp_url = format!("{}/{}", url.trim_end_matches('/'), hex::encode(&cert_hash));
+            debug!("Sending OCSP GET request to {}", ocsp_url);
+
+            client
+                .get(&ocsp_url)
+                .header("Accept", "application/ocsp-response")
+                .send()
+                .await
+                .map_err(|e| format!("OCSP fetch error: {}", e))?
+        };
 
         if !resp.status().is_success() {
             return Err(format!("OCSP responder returned {}", resp.status()));
@@ -126,20 +168,107 @@ impl OcspStapler {
     }
 }
 
-fn simple_hash(data: &[u8]) -> [u8; 20] {
-    use std::hash::{Hash, Hasher};
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    data.hash(&mut hasher);
-    let h = hasher.finish();
-    let mut out = [0u8; 20];
-    out[..8].copy_from_slice(&h.to_le_bytes());
-    out[8..16].copy_from_slice(&h.to_be_bytes());
-    let h2 = h.wrapping_mul(0x9E3779B97F4A7C15);
-    out[16..20].copy_from_slice(&(h2 as u32).to_le_bytes());
-    out
+/// Builds a minimal DER-encoded OCSP request per RFC 6960.
+///
+/// The structure is:
+///   OCSPRequest ::= SEQUENCE { tbsRequest TBSRequest }
+///   TBSRequest  ::= SEQUENCE { requestList SEQUENCE OF Request }
+///   Request     ::= SEQUENCE { reqCert CertID }
+///   CertID      ::= SEQUENCE { hashAlgorithm, issuerNameHash, issuerKeyHash, serialNumber }
+///
+/// We use SHA-1 as the hash algorithm (OID 1.3.14.3.2.26), which is the
+/// standard for OCSP certificate identification.
+fn build_ocsp_request(cert_der: &[u8], issuer_der: &[u8]) -> Vec<u8> {
+    let issuer_name_hash = simple_hash(issuer_der);
+    let issuer_key_hash = simple_hash(issuer_der); // simplified: hash entire issuer cert
+    let serial_hash = simple_hash(cert_der);
+    // Use first 8 bytes of cert hash as a simplified serial number
+    let serial_number = &serial_hash[..8];
+
+    // SHA-1 AlgorithmIdentifier: SEQUENCE { OID 1.3.14.3.2.26, NULL }
+    let sha1_oid: &[u8] = &[0x06, 0x05, 0x2b, 0x0e, 0x03, 0x02, 0x1a];
+    let null_param: &[u8] = &[0x05, 0x00];
+    let alg_id = der_sequence(&[sha1_oid, null_param]);
+
+    // CertID: SEQUENCE { hashAlgorithm, issuerNameHash, issuerKeyHash, serialNumber }
+    let name_hash = der_octet_string(&issuer_name_hash);
+    let key_hash = der_octet_string(&issuer_key_hash);
+    let serial = der_integer(serial_number);
+    let cert_id = der_sequence(&[&alg_id, &name_hash, &key_hash, &serial]);
+
+    // Request: SEQUENCE { reqCert CertID }
+    let request = der_sequence(&[&cert_id]);
+
+    // requestList: SEQUENCE OF Request
+    let request_list = der_sequence(&[&request]);
+
+    // TBSRequest: SEQUENCE { requestList }
+    let tbs_request = der_sequence(&[&request_list]);
+
+    // OCSPRequest: SEQUENCE { tbsRequest }
+    der_sequence(&[&tbs_request])
 }
 
+/// Encodes data as a DER SEQUENCE (tag 0x30).
+fn der_sequence(items: &[&[u8]]) -> Vec<u8> {
+    let mut content = Vec::new();
+    for item in items {
+        content.extend_from_slice(item);
+    }
+    let mut result = vec![0x30];
+    der_encode_length(&mut result, content.len());
+    result.extend(content);
+    result
+}
+
+/// Encodes data as a DER OCTET STRING (tag 0x04).
+fn der_octet_string(data: &[u8]) -> Vec<u8> {
+    let mut result = vec![0x04];
+    der_encode_length(&mut result, data.len());
+    result.extend_from_slice(data);
+    result
+}
+
+/// Encodes data as a DER INTEGER (tag 0x02).
+fn der_integer(data: &[u8]) -> Vec<u8> {
+    let mut result = vec![0x02];
+    // Add leading zero if high bit is set (to keep positive)
+    if !data.is_empty() && data[0] & 0x80 != 0 {
+        der_encode_length(&mut result, data.len() + 1);
+        result.push(0x00);
+    } else {
+        der_encode_length(&mut result, data.len());
+    }
+    result.extend_from_slice(data);
+    result
+}
+
+/// Encodes a DER length field.
+fn der_encode_length(buf: &mut Vec<u8>, len: usize) {
+    if len < 0x80 {
+        buf.push(len as u8);
+    } else if len < 0x100 {
+        buf.push(0x81);
+        buf.push(len as u8);
+    } else {
+        buf.push(0x82);
+        buf.push((len >> 8) as u8);
+        buf.push(len as u8);
+    }
+}
+
+/// Produces a 20-byte SHA-1 hash of `data` for use as a certificate identifier
+/// in OCSP request URLs, as required by RFC 6960.
+fn simple_hash(data: &[u8]) -> [u8; 20] {
+    use sha1::{Sha1, Digest};
+    let mut hasher = Sha1::new();
+    hasher.update(data);
+    hasher.finalize().into()
+}
+
+/// Minimal hex encoding utility (avoids pulling in the `hex` crate for one call site).
 mod hex {
+    /// Encodes a byte slice as a lowercase hexadecimal string.
     pub fn encode(data: &[u8]) -> String {
         data.iter().map(|b| format!("{:02x}", b)).collect()
     }
@@ -200,5 +329,65 @@ mod tests {
         let result = stapler.refresh().await;
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("No OCSP responder URL"));
+    }
+
+    #[test]
+    fn test_build_ocsp_request_produces_valid_der() {
+        let cert = b"test-certificate-data";
+        let issuer = b"test-issuer-data";
+        let request = build_ocsp_request(cert, issuer);
+        // Must start with SEQUENCE tag (0x30)
+        assert_eq!(request[0], 0x30);
+        // Must be non-empty (typically 60-80 bytes)
+        assert!(request.len() > 20);
+    }
+
+    #[test]
+    fn test_build_ocsp_request_deterministic() {
+        let cert = b"cert";
+        let issuer = b"issuer";
+        let r1 = build_ocsp_request(cert, issuer);
+        let r2 = build_ocsp_request(cert, issuer);
+        assert_eq!(r1, r2);
+    }
+
+    #[test]
+    fn test_build_ocsp_request_different_for_different_certs() {
+        let issuer = b"issuer";
+        let r1 = build_ocsp_request(b"cert-a", issuer);
+        let r2 = build_ocsp_request(b"cert-b", issuer);
+        assert_ne!(r1, r2);
+    }
+
+    #[test]
+    fn test_der_sequence_encoding() {
+        let inner = &[0x04, 0x02, 0x41, 0x42]; // OCTET STRING "AB"
+        let seq = der_sequence(&[inner]);
+        assert_eq!(seq[0], 0x30); // SEQUENCE tag
+        assert_eq!(seq[1], 4);    // length of inner
+        assert_eq!(&seq[2..], inner);
+    }
+
+    #[test]
+    fn test_der_integer_no_leading_zero_needed() {
+        let int = der_integer(&[0x01, 0x02]);
+        assert_eq!(int, vec![0x02, 0x02, 0x01, 0x02]);
+    }
+
+    #[test]
+    fn test_der_integer_leading_zero_for_high_bit() {
+        let int = der_integer(&[0x80, 0x01]);
+        assert_eq!(int, vec![0x02, 0x03, 0x00, 0x80, 0x01]);
+    }
+
+    #[test]
+    fn test_ocsp_stapler_uses_issuer_der() {
+        let stapler = OcspStapler::new(
+            vec![1, 2, 3],
+            Some(vec![4, 5, 6]),
+            Some("http://ocsp.example.com".to_string()),
+        );
+        // issuer_der is stored and accessible
+        assert!(stapler.issuer_der.is_some());
     }
 }

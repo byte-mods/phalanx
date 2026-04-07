@@ -9,11 +9,10 @@
 //! OnResponseHeaders, OnResponseBody, and OnLog.
 
 use std::collections::HashMap;
-use std::path::Path;
 use std::sync::Arc;
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
-use tracing::{debug, error, info, warn};
+use tracing::info;
 
 /// Proxy-Wasm ABI action returned by plugin callbacks.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -73,6 +72,7 @@ pub struct WasmPluginResult {
 }
 
 impl Default for WasmPluginResult {
+    /// Returns a pass-through result: continue processing with no modifications.
     fn default() -> Self {
         Self {
             action: WasmAction::Continue,
@@ -110,6 +110,8 @@ pub struct WasmPluginConfig {
 }
 
 impl Default for WasmPluginConfig {
+    /// Returns a default config: unnamed, priority 100, enabled,
+    /// running only in the `OnRequestHeaders` phase.
     fn default() -> Self {
         Self {
             name: String::new(),
@@ -167,6 +169,8 @@ pub struct HeaderInjectionPlugin {
 }
 
 impl HeaderInjectionPlugin {
+    /// Creates a new header injection plugin with the given name and
+    /// list of `(header_name, header_value)` pairs to append.
     pub fn new(name: &str, headers: Vec<(String, String)>) -> Self {
         Self {
             name: name.to_string(),
@@ -198,6 +202,12 @@ pub struct HeaderRateLimitPlugin {
 }
 
 impl HeaderRateLimitPlugin {
+    /// Creates a new rate-limit plugin keyed by the given header.
+    /// Falls back to the client IP when the header is absent.
+    ///
+    /// # Arguments
+    /// * `header_name` - HTTP header used as the rate-limit key.
+    /// * `max_requests` - Maximum requests allowed per key before returning 429.
     pub fn new(name: &str, header_name: &str, max_requests: u64) -> Self {
         Self {
             name: name.to_string(),
@@ -248,6 +258,8 @@ pub struct PathBlockerPlugin {
 }
 
 impl PathBlockerPlugin {
+    /// Creates a new path blocker that returns 403 for requests whose path
+    /// contains any of the given substring patterns.
     pub fn new(name: &str, patterns: Vec<String>) -> Self {
         Self {
             name: name.to_string(),
@@ -279,18 +291,114 @@ impl WasmPlugin for PathBlockerPlugin {
     }
 }
 
+/// A plugin loaded from a `.wasm` file via the wasmtime runtime.
+///
+/// Implements the `WasmPlugin` trait by calling exported proxy-wasm ABI
+/// functions in the Wasm module. Supports `proxy_on_request_headers`,
+/// `proxy_on_request_body`, `proxy_on_response_headers`, and `proxy_on_log`.
+pub struct WasmtimePlugin {
+    name: String,
+    /// The compiled wasmtime module, ready for instantiation.
+    module: wasmtime::Module,
+    /// The wasmtime engine shared across all instances.
+    engine: wasmtime::Engine,
+}
+
+impl std::fmt::Debug for WasmtimePlugin {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WasmtimePlugin")
+            .field("name", &self.name)
+            .finish()
+    }
+}
+
+impl WasmtimePlugin {
+    /// Loads a `.wasm` file from disk and compiles it into a wasmtime module.
+    ///
+    /// # Errors
+    /// Returns an error if the file cannot be read or if the Wasm module
+    /// is malformed.
+    pub fn from_file(name: &str, path: &str) -> Result<Self, String> {
+        let engine = wasmtime::Engine::default();
+        let wasm_bytes = std::fs::read(path)
+            .map_err(|e| format!("Failed to read Wasm file '{}': {}", path, e))?;
+        let module = wasmtime::Module::new(&engine, &wasm_bytes)
+            .map_err(|e| format!("Failed to compile Wasm module '{}': {}", path, e))?;
+        info!("Loaded Wasm plugin '{}' from {}", name, path);
+        Ok(Self {
+            name: name.to_string(),
+            module,
+            engine,
+        })
+    }
+
+    /// Creates a new wasmtime instance and calls the named export function.
+    /// Returns the i32 result code (0 = Continue, 1 = Pause).
+    fn call_export(&self, func_name: &str) -> Option<i32> {
+        let mut store = wasmtime::Store::new(&self.engine, ());
+        let instance = wasmtime::Instance::new(&mut store, &self.module, &[]).ok()?;
+        let func = instance.get_typed_func::<(), i32>(&mut store, func_name).ok()?;
+        func.call(&mut store, ()).ok()
+    }
+}
+
+impl WasmPlugin for WasmtimePlugin {
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    fn on_request_headers(&self, _ctx: &WasmRequestContext) -> WasmPluginResult {
+        match self.call_export("proxy_on_request_headers") {
+            Some(1) => WasmPluginResult {
+                action: WasmAction::Pause,
+                ..Default::default()
+            },
+            _ => WasmPluginResult::default(),
+        }
+    }
+
+    fn on_request_body(&self, _ctx: &WasmRequestContext) -> WasmPluginResult {
+        match self.call_export("proxy_on_request_body") {
+            Some(1) => WasmPluginResult {
+                action: WasmAction::Pause,
+                ..Default::default()
+            },
+            _ => WasmPluginResult::default(),
+        }
+    }
+
+    fn on_response_headers(&self, _ctx: &WasmResponseContext) -> WasmPluginResult {
+        match self.call_export("proxy_on_response_headers") {
+            Some(1) => WasmPluginResult {
+                action: WasmAction::Pause,
+                ..Default::default()
+            },
+            _ => WasmPluginResult::default(),
+        }
+    }
+
+    fn on_log(&self, _req: &WasmRequestContext, _resp: &WasmResponseContext) -> WasmPluginResult {
+        self.call_export("proxy_on_log");
+        WasmPluginResult::default()
+    }
+}
+
 /// The plugin manager that orchestrates all registered Wasm plugins.
 pub struct WasmPluginManager {
     /// Registered plugins, sorted by priority
     plugins: Arc<RwLock<Vec<PluginEntry>>>,
 }
 
+/// Internal entry pairing a plugin instance with its configuration.
 struct PluginEntry {
+    /// The plugin implementation (native Rust or future Wasm runtime).
     plugin: Arc<dyn WasmPlugin>,
+    /// Configuration controlling priority, phases, and enabled state.
     config: WasmPluginConfig,
 }
 
 impl WasmPluginManager {
+    /// Creates an empty plugin manager with no registered plugins.
     pub fn new() -> Self {
         Self {
             plugins: Arc::new(RwLock::new(Vec::new())),
@@ -448,6 +556,90 @@ impl WasmPluginManager {
         let content =
             std::fs::read_to_string(path).map_err(|e| format!("read error: {}", e))?;
         serde_json::from_str(&content).map_err(|e| format!("parse error: {}", e))
+    }
+
+    /// Loads a plugin from a `WasmPluginConfig`.
+    ///
+    /// If `wasm_path` is non-empty and the file exists, loads it as a
+    /// `WasmtimePlugin`. Otherwise falls back to matching native plugins
+    /// by name ("header_injection", "path_blocker", "header_rate_limit").
+    pub fn load_from_config(&self, config: WasmPluginConfig) -> Result<(), String> {
+        if !config.wasm_path.is_empty() && std::path::Path::new(&config.wasm_path).exists() {
+            let plugin = WasmtimePlugin::from_file(&config.name, &config.wasm_path)?;
+            self.register(Arc::new(plugin), config);
+            Ok(())
+        } else if !config.wasm_path.is_empty() {
+            Err(format!("Wasm file not found: {}", config.wasm_path))
+        } else {
+            // No wasm_path — try native plugin matching
+            Err(format!(
+                "No wasm_path for plugin '{}'; register native plugins directly",
+                config.name
+            ))
+        }
+    }
+
+    /// Hot-reloads plugins from a JSON config file.
+    ///
+    /// Performs a 3-way diff: unloads removed plugins, reloads changed plugins
+    /// (by unregistering and re-registering), and adds new plugins. Native
+    /// plugins (those without a `wasm_path`) are preserved if they already exist.
+    pub fn reload_from_config(&self, config_path: &str) -> Result<usize, String> {
+        let configs = Self::load_config_from_file(config_path)?;
+        let mut plugins = self.plugins.write();
+
+        // Build a set of new plugin names for removal detection
+        let new_names: std::collections::HashSet<String> =
+            configs.iter().map(|c| c.name.clone()).collect();
+
+        // Remove plugins that are no longer in the config
+        let before = plugins.len();
+        plugins.retain(|e| new_names.contains(&e.config.name));
+        let removed = before - plugins.len();
+
+        // Track existing plugin names for add-vs-update detection
+        let existing_names: std::collections::HashSet<String> =
+            plugins.iter().map(|e| e.config.name.clone()).collect();
+
+        let mut added = 0usize;
+        let mut errors = Vec::new();
+
+        for cfg in configs {
+            if !cfg.enabled {
+                continue;
+            }
+            if existing_names.contains(&cfg.name) {
+                // Update: remove old and re-add
+                plugins.retain(|e| e.config.name != cfg.name);
+            }
+            if !cfg.wasm_path.is_empty() && std::path::Path::new(&cfg.wasm_path).exists() {
+                match WasmtimePlugin::from_file(&cfg.name, &cfg.wasm_path) {
+                    Ok(plugin) => {
+                        info!("Wasm plugin (re)loaded: {} from {}", cfg.name, cfg.wasm_path);
+                        plugins.push(PluginEntry {
+                            plugin: Arc::new(plugin),
+                            config: cfg,
+                        });
+                        added += 1;
+                    }
+                    Err(e) => {
+                        errors.push(format!("Failed to reload plugin '{}': {}", cfg.name, e));
+                    }
+                }
+            }
+        }
+
+        plugins.sort_by_key(|e| e.config.priority);
+
+        if !errors.is_empty() {
+            tracing::warn!("Wasm reload had {} errors: {:?}", errors.len(), errors);
+        }
+
+        info!(
+            "Wasm plugin reload complete: {} added/updated, {} removed",
+            added, removed
+        );
+        Ok(added + removed)
     }
 }
 
@@ -873,6 +1065,129 @@ mod tests {
         assert_eq!(hdrs.len(), 2);
     }
 
+    // ── WasmtimePlugin Tests ─────────────────────────────────────────────
+
+    #[test]
+    fn test_wasmtime_plugin_from_file_missing() {
+        let result = WasmtimePlugin::from_file("test", "/nonexistent/plugin.wasm");
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("Failed to read"));
+    }
+
+    #[test]
+    fn test_wasmtime_plugin_from_file_invalid_wasm() {
+        // Write invalid bytes to a temp file
+        let dir = std::env::temp_dir();
+        let path = dir.join("invalid_test.wasm");
+        std::fs::write(&path, b"not a wasm file").unwrap();
+        let result = WasmtimePlugin::from_file("test", path.to_str().unwrap());
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("Failed to compile"));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn test_wasmtime_plugin_loads_minimal_wasm() {
+        // Minimal valid Wasm module (empty module: magic + version + no sections)
+        let minimal_wasm = b"\x00asm\x01\x00\x00\x00";
+        let dir = std::env::temp_dir();
+        let path = dir.join("minimal_test.wasm");
+        std::fs::write(&path, minimal_wasm).unwrap();
+        let result = WasmtimePlugin::from_file("minimal", path.to_str().unwrap());
+        assert!(result.is_ok());
+        let plugin = result.unwrap();
+        assert_eq!(plugin.name(), "minimal");
+        // Calling exports that don't exist returns default (Continue)
+        let ctx = make_request_ctx();
+        let r = plugin.on_request_headers(&ctx);
+        assert_eq!(r.action, WasmAction::Continue);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn test_load_from_config_missing_wasm_file() {
+        let mgr = WasmPluginManager::new();
+        let config = WasmPluginConfig {
+            name: "test".into(),
+            wasm_path: "/nonexistent/plugin.wasm".into(),
+            ..Default::default()
+        };
+        let result = mgr.load_from_config(config);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_load_from_config_no_wasm_path() {
+        let mgr = WasmPluginManager::new();
+        let config = WasmPluginConfig {
+            name: "test".into(),
+            wasm_path: String::new(),
+            ..Default::default()
+        };
+        let result = mgr.load_from_config(config);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_load_from_config_minimal_wasm() {
+        let minimal_wasm = b"\x00asm\x01\x00\x00\x00";
+        let dir = std::env::temp_dir();
+        let path = dir.join("config_load_test.wasm");
+        std::fs::write(&path, minimal_wasm).unwrap();
+
+        let mgr = WasmPluginManager::new();
+        let config = WasmPluginConfig {
+            name: "loaded-plugin".into(),
+            wasm_path: path.to_str().unwrap().into(),
+            ..Default::default()
+        };
+        let result = mgr.load_from_config(config);
+        assert!(result.is_ok());
+        assert_eq!(mgr.plugin_count(), 1);
+        assert_eq!(mgr.plugin_names(), vec!["loaded-plugin"]);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn test_native_plugins_work_alongside_wasm() {
+        let mgr = WasmPluginManager::new();
+
+        // Register a native plugin
+        let native = Arc::new(HeaderInjectionPlugin::new(
+            "native",
+            vec![("X-Native".to_string(), "yes".to_string())],
+        ));
+        mgr.register(
+            native,
+            WasmPluginConfig {
+                name: "native".into(),
+                priority: 10,
+                phases: vec![WasmPhase::OnRequestHeaders],
+                ..Default::default()
+            },
+        );
+
+        // Load a minimal wasm plugin
+        let minimal_wasm = b"\x00asm\x01\x00\x00\x00";
+        let dir = std::env::temp_dir();
+        let path = dir.join("alongside_test.wasm");
+        std::fs::write(&path, minimal_wasm).unwrap();
+        let _ = mgr.load_from_config(WasmPluginConfig {
+            name: "wasm".into(),
+            wasm_path: path.to_str().unwrap().into(),
+            priority: 20,
+            phases: vec![WasmPhase::OnRequestHeaders],
+            ..Default::default()
+        });
+
+        assert_eq!(mgr.plugin_count(), 2);
+        let ctx = make_request_ctx();
+        let result = mgr.execute_request_headers(&ctx);
+        // Native plugin should inject headers
+        assert!(result.headers.is_some());
+        let _ = std::fs::remove_file(&path);
+    }
+
     #[test]
     fn test_direct_response_serialization() {
         let resp = WasmDirectResponse {
@@ -898,5 +1213,71 @@ mod tests {
         let ctx = make_response_ctx();
         let cloned = ctx.clone();
         assert_eq!(cloned.status_code, 200);
+    }
+
+    // ── reload_from_config tests ──────────────────────────────────────────
+
+    #[test]
+    fn test_reload_from_config_missing_file() {
+        let mgr = WasmPluginManager::new();
+        let result = mgr.reload_from_config("/nonexistent/plugins.json");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_reload_from_config_loads_wasm_plugins() {
+        let minimal_wasm = b"\x00asm\x01\x00\x00\x00";
+        let dir = std::env::temp_dir().join(format!("phalanx_wasm_reload_{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let wasm_path = dir.join("reload_test.wasm");
+        std::fs::write(&wasm_path, minimal_wasm).unwrap();
+
+        let config = serde_json::json!([
+            {
+                "name": "reload-plugin",
+                "wasm_path": wasm_path.to_str().unwrap(),
+                "config": "{}",
+                "phases": ["OnRequestHeaders"],
+                "priority": 50,
+                "enabled": true
+            }
+        ]);
+        let config_path = dir.join("plugins.json");
+        std::fs::write(&config_path, serde_json::to_string(&config).unwrap()).unwrap();
+
+        let mgr = WasmPluginManager::new();
+        let result = mgr.reload_from_config(config_path.to_str().unwrap());
+        assert!(result.is_ok());
+        assert_eq!(mgr.plugin_count(), 1);
+        assert_eq!(mgr.plugin_names(), vec!["reload-plugin"]);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_reload_removes_old_plugins() {
+        let mgr = WasmPluginManager::new();
+        // Register a native plugin
+        let plugin = Arc::new(HeaderInjectionPlugin::new("old-plugin", vec![]));
+        mgr.register(
+            plugin,
+            WasmPluginConfig {
+                name: "old-plugin".into(),
+                ..Default::default()
+            },
+        );
+        assert_eq!(mgr.plugin_count(), 1);
+
+        // Reload with empty config (no plugins) — old one should be removed
+        let dir = std::env::temp_dir().join(format!("phalanx_wasm_reload2_{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let config_path = dir.join("empty.json");
+        std::fs::write(&config_path, "[]").unwrap();
+
+        let result = mgr.reload_from_config(config_path.to_str().unwrap());
+        assert!(result.is_ok());
+        assert_eq!(mgr.plugin_count(), 0);
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

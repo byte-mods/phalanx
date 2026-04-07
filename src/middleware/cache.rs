@@ -1,12 +1,18 @@
+/// Advanced two-tier response cache (L1 in-memory + L2 on-disk).
+///
+/// Features beyond simple key-value caching:
+/// - **Vary-aware keys**: different cached variants per `Accept-Encoding`, etc.
+/// - **Stale-while-revalidate**: serves stale content while background refresh runs
+/// - **Stale-if-error**: serves stale content when upstream returns errors
+/// - **Thundering herd protection**: per-key mutex prevents parallel upstream fetches
+/// - **Disk persistence**: optional L2 tier survives process restarts
+/// - **Purge API**: single key, prefix-based, and full cache invalidation
 use bytes::Bytes;
 use dashmap::DashMap;
-use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-use tokio::sync::Mutex;
-use tracing::{debug, error, info, warn};
+use std::time::{Duration, Instant};
+use tracing::{debug, info, warn};
 
 /// Extended cache supporting disk tiers, Vary, stale-while-revalidate, locking,
 /// background updates, range/slice, and a purge API.
@@ -21,13 +27,25 @@ pub struct AdvancedCache {
     vary_map: Arc<DashMap<String, Vec<String>>>,
 }
 
+/// A single cached response entry with full HTTP metadata and freshness tracking.
+///
+/// Supports three freshness states:
+/// 1. **Fresh**: `created_at + max_age` has not elapsed
+/// 2. **Stale-revalidatable**: expired but within `stale_while_revalidate` window
+/// 3. **Stale-on-error**: expired but within `stale_if_error` window
 #[derive(Clone, Debug)]
 pub struct CacheEntry {
+    /// HTTP status code of the cached response.
     pub status: u16,
+    /// Response body bytes.
     pub body: Bytes,
+    /// Value of the Content-Type response header.
     pub content_type: String,
+    /// All response headers to replay on cache hit.
     pub headers: Vec<(String, String)>,
+    /// When this entry was originally cached.
     pub created_at: Instant,
+    /// Maximum time this entry is considered fresh.
     pub max_age: Duration,
     /// How long the entry can be served stale while a background refresh happens.
     pub stale_while_revalidate: Duration,
@@ -36,15 +54,18 @@ pub struct CacheEntry {
 }
 
 impl CacheEntry {
+    /// Returns `true` if this entry has not exceeded its `max_age`.
     pub fn is_fresh(&self) -> bool {
         self.created_at.elapsed() < self.max_age
     }
 
+    /// Returns `true` if stale but within the `stale_while_revalidate` grace window.
     pub fn is_stale_revalidatable(&self) -> bool {
         !self.is_fresh()
             && self.created_at.elapsed() < self.max_age + self.stale_while_revalidate
     }
 
+    /// Returns `true` if stale but within the `stale_if_error` grace window.
     pub fn is_stale_on_error(&self) -> bool {
         !self.is_fresh() && self.created_at.elapsed() < self.max_age + self.stale_if_error
     }
@@ -74,6 +95,12 @@ pub fn build_cache_key(
 }
 
 impl AdvancedCache {
+    /// Creates a new advanced cache with L1 memory and optional L2 disk tiers.
+    ///
+    /// # Arguments
+    /// * `max_capacity` - Maximum entries in the L1 Moka cache.
+    /// * `default_ttl_secs` - Default TTL for Moka eviction (minimum 60s).
+    /// * `disk_path` - Optional directory for L2 disk cache; created if absent.
     pub fn new(max_capacity: u64, default_ttl_secs: u64, disk_path: Option<&str>) -> Self {
         let cache = moka::future::Cache::builder()
             .max_capacity(max_capacity)
@@ -194,6 +221,7 @@ impl AdvancedCache {
         self.vary_map.get(base_key).map(|v| v.clone())
     }
 
+    /// Returns the approximate number of entries in the L1 memory cache.
     pub fn entry_count(&self) -> u64 {
         self.memory.entry_count()
     }
@@ -221,17 +249,20 @@ impl AdvancedCache {
 
     // ── Disk I/O helpers ──
 
+    /// Computes the filesystem path for a disk cache entry by hashing the key.
     fn disk_entry_path(&self, base: &Path, key: &str) -> PathBuf {
         let hash = hex_prefix(key);
         base.join(format!("{}.cache", hash))
     }
 
+    /// Reads and deserializes a cache entry from the L2 disk tier.
     async fn read_disk(&self, base: &Path, key: &str) -> Option<CacheEntry> {
         let path = self.disk_entry_path(base, key);
         let data = tokio::fs::read(&path).await.ok()?;
         deserialize_entry(&data)
     }
 
+    /// Serializes and writes a cache entry to the L2 disk tier.
     async fn write_disk(&self, base: &Path, key: &str, entry: &CacheEntry) {
         let path = self.disk_entry_path(base, key);
         if let Some(data) = serialize_entry(entry) {
@@ -242,6 +273,9 @@ impl AdvancedCache {
     }
 }
 
+/// Generates a deterministic 16-hex-char filename from a cache key using
+/// the standard library's `DefaultHasher`. This avoids filesystem issues
+/// with special characters in cache keys.
 fn hex_prefix(key: &str) -> String {
     use std::hash::{Hash, Hasher};
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
@@ -249,6 +283,9 @@ fn hex_prefix(key: &str) -> String {
     format!("{:016x}", hasher.finish())
 }
 
+/// Serializes a cache entry to a compact binary format for disk persistence.
+///
+/// Layout: [status:4][max_age:8][swr:8][sie:8][ct_len:4][ct:..][hdr_len:4][hdr_json:..][body:..]
 fn serialize_entry(entry: &CacheEntry) -> Option<Vec<u8>> {
     let max_age_secs = entry.max_age.as_secs();
     let swr_secs = entry.stale_while_revalidate.as_secs();
@@ -269,6 +306,11 @@ fn serialize_entry(entry: &CacheEntry) -> Option<Vec<u8>> {
     Some(buf)
 }
 
+/// Deserializes a cache entry from the binary disk format produced by `serialize_entry`.
+///
+/// Returns `None` if the data is too short or any field fails to parse.
+/// The `created_at` timestamp is set to `Instant::now()` since absolute
+/// instants cannot be persisted across process restarts.
 fn deserialize_entry(data: &[u8]) -> Option<CacheEntry> {
     if data.len() < 32 {
         return None;

@@ -1,11 +1,25 @@
+//! # Cluster State Module
+//!
+//! Provides a unified key-value interface (`ClusterState`) for sharing state
+//! across Phalanx nodes in a multi-instance deployment. Supports three backends:
+//!
+//! - **etcd**: Strongly consistent via the etcd v3 API with lease-based TTLs.
+//! - **Redis**: Fast, widely-deployed, with native TTL support via `SET EX`.
+//! - **Gossip**: Peer-to-peer SWIM protocol (see `gossip` submodule) with no
+//!   external dependencies; uses last-write-wins (LWW) semantics.
+//! - **Standalone**: No-op for single-node deployments.
+//!
+//! Higher-level operations (sticky sessions, heartbeats) are built on top of
+//! the primitive `put`/`get`/`delete` methods.
+
 pub mod gossip;
 
+use gossip::{GossipConfig, GossipState};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::time::sleep;
-use tracing::{debug, error, info, warn};
+use tracing::{info, warn};
 
 /// Shared state coordination across Phalanx cluster nodes via an external KV store.
 ///
@@ -15,8 +29,12 @@ use tracing::{debug, error, info, warn};
 /// - Shared health status
 /// - Leader election for singleton tasks
 pub struct ClusterState {
+    /// The storage backend used for KV operations.
     backend: ClusterBackend,
+    /// Unique identifier for this Phalanx node within the cluster.
     node_id: String,
+    /// Gossip state engine (populated when backend is Gossip).
+    gossip_state: Option<Arc<GossipState>>,
 }
 
 #[derive(Debug, Clone)]
@@ -31,18 +49,47 @@ pub enum ClusterBackend {
     Standalone,
 }
 
-/// A key-value entry with TTL support.
+/// A key-value entry stored in the cluster state with metadata for conflict resolution.
+///
+/// The `node_id` and `updated_at` fields enable debugging and last-write-wins
+/// conflict resolution in gossip mode.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ClusterEntry {
+    /// The stored value (e.g. a backend address for sticky sessions).
     pub value: String,
+    /// The node that last wrote this entry.
     pub node_id: String,
+    /// Unix timestamp (seconds) when this entry was last updated.
     pub updated_at: u64,
 }
 
 impl ClusterState {
+    /// Creates a new cluster state handle.
+    ///
+    /// # Arguments
+    /// * `backend` - Which storage engine to use (etcd, Redis, Gossip, or Standalone).
+    /// * `node_id` - A unique identifier for this Phalanx instance.
     pub fn new(backend: ClusterBackend, node_id: String) -> Self {
+        let gossip_state = if let ClusterBackend::Gossip { ref bind_addr, ref seed_peers } = backend {
+            let seed_addrs: Vec<std::net::SocketAddr> = seed_peers
+                .iter()
+                .filter_map(|s| s.parse().ok())
+                .collect();
+            let config = GossipConfig {
+                node_id: node_id.clone(),
+                bind_addr: bind_addr.parse().unwrap_or_else(|_| "0.0.0.0:7946".parse().unwrap()),
+                seed_peers: seed_addrs,
+                ..Default::default()
+            };
+            let state = Arc::new(GossipState::new(config));
+            state.clone().spawn_gossip_loop();
+            Some(state)
+        } else {
+            None
+        };
+
         info!("Cluster state initialized: node_id={}, backend={:?}", node_id, backend);
-        Self { backend, node_id }
+        Self { backend, node_id, gossip_state }
     }
 
     /// Stores a key-value pair in the cluster KV store with an optional TTL.
@@ -117,7 +164,15 @@ impl ClusterState {
                 }
                 Ok(())
             }
-            ClusterBackend::Gossip { .. } | ClusterBackend::Standalone => Ok(()),
+            ClusterBackend::Gossip { .. } => {
+                if let Some(gs) = &self.gossip_state {
+                    let serialized =
+                        serde_json::to_string(&entry).map_err(|e| format!("serialize: {}", e))?;
+                    gs.put(key, &serialized, ttl_secs.unwrap_or(0));
+                }
+                Ok(())
+            }
+            ClusterBackend::Standalone => Ok(()),
         }
     }
 
@@ -165,7 +220,20 @@ impl ClusterState {
                     None => Ok(None),
                 }
             }
-            ClusterBackend::Gossip { .. } | ClusterBackend::Standalone => Ok(None),
+            ClusterBackend::Gossip { .. } => {
+                if let Some(gs) = &self.gossip_state {
+                    if let Some(val) = gs.get(key) {
+                        let entry: ClusterEntry =
+                            serde_json::from_str(&val).map_err(|e| format!("deserialize: {}", e))?;
+                        Ok(Some(entry))
+                    } else {
+                        Ok(None)
+                    }
+                } else {
+                    Ok(None)
+                }
+            }
+            ClusterBackend::Standalone => Ok(None),
         }
     }
 
@@ -183,8 +251,27 @@ impl ClusterState {
                     .map_err(|e| format!("etcd delete: {}", e))?;
                 Ok(())
             }
-            ClusterBackend::Redis { url: _ } => Ok(()),
-            ClusterBackend::Gossip { .. } | ClusterBackend::Standalone => Ok(()),
+            ClusterBackend::Redis { url } => {
+                let client = redis::Client::open(url.as_str())
+                    .map_err(|e| format!("Redis connect error: {}", e))?;
+                let mut con = client
+                    .get_multiplexed_async_connection()
+                    .await
+                    .map_err(|e| format!("Redis connection error: {}", e))?;
+                redis::cmd("DEL")
+                    .arg(key)
+                    .query_async::<()>(&mut con)
+                    .await
+                    .map_err(|e| format!("Redis DEL error: {}", e))?;
+                Ok(())
+            }
+            ClusterBackend::Gossip { .. } => {
+                if let Some(gs) = &self.gossip_state {
+                    gs.delete(key);
+                }
+                Ok(())
+            }
+            ClusterBackend::Standalone => Ok(()),
         }
     }
 
@@ -216,7 +303,9 @@ impl ClusterState {
         self.put(&key, &value, Some(ttl_secs)).await
     }
 
-    /// Spawns a background heartbeat loop.
+    /// Spawns a background heartbeat loop that periodically writes this node's
+    /// "alive" status to the cluster store. The TTL is set to 3x the interval
+    /// so that a missed heartbeat does not immediately expire the registration.
     pub fn spawn_heartbeat(self: Arc<Self>, interval_secs: u64) {
         tokio::spawn(async move {
             loop {
@@ -228,6 +317,7 @@ impl ClusterState {
         });
     }
 
+    /// Returns this node's unique identifier.
     pub fn node_id(&self) -> &str {
         &self.node_id
     }
@@ -298,6 +388,42 @@ mod tests {
         let backend = ClusterBackend::Etcd { endpoints: vec!["http://localhost:2379".to_string()] };
         let debug_str = format!("{:?}", backend);
         assert!(debug_str.contains("Etcd"));
+    }
+
+    #[tokio::test]
+    async fn test_gossip_cluster_put_get_delete() {
+        let state = ClusterState::new(
+            ClusterBackend::Gossip {
+                bind_addr: "127.0.0.1:0".to_string(),
+                seed_peers: vec![],
+            },
+            "gossip-node-1".to_string(),
+        );
+        assert!(state.gossip_state.is_some());
+
+        // put + get
+        state.put("test-key", "test-value", Some(300)).await.unwrap();
+        let entry = state.get("test-key").await.unwrap().expect("should find key");
+        assert_eq!(entry.value, "test-value");
+        assert_eq!(entry.node_id, "gossip-node-1");
+
+        // delete
+        state.delete("test-key").await.unwrap();
+        assert!(state.get("test-key").await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn test_gossip_cluster_sticky_session() {
+        let state = ClusterState::new(
+            ClusterBackend::Gossip {
+                bind_addr: "127.0.0.1:0".to_string(),
+                seed_peers: vec![],
+            },
+            "gossip-node-1".to_string(),
+        );
+        state.share_sticky_session("user-42", "10.0.0.5:8080", 60).await.unwrap();
+        let backend = state.lookup_sticky_session("user-42").await;
+        assert_eq!(backend, Some("10.0.0.5:8080".to_string()));
     }
 
     #[test]

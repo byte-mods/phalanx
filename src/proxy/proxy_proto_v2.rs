@@ -23,21 +23,28 @@ const PP2_HEADER_LEN: usize = 16;
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
-/// Address family of the proxied connection.
+/// Address family of the proxied connection (nibble in byte 13 of the header).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AddressFamily {
+    /// Unspecified -- no address information present (e.g. health check).
     Unspec,
+    /// IPv4 (AF_INET) -- 12 bytes of address data (src_ip4, dst_ip4, src_port, dst_port).
     Ipv4,
+    /// IPv6 (AF_INET6) -- 36 bytes of address data.
     Ipv6,
+    /// Unix domain socket -- 216 bytes (108 + 108) of path data; no `SocketAddr`.
     Unix,
 }
 
-/// Transport protocol of the proxied connection.
+/// Transport protocol of the proxied connection (low nibble of byte 13).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TransportProtocol {
+    /// Unspecified transport.
     Unspec,
-    Stream, // TCP
-    Dgram,  // UDP
+    /// Stream (TCP).
+    Stream,
+    /// Datagram (UDP).
+    Dgram,
 }
 
 /// The parsed PROXY Protocol v2 header.

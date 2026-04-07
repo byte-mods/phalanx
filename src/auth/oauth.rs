@@ -1,3 +1,8 @@
+/// OAuth 2.0 Token Introspection (RFC 7662) authentication.
+///
+/// Validates Bearer tokens by calling a remote introspection endpoint with
+/// the proxy's own client credentials. Results are cached in a thread-safe
+/// [`DashMap`] to avoid hammering the authorization server on every request.
 use super::AuthResult;
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use dashmap::DashMap;
@@ -11,22 +16,55 @@ use tracing::{debug, error, warn};
 const CACHE_TTL: Duration = Duration::from_secs(60);
 
 /// OAuth 2.0 Token Introspection response (RFC 7662).
+///
+/// The `active` field is the only mandatory field -- if `false`, the token
+/// is expired, revoked, or otherwise invalid.
 #[derive(Debug, Deserialize)]
 struct IntrospectResponse {
+    /// Whether the token is currently active and valid.
     active: bool,
+    /// Subject identifier for the token owner.
     sub: Option<String>,
+    /// Space-delimited list of OAuth scopes granted to the token.
     scope: Option<String>,
-    #[allow(dead_code)]
+    /// Token expiration time (Unix timestamp); used to cap cache TTL.
     exp: Option<u64>,
 }
 
 /// Shared, async-safe OAuth token introspection cache.
-/// Key: raw Bearer token string. Value: cached introspection result.
-pub type OAuthCache = Arc<DashMap<String, (bool, Option<String>, Instant)>>;
+/// Key: raw Bearer token string. Value: (active, subject, cached_at, token_exp).
+pub type OAuthCache = Arc<DashMap<String, (bool, Option<String>, Instant, Option<u64>)>>;
 
 /// Create a new empty OAuth cache.
 pub fn new_cache() -> OAuthCache {
     Arc::new(DashMap::new())
+}
+
+/// Spawns a background task that periodically removes expired entries from the cache.
+pub fn spawn_cache_reaper(cache: OAuthCache) {
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(60));
+        loop {
+            interval.tick().await;
+            cache.retain(|_, (_, _, cached_at, exp)| {
+                // Remove if past fixed TTL
+                if cached_at.elapsed() >= CACHE_TTL {
+                    return false;
+                }
+                // Remove if token has expired (exp is in the past)
+                if let Some(exp_ts) = exp {
+                    let now_ts = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_secs();
+                    if now_ts >= *exp_ts {
+                        return false;
+                    }
+                }
+                true
+            });
+        }
+    });
 }
 
 /// Check OAuth 2.0 Bearer token via RFC 7662 token introspection.
@@ -59,8 +97,23 @@ pub async fn check(
 
     // Check cache first
     if let Some(entry) = cache.get(&token) {
-        let (active, sub, cached_at) = entry.value().clone();
-        if cached_at.elapsed() < CACHE_TTL {
+        let (active, sub, cached_at, exp) = entry.value().clone();
+        // Effective TTL: min(CACHE_TTL, time until token exp)
+        let effective_ttl = match exp {
+            Some(exp_ts) => {
+                let now_ts = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs();
+                if now_ts >= exp_ts {
+                    Duration::from_secs(0) // already expired
+                } else {
+                    CACHE_TTL.min(Duration::from_secs(exp_ts - now_ts))
+                }
+            }
+            None => CACHE_TTL,
+        };
+        if cached_at.elapsed() < effective_ttl {
             debug!("OAuth cache hit for token (active={})", active);
             return if active {
                 (AuthResult::Allowed, sub)
@@ -80,8 +133,8 @@ pub async fn check(
     match introspect_token(&token, introspect_url, client_id, client_secret).await {
         Ok(resp) => {
             let sub = resp.sub.clone();
-            // Cache the result
-            cache.insert(token.clone(), (resp.active, sub.clone(), Instant::now()));
+            // Cache the result (include exp for TTL capping)
+            cache.insert(token.clone(), (resp.active, sub.clone(), Instant::now(), resp.exp));
             if resp.active {
                 debug!("OAuth token active, scope={:?}", resp.scope);
                 (AuthResult::Allowed, sub)
@@ -153,14 +206,19 @@ fn reqwest_client() -> Result<reqwest::Client, String> {
 }
 
 /// URL-encode a token string (percent-encode special characters).
+///
+/// Implements RFC 3986 unreserved character pass-through: alphanumeric and
+/// `-`, `_`, `.`, `~` are left as-is; everything else is percent-encoded
+/// byte-by-byte (supporting multi-byte UTF-8 characters).
 fn urlencoded(input: &str) -> String {
     input
         .chars()
         .flat_map(|c| {
             if c.is_alphanumeric() || matches!(c, '-' | '_' | '.' | '~') {
+                // Unreserved characters pass through unchanged
                 vec![c]
             } else {
-                // Percent-encode the byte(s)
+                // Percent-encode each byte of the UTF-8 representation
                 c.encode_utf8(&mut [0u8; 4])
                     .bytes()
                     .flat_map(|b| format!("%{:02X}", b).chars().collect::<Vec<_>>())
@@ -198,7 +256,7 @@ mod tests {
         let cache = new_cache();
         cache.insert(
             "valid-token".to_string(),
-            (true, Some("user-1".to_string()), Instant::now()),
+            (true, Some("user-1".to_string()), Instant::now(), None),
         );
         let rt = tokio::runtime::Runtime::new().unwrap();
         let (result, sub) = rt.block_on(check(
@@ -215,7 +273,7 @@ mod tests {
     #[test]
     fn test_cache_hit_inactive_denied() {
         let cache = new_cache();
-        cache.insert("inactive-token".to_string(), (false, None, Instant::now()));
+        cache.insert("inactive-token".to_string(), (false, None, Instant::now(), None));
         let rt = tokio::runtime::Runtime::new().unwrap();
         let (result, _) = rt.block_on(check(
             &bearer_headers("inactive-token"),
@@ -248,7 +306,7 @@ mod tests {
         let old = Instant::now()
             .checked_sub(Duration::from_secs(120))
             .unwrap_or(Instant::now());
-        cache.insert("old-token".to_string(), (true, None, old));
+        cache.insert("old-token".to_string(), (true, None, old, None));
 
         // The cache should detect expiry and attempt a live introspection.
         // Since the URL is unreachable, it should return Denied with an error.
@@ -264,6 +322,61 @@ mod tests {
         assert!(matches!(result, AuthResult::Denied(..)));
         // Cache entry should have been removed
         assert!(!cache.contains_key("old-token"));
+    }
+
+    #[test]
+    fn test_cache_entry_with_exp_in_past_is_evicted() {
+        let cache = new_cache();
+        // Token expired 10 seconds ago
+        let past_exp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            - 10;
+        cache.insert(
+            "expired-token".to_string(),
+            (true, Some("user-1".to_string()), Instant::now(), Some(past_exp)),
+        );
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let (result, _) = rt.block_on(check(
+            &bearer_headers("expired-token"),
+            "http://127.0.0.1:0/introspect",
+            "client",
+            "secret",
+            &cache,
+        ));
+        // Effective TTL is 0 due to past exp, so cache miss → introspection fails → Denied
+        assert!(matches!(result, AuthResult::Denied(..)));
+    }
+
+    #[test]
+    fn test_cache_reaper_removes_expired_entries() {
+        let cache = new_cache();
+        let old = Instant::now()
+            .checked_sub(Duration::from_secs(120))
+            .unwrap_or(Instant::now());
+        cache.insert("stale".to_string(), (true, None, old, None));
+        cache.insert("fresh".to_string(), (true, None, Instant::now(), None));
+
+        // Manually run the reaper logic
+        cache.retain(|_, (_, _, cached_at, exp)| {
+            if cached_at.elapsed() >= CACHE_TTL {
+                return false;
+            }
+            if let Some(exp_ts) = exp {
+                let now_ts = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs();
+                if now_ts >= *exp_ts {
+                    return false;
+                }
+            }
+            true
+        });
+
+        assert!(!cache.contains_key("stale"));
+        assert!(cache.contains_key("fresh"));
     }
 
     #[test]

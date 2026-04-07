@@ -1,10 +1,24 @@
+//! gRPC-Web protocol translation layer.
+//!
+//! Browser-based gRPC clients cannot use native HTTP/2 gRPC because browsers
+//! do not expose the HTTP/2 framing layer. Instead they use "gRPC-Web", which
+//! encodes gRPC messages over HTTP/1.1 (or HTTP/2) with a different content
+//! type (`application/grpc-web` or `application/grpc-web-text` for base64).
+//!
+//! This module translates:
+//! - **Request**: `grpc-web` content type -> standard `grpc` content type, adds `TE: trailers`.
+//! - **Response**: `grpc` content type -> `grpc-web` (or `grpc-web-text`), adds CORS headers.
+//! - **Preflight**: Handles `OPTIONS` requests with proper CORS headers for browser compatibility.
+
 use bytes::Bytes;
 use http_body_util::combinators::BoxBody;
 use http_body_util::{BodyExt, Full};
 use hyper::{Request, Response, StatusCode};
-use tracing::debug;
 
-/// Detects whether the request is a gRPC-Web call by content type.
+/// Detects whether the request is a gRPC-Web call by inspecting the `Content-Type` header.
+///
+/// Returns `true` if the content type starts with `application/grpc-web`,
+/// `application/grpc-web+proto`, or `application/grpc-web-text`.
 pub fn is_grpc_web<T>(req: &Request<T>) -> bool {
     req.headers()
         .get(hyper::header::CONTENT_TYPE)
@@ -51,9 +65,10 @@ pub fn translate_request(
 /// Translates a standard gRPC response back to gRPC-Web format.
 ///
 /// - Rewrites content-type from `application/grpc` → `application/grpc-web`
-/// - Moves trailers into the response body (gRPC-Web requires trailers in body)
+/// - Appends trailers to the response body as a length-prefixed frame
+///   (0x80 flag byte + 4-byte big-endian length + trailer text)
 /// - Adds CORS headers for browser compatibility
-pub fn translate_response(
+pub async fn translate_response(
     response: Response<BoxBody<Bytes, hyper::Error>>,
     use_text_encoding: bool,
 ) -> Response<BoxBody<Bytes, hyper::Error>> {
@@ -73,6 +88,43 @@ pub fn translate_response(
         }
     }
 
+    // Collect the response body so we can append trailers
+    let body_bytes = match body.collect().await {
+        Ok(collected) => collected.to_bytes(),
+        Err(_) => Bytes::new(),
+    };
+
+    // Build trailer frame from grpc-status and grpc-message headers
+    let mut trailer_text = String::new();
+    if let Some(status) = parts.headers.get("grpc-status") {
+        if let Ok(s) = status.to_str() {
+            trailer_text.push_str(&format!("grpc-status: {}\r\n", s));
+        }
+    }
+    if let Some(msg) = parts.headers.get("grpc-message") {
+        if let Ok(s) = msg.to_str() {
+            trailer_text.push_str(&format!("grpc-message: {}\r\n", s));
+        }
+    }
+
+    // Build final body: original body + trailer frame (0x80 | len | trailer_text)
+    let mut final_body = body_bytes.to_vec();
+    if !trailer_text.is_empty() {
+        let trailer_bytes = trailer_text.as_bytes();
+        // Trailer frame: flag byte (0x80) + 4-byte big-endian length + data
+        final_body.push(0x80);
+        final_body.extend_from_slice(&(trailer_bytes.len() as u32).to_be_bytes());
+        final_body.extend_from_slice(trailer_bytes);
+    }
+
+    // If text encoding requested, base64-encode the entire body
+    let response_body = if use_text_encoding {
+        use base64::{Engine, engine::general_purpose::STANDARD};
+        STANDARD.encode(&final_body).into_bytes()
+    } else {
+        final_body
+    };
+
     // gRPC-Web CORS headers for browser clients
     parts.headers.insert(
         hyper::header::ACCESS_CONTROL_EXPOSE_HEADERS,
@@ -81,7 +133,12 @@ pub fn translate_response(
             .unwrap(),
     );
 
-    Response::from_parts(parts, body)
+    Response::from_parts(
+        parts,
+        Full::new(Bytes::from(response_body))
+            .map_err(|never| match never {})
+            .boxed(),
+    )
 }
 
 /// Adds standard CORS preflight headers for gRPC-Web OPTIONS requests.
@@ -108,10 +165,10 @@ pub fn cors_preflight_response() -> Response<BoxBody<Bytes, hyper::Error>> {
 
 #[cfg(test)]
 mod tests {
-    use super::{cors_preflight_response, is_grpc_web, translate_request};
+    use super::*;
     use bytes::Bytes;
-    use http_body_util::Full;
-    use hyper::{header, Request, StatusCode};
+    use http_body_util::{BodyExt, Full};
+    use hyper::{header, Request, Response, StatusCode};
 
     #[test]
     fn test_is_grpc_web_true() {
@@ -205,6 +262,94 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::NO_CONTENT);
     }
 
+    #[tokio::test]
+    async fn test_translate_response_appends_trailers_to_body() {
+        let resp = Response::builder()
+            .status(StatusCode::OK)
+            .header(header::CONTENT_TYPE, "application/grpc")
+            .header("grpc-status", "0")
+            .header("grpc-message", "OK")
+            .body(
+                Full::new(Bytes::from_static(b"\x00\x00\x00\x00\x05hello"))
+                    .map_err(|never| match never {})
+                    .boxed(),
+            )
+            .unwrap();
+
+        let translated = translate_response(resp, false).await;
+        let body = translated
+            .into_body()
+            .collect()
+            .await
+            .unwrap()
+            .to_bytes();
+
+        // Body should contain original data + trailer frame (0x80 + len + trailer text)
+        assert!(body.len() > 10);
+        // Find the trailer frame: look for 0x80 byte
+        let trailer_pos = body.iter().position(|&b| b == 0x80);
+        assert!(trailer_pos.is_some(), "trailer frame must be present");
+        let pos = trailer_pos.unwrap();
+        // 4 bytes of length after the 0x80 flag
+        let trailer_len = u32::from_be_bytes([body[pos + 1], body[pos + 2], body[pos + 3], body[pos + 4]]) as usize;
+        let trailer_text = std::str::from_utf8(&body[pos + 5..pos + 5 + trailer_len]).unwrap();
+        assert!(trailer_text.contains("grpc-status: 0"));
+        assert!(trailer_text.contains("grpc-message: OK"));
+    }
+
+    #[tokio::test]
+    async fn test_translate_response_text_encoding_base64() {
+        let resp = Response::builder()
+            .status(StatusCode::OK)
+            .header(header::CONTENT_TYPE, "application/grpc")
+            .header("grpc-status", "0")
+            .body(
+                Full::new(Bytes::from_static(b"\x00\x00\x00\x00\x02hi"))
+                    .map_err(|never| match never {})
+                    .boxed(),
+            )
+            .unwrap();
+
+        let translated = translate_response(resp, true).await;
+        let body = translated
+            .into_body()
+            .collect()
+            .await
+            .unwrap()
+            .to_bytes();
+
+        // Text encoding should produce valid base64
+        let decoded = base64::Engine::decode(
+            &base64::engine::general_purpose::STANDARD,
+            &body,
+        );
+        assert!(decoded.is_ok(), "body must be valid base64");
+    }
+
+    #[tokio::test]
+    async fn test_translate_response_no_trailers() {
+        let resp = Response::builder()
+            .status(StatusCode::OK)
+            .header(header::CONTENT_TYPE, "application/grpc")
+            .body(
+                Full::new(Bytes::from_static(b"data"))
+                    .map_err(|never| match never {})
+                    .boxed(),
+            )
+            .unwrap();
+
+        let translated = translate_response(resp, false).await;
+        let body = translated
+            .into_body()
+            .collect()
+            .await
+            .unwrap()
+            .to_bytes();
+
+        // No grpc-status/grpc-message headers → no trailer frame appended
+        assert_eq!(&body[..], b"data");
+    }
+
     #[test]
     fn test_cors_preflight_response_headers() {
         let resp = cors_preflight_response();
@@ -231,4 +376,3 @@ mod tests {
         );
     }
 }
-

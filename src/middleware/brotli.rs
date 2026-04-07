@@ -1,7 +1,15 @@
+/// Brotli response compression middleware.
+///
+/// Brotli typically achieves 15-25% better compression than gzip for text
+/// content. This module provides detection of `Accept-Encoding: br` and
+/// compression with configurable quality (0-11, clamped).
+/// Bodies smaller than [`MIN_BROTLI_SIZE`] (1 KB) are skipped.
 use bytes::Bytes;
 use std::io::Write;
 use tracing::debug;
 
+/// Minimum body size to attempt Brotli compression (1 KB).
+/// Below this threshold, compression overhead exceeds the savings.
 pub const MIN_BROTLI_SIZE: usize = 1024;
 
 /// Checks if the client accepts Brotli encoding.

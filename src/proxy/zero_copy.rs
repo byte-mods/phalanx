@@ -1,6 +1,27 @@
+//! Zero-copy bidirectional data transfer.
+//!
+//! Provides two implementations for relaying bytes between a client stream and
+//! a backend stream:
+//!
+//! 1. **Fallback (all platforms)** -- `copy_bidirectional_fallback` uses Tokio's
+//!    userspace `copy_bidirectional`, which copies data through a kernel-to-user
+//!    bounce buffer.
+//! 2. **Linux splice (zero-copy)** -- `linux::splice_bidirectional` uses the
+//!    `splice(2)` syscall to move data between file descriptors via an in-kernel
+//!    pipe, avoiding any user-space copy and halving the number of context
+//!    switches per byte transferred.
+//!
+//! The TCP and WebSocket proxy modules choose the optimal implementation at
+//! compile time with `#[cfg(target_os = "linux")]`.
+
 use tokio::io::{AsyncRead, AsyncWrite};
 
-/// Bi-directionally proxies data between two generic streams using Tokio's fallback.
+/// Bi-directionally proxies data between two generic async streams using Tokio's
+/// userspace `copy_bidirectional`.
+///
+/// Returns `(bytes_a_to_b, bytes_b_to_a)` on success.
+///
+/// This is the portable fallback used on macOS, Windows, and any non-Linux target.
 pub async fn copy_bidirectional_fallback<A, B>(
     a: &mut A,
     b: &mut B,
@@ -14,12 +35,26 @@ where
 
 #[cfg(target_os = "linux")]
 pub mod linux {
+    //! Linux-specific zero-copy implementation using the `splice(2)` syscall.
+    //!
+    //! Data flows: socket_fd -> pipe -> socket_fd, entirely inside the kernel.
+    //! This eliminates all user-space memory copies and is significantly faster
+    //! for high-throughput TCP proxying (e.g. database traffic, video streaming).
+
     use nix::fcntl::{OFlag, SpliceFFlags, splice};
     use nix::unistd::pipe2;
     use std::os::fd::{AsRawFd, RawFd};
     use std::os::unix::io::OwnedFd;
     use tokio::net::TcpStream;
 
+    /// Splice data in one direction: `src` socket -> kernel pipe -> `dst` socket.
+    ///
+    /// Runs in a loop until `src` reaches EOF (returns 0 from splice).
+    /// Uses non-blocking splice with Tokio readiness notifications to avoid
+    /// busy-waiting.
+    ///
+    /// # Returns
+    /// Total bytes transferred from `src` to `dst`.
     async fn splice_unidirectional(
         src: &TcpStream,
         dst: &TcpStream,
@@ -27,10 +62,12 @@ pub mod linux {
         pipe_write: RawFd,
     ) -> std::io::Result<u64> {
         let mut total_copied: u64 = 0;
+        // Track how many bytes are currently sitting in the kernel pipe buffer,
+        // waiting to be drained to the destination socket.
         let mut bytes_in_pipe: usize = 0;
 
         loop {
-            // Fill pipe
+            // Phase 1: Fill the pipe from the source socket (splice src_fd -> pipe_write)
             if bytes_in_pipe == 0 {
                 let res = src.try_io(tokio::io::Interest::READABLE, || {
                     splice(
@@ -58,7 +95,7 @@ pub mod linux {
                 }
             }
 
-            // Drain pipe
+            // Phase 2: Drain the pipe into the destination socket (splice pipe_read -> dst_fd)
             while bytes_in_pipe > 0 {
                 let res = dst.try_io(tokio::io::Interest::WRITABLE, || {
                     splice(
@@ -93,7 +130,16 @@ pub mod linux {
         Ok(total_copied)
     }
 
-    /// True zero-copy bidirectional proxy for TcpStreams using Linux `splice`.
+    /// True zero-copy bidirectional proxy for `TcpStream`s using Linux `splice(2)`.
+    ///
+    /// Creates two kernel pipes (one per direction) and runs the two
+    /// unidirectional splice loops concurrently via `tokio::try_join!`.
+    ///
+    /// # Returns
+    /// `(bytes_client_to_server, bytes_server_to_client)` on success.
+    ///
+    /// The `OwnedFd` pipe handles are dropped (closed) automatically when
+    /// this function returns, preventing file descriptor leaks.
     pub async fn splice_bidirectional(
         client: &mut TcpStream,
         server: &mut TcpStream,

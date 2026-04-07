@@ -1,3 +1,18 @@
+//! URL rewriting engine (Nginx-compatible).
+//!
+//! Provides regex-based URI rewriting with four flag types that control
+//! routing behavior after a match:
+//!
+//! | Flag        | Behavior                                                    |
+//! |-------------|-------------------------------------------------------------|
+//! | `break`     | Rewrite the URI and continue to the backend (no re-routing).|
+//! | `last`      | Rewrite the URI and restart route matching from the top.    |
+//! | `redirect`  | Return a 302 Found redirect to the rewritten URI.           |
+//! | `permanent` | Return a 301 Moved Permanently redirect.                    |
+//!
+//! Capture group syntax supports Nginx-style `$1`, `$2`, ... which are
+//! internally converted to the `regex` crate's `${1}`, `${2}` format.
+
 use hyper::StatusCode;
 use regex::Regex;
 
@@ -163,14 +178,9 @@ pub fn apply_rewrites(rules: &[RewriteRule], uri: &str) -> RewriteResult {
 }
 
 /// Compile a slice of raw `(pattern, replacement, flag)` tuples into `RewriteRule`s.
-/// Panics at startup with a descriptive message if any rule is invalid.
-pub fn compile_rules(raw: &[(String, String, String)]) -> Vec<RewriteRule> {
+pub fn compile_rules(raw: &[(String, String, String)]) -> Result<Vec<RewriteRule>, String> {
     raw.iter()
-        .map(|(pat, rep, flag)| {
-            RewriteRule::compile(pat, rep, flag).unwrap_or_else(|e| {
-                panic!("Configuration error in rewrite rule: {}", e);
-            })
-        })
+        .map(|(pat, rep, flag)| RewriteRule::compile(pat, rep, flag))
         .collect()
 }
 

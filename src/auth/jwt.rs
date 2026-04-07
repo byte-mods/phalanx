@@ -1,16 +1,31 @@
+/// JWT Bearer token authentication.
+///
+/// Validates `Authorization: Bearer <token>` headers using the `jsonwebtoken` crate.
+/// Supports HMAC (HS256/384/512), RSA (RS256/384/512), and ECDSA (ES256/384)
+/// algorithms. On success, decoded claims are returned so the proxy can inject
+/// `X-Auth-*` headers into upstream requests.
 use super::AuthResult;
 use hyper::{HeaderMap, StatusCode};
 use jsonwebtoken::{Algorithm, DecodingKey, Validation, decode};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
-/// Standard JWT claims we extract on successful validation.
+/// Standard JWT claims extracted on successful token validation.
+///
+/// Only commonly used claims are deserialized; additional custom claims
+/// are silently ignored by serde. The `aud` field uses a generic JSON value
+/// because the JWT spec allows it to be either a string or an array of strings.
 #[derive(Debug, Deserialize, Serialize)]
 pub struct Claims {
+    /// Subject identifier (unique user ID in the IdP).
     pub sub: Option<String>,
+    /// User email address, if present in the token.
     pub email: Option<String>,
+    /// Expiration time as a Unix timestamp (seconds since epoch).
     pub exp: Option<u64>,
+    /// Issuer of the token (e.g., `https://auth.example.com`).
     pub iss: Option<String>,
+    /// Audience claim -- can be a single string or array of strings per RFC 7519.
     pub aud: Option<serde_json::Value>,
 }
 

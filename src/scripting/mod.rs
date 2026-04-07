@@ -1,9 +1,7 @@
-use bytes::Bytes;
-use hyper::{HeaderMap, StatusCode};
+use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::sync::Arc;
-use tracing::{debug, error, warn};
+use tracing::{debug, info};
 
 pub mod rhai_engine;
 
@@ -31,19 +29,34 @@ pub enum HookPhase {
     Log,
 }
 
-/// The context available to a hook during execution.
+/// The request/response context available to a hook during execution.
+///
+/// This struct is populated by the proxy pipeline and passed to every hook
+/// handler. Pre-upstream hooks see request data; post-upstream hooks also
+/// see the response status and headers.
 #[derive(Debug, Clone)]
 pub struct HookContext {
+    /// Client's IP address (after real-IP extraction).
     pub client_ip: String,
+    /// HTTP method (e.g. "GET", "POST").
     pub method: String,
+    /// Request URI path (e.g. "/api/users").
     pub path: String,
+    /// Optional query string (without the leading `?`).
     pub query: Option<String>,
+    /// Request headers as a flat key-value map.
     pub headers: HashMap<String, String>,
+    /// Response status code (only populated in PostUpstream and Log phases).
     pub status: Option<u16>,
+    /// Response headers from the backend (only populated in PostUpstream and Log phases).
     pub response_headers: HashMap<String, String>,
 }
 
-/// The result of executing a hook.
+/// The result of executing a hook, determining how the proxy pipeline proceeds.
+///
+/// Hooks can pass through, modify the request, inject headers, or short-circuit
+/// the entire pipeline with a custom response. The proxy processes results
+/// sequentially; a `Respond` variant stops further hook execution.
 #[derive(Debug, Clone)]
 pub enum HookResult {
     /// Continue processing normally
@@ -63,47 +76,80 @@ pub enum HookResult {
 }
 
 /// A hook definition: a named piece of logic attached to a lifecycle phase.
+///
+/// Hooks within the same phase are executed in ascending `priority` order.
+/// Lower priority values execute first.
 pub struct Hook {
+    /// Human-readable name for logging and debugging (e.g. "rate-limit-check").
     pub name: String,
+    /// The lifecycle phase when this hook fires.
     pub phase: HookPhase,
+    /// Execution order within the phase. Lower values run first.
     pub priority: i32,
+    /// The actual logic to execute. Must be `Send + Sync` for concurrent use.
     pub handler: Box<dyn HookHandler>,
 }
 
 /// Trait for implementing hook handlers.
+///
+/// Implementors receive the current request/response context and return a
+/// `HookResult` that controls pipeline behavior. Implementations must be
+/// `Send + Sync` because hooks run concurrently across Tokio tasks.
 pub trait HookHandler: Send + Sync {
+    /// Execute the hook logic against the given context.
+    ///
+    /// # Returns
+    /// A `HookResult` indicating whether to continue, rewrite, inject headers,
+    /// or short-circuit the request with a custom response.
     fn execute(&self, ctx: &HookContext) -> HookResult;
 }
 
 /// The hook engine manages all registered hooks and dispatches them in order.
+///
+/// Hooks are organized by phase, and within each phase sorted by priority.
+/// The engine is typically initialized once at startup and shared immutably
+/// across all request-handling tasks.
 pub struct HookEngine {
-    hooks: HashMap<HookPhase, Vec<Hook>>,
+    /// Map from lifecycle phase to sorted list of hooks for that phase.
+    /// Wrapped in RwLock for interior mutability to support SIGHUP reload
+    /// (re-registering Rhai hooks without rebuilding the entire engine).
+    hooks: RwLock<HashMap<HookPhase, Vec<Hook>>>,
 }
 
 impl HookEngine {
+    /// Creates a new empty hook engine with no registered hooks.
     pub fn new() -> Self {
         Self {
-            hooks: HashMap::new(),
+            hooks: RwLock::new(HashMap::new()),
         }
     }
 
-    /// Registers a hook for a specific phase.
-    pub fn register(&mut self, hook: Hook) {
+    /// Registers a hook for a specific phase and re-sorts by priority.
+    ///
+    /// The hook list is sorted after each insertion so that execution order
+    /// is always deterministic based on the `priority` field.
+    pub fn register(&self, hook: Hook) {
         let phase = hook.phase;
-        let hooks = self.hooks.entry(phase).or_insert_with(Vec::new);
-        hooks.push(hook);
-        hooks.sort_by_key(|h| h.priority);
+        let mut hooks = self.hooks.write();
+        let phase_hooks = hooks.entry(phase).or_insert_with(Vec::new);
+        phase_hooks.push(hook);
+        phase_hooks.sort_by_key(|h| h.priority);
     }
 
-    /// Executes all hooks for a given phase, collecting results.
+    /// Executes all hooks for a given phase in priority order, collecting results.
+    ///
+    /// If any hook returns `HookResult::Respond`, execution stops immediately
+    /// (short-circuit) and only results up to and including that response are returned.
+    /// This enables early denial (e.g. IP block) without running subsequent hooks.
     pub fn execute(&self, phase: HookPhase, ctx: &HookContext) -> Vec<HookResult> {
-        let hooks = match self.hooks.get(&phase) {
+        let hooks = self.hooks.read();
+        let phase_hooks = match hooks.get(&phase) {
             Some(h) => h,
             None => return vec![],
         };
 
         let mut results = Vec::new();
-        for hook in hooks {
+        for hook in phase_hooks {
             let result = hook.handler.execute(ctx);
             debug!("Hook '{}' ({:?}) → {:?}", hook.name, phase, result);
             match &result {
@@ -119,18 +165,66 @@ impl HookEngine {
 
     /// Returns whether any hooks are registered for the given phase.
     pub fn has_hooks(&self, phase: HookPhase) -> bool {
-        self.hooks.get(&phase).map(|h| !h.is_empty()).unwrap_or(false)
+        let hooks = self.hooks.read();
+        hooks.get(&phase).map(|h| !h.is_empty()).unwrap_or(false)
+    }
+
+    /// Removes all Rhai hooks (identified by name prefix "rhai:") and re-registers
+    /// from the given script file. Called on SIGHUP reload when `rhai_script` changes.
+    ///
+    /// On error, logs a warning and preserves existing hooks.
+    pub fn reload_rhai_script(&self, script_path: &str) {
+        match rhai_engine::RhaiHookHandler::from_file(script_path) {
+            Ok(handler) => {
+                // Remove existing Rhai hooks
+                {
+                    let mut hooks = self.hooks.write();
+                    for phase_hooks in hooks.values_mut() {
+                        phase_hooks.retain(|h| !h.name.starts_with("rhai:"));
+                    }
+                }
+                // Register the new Rhai handler for all 4 phases
+                let handler = std::sync::Arc::new(handler);
+                for phase in [HookPhase::PreRoute, HookPhase::PreUpstream, HookPhase::PostUpstream, HookPhase::Log] {
+                    self.register(Hook {
+                        name: format!("rhai:{}", script_path),
+                        phase,
+                        priority: 50,
+                        handler: Box::new(RhaiHookProxy(std::sync::Arc::clone(&handler))),
+                    });
+                }
+                info!("Rhai script reloaded from {}", script_path);
+            }
+            Err(e) => {
+                tracing::warn!("Rhai script reload failed (keeping existing): {}", e);
+            }
+        }
+    }
+}
+
+/// Proxy that delegates to a shared RhaiHookHandler via Arc.
+struct RhaiHookProxy(std::sync::Arc<rhai_engine::RhaiHookHandler>);
+
+impl HookHandler for RhaiHookProxy {
+    fn execute(&self, ctx: &HookContext) -> HookResult {
+        self.0.execute(ctx)
     }
 }
 
 // ── Built-in hook implementations ──
 
 /// A simple header-injection hook configured via JSON rules.
+///
+/// Unconditionally adds/overwrites the configured headers on every request
+/// that passes through this hook's phase. Useful for adding security headers
+/// (e.g. `X-Frame-Options`, `Strict-Transport-Security`).
 pub struct HeaderInjectionHook {
+    /// Headers to inject (key -> value).
     headers: HashMap<String, String>,
 }
 
 impl HeaderInjectionHook {
+    /// Creates a new header injection hook with the given header map.
     pub fn new(headers: HashMap<String, String>) -> Self {
         Self { headers }
     }
@@ -142,14 +236,26 @@ impl HookHandler for HeaderInjectionHook {
     }
 }
 
-/// A conditional rewrite hook that rewrites paths matching a condition.
+/// A conditional rewrite hook that rewrites the request path when a specific
+/// header matches a specific value.
+///
+/// Example: Rewrite to `/v2/api` when `X-API-Version: 2` is present.
 pub struct ConditionalRewriteHook {
+    /// The header name to check (e.g. "X-API-Version").
     condition_header: String,
+    /// The expected header value that triggers the rewrite.
     condition_value: String,
+    /// The new path to rewrite to when the condition matches.
     new_path: String,
 }
 
 impl ConditionalRewriteHook {
+    /// Creates a new conditional rewrite hook.
+    ///
+    /// # Arguments
+    /// * `header` - Header name to match against.
+    /// * `value` - Expected header value to trigger rewrite.
+    /// * `path` - New request path when condition is met.
     pub fn new(header: String, value: String, path: String) -> Self {
         Self {
             condition_header: header,
@@ -175,12 +281,22 @@ impl HookHandler for ConditionalRewriteHook {
 }
 
 /// An IP-based access control hook.
+///
+/// Implements a deny-first, then allow-list policy:
+/// 1. If the client IP is in `denied_ips`, return 403 immediately.
+/// 2. If `allowed_ips` is non-empty and the client IP is NOT in it, return 403.
+/// 3. Otherwise, allow the request to continue.
+///
+/// When both lists are empty, all IPs are allowed.
 pub struct IpAccessHook {
+    /// Allowlist of client IPs. Empty = allow all (unless denied).
     allowed_ips: Vec<String>,
+    /// Denylist of client IPs. Checked before the allowlist.
     denied_ips: Vec<String>,
 }
 
 impl IpAccessHook {
+    /// Creates a new IP access hook with the given allow/deny lists.
     pub fn new(allowed: Vec<String>, denied: Vec<String>) -> Self {
         Self {
             allowed_ips: allowed,
@@ -191,6 +307,7 @@ impl IpAccessHook {
 
 impl HookHandler for IpAccessHook {
     fn execute(&self, ctx: &HookContext) -> HookResult {
+        // Step 1: Check denylist first (deny takes precedence over allow)
         if self.denied_ips.contains(&ctx.client_ip) {
             return HookResult::Respond {
                 status: 403,
@@ -198,6 +315,7 @@ impl HookHandler for IpAccessHook {
                 headers: HashMap::new(),
             };
         }
+        // Step 2: If an allowlist exists, the client must be on it
         if !self.allowed_ips.is_empty() && !self.allowed_ips.contains(&ctx.client_ip) {
             return HookResult::Respond {
                 status: 403,
@@ -205,6 +323,7 @@ impl HookHandler for IpAccessHook {
                 headers: HashMap::new(),
             };
         }
+        // Step 3: Not denied, and either on allowlist or no allowlist defined
         HookResult::Continue
     }
 }
@@ -237,7 +356,7 @@ mod tests {
         let mut headers = HashMap::new();
         headers.insert("X-Test".to_string(), "alpha".to_string());
 
-        let mut engine = HookEngine::new();
+        let engine = HookEngine::new();
         engine.register(Hook {
             name: "inject".to_string(),
             phase: HookPhase::PreRoute,
@@ -260,7 +379,7 @@ mod tests {
         let mut second = HashMap::new();
         second.insert("X-Order".to_string(), "second".to_string());
 
-        let mut engine = HookEngine::new();
+        let engine = HookEngine::new();
         engine.register(Hook {
             name: "later".to_string(),
             phase: HookPhase::PreRoute,
@@ -344,7 +463,7 @@ mod tests {
         let mut inject = HashMap::new();
         inject.insert("X-Never".to_string(), "seen".to_string());
 
-        let mut engine = HookEngine::new();
+        let engine = HookEngine::new();
         engine.register(Hook {
             name: "deny".to_string(),
             phase: HookPhase::PreRoute,
@@ -365,7 +484,7 @@ mod tests {
 
     #[test]
     fn test_has_hooks() {
-        let mut engine = HookEngine::new();
+        let engine = HookEngine::new();
         assert!(!engine.has_hooks(HookPhase::PreRoute));
 
         let mut h = HashMap::new();

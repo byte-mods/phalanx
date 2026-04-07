@@ -1,4 +1,17 @@
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+//! Real client IP resolution and forwarding header injection.
+//!
+//! When Phalanx sits behind one or more reverse proxies (e.g. a CDN or cloud
+//! load balancer), the TCP peer address is that of the proxy, not the real
+//! client. This module extracts the true client IP from `X-Real-IP` or
+//! `X-Forwarded-For` headers, but only when the direct connection originates
+//! from a trusted proxy CIDR.
+//!
+//! Additionally provides:
+//! - `inject_forwarding_headers` to set standard `X-Forwarded-For`,
+//!   `X-Forwarded-Proto`, and `X-Real-IP` on outbound backend requests.
+//! - `parse_proxy_protocol_v1` for HAProxy PROXY protocol v1 header parsing.
+
+use std::net::{IpAddr, SocketAddr};
 use tracing::debug;
 
 /// Trusted proxy CIDR ranges.
@@ -9,9 +22,12 @@ pub struct TrustedProxies {
     cidrs: Vec<CidrRange>,
 }
 
+/// A single CIDR range (e.g. `10.0.0.0/8` or `::1/128`).
 #[derive(Debug, Clone)]
 struct CidrRange {
+    /// Base network address.
     network: IpAddr,
+    /// Number of significant bits in the network mask (0..=32 for IPv4, 0..=128 for IPv6).
     prefix_len: u8,
 }
 
@@ -30,16 +46,20 @@ impl TrustedProxies {
         Self { cidrs: parsed }
     }
 
+    /// Returns `true` if `ip` falls within any of the configured trusted CIDR ranges.
     pub fn is_trusted(&self, ip: &IpAddr) -> bool {
         self.cidrs.iter().any(|c| c.contains(ip))
     }
 
+    /// Returns `true` if no trusted CIDRs were configured (forwarding headers are never trusted).
     pub fn is_empty(&self) -> bool {
         self.cidrs.is_empty()
     }
 }
 
 impl CidrRange {
+    /// Parses a CIDR string like `"10.0.0.0/8"` or a bare IP like `"192.168.1.1"`.
+    /// A bare IP is treated as a `/32` (IPv4) or `/128` (IPv6) single-host range.
     fn parse(s: &str) -> Option<Self> {
         let (addr_str, prefix_str) = if let Some(pos) = s.find('/') {
             (&s[..pos], &s[pos + 1..])
@@ -61,6 +81,8 @@ impl CidrRange {
         })
     }
 
+    /// Tests whether `ip` falls within this CIDR range using bitwise masking.
+    /// Returns `false` if the address families (v4 vs v6) don't match.
     fn contains(&self, ip: &IpAddr) -> bool {
         match (self.network, ip) {
             (IpAddr::V4(net), IpAddr::V4(target)) => {

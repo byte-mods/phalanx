@@ -1,14 +1,37 @@
+//! Traffic mirroring and A/B traffic splitting.
+//!
+//! Mirroring copies an incoming request to a secondary ("shadow") upstream pool
+//! so that new backends or services can be tested with live production traffic
+//! without affecting the primary request path. The shadow response is discarded.
+//!
+//! Traffic splitting uses a consistent hash to deterministically route a
+//! fraction of requests to different variants, enabling canary deployments and
+//! A/B testing.
+
 use bytes::Bytes;
-use hyper::Request;
-use http_body_util::Full;
 use std::sync::Arc;
 use tracing::{debug, error};
 
 use crate::routing::UpstreamManager;
 
 /// Fires a mirrored (tee'd) copy of the request to a shadow upstream pool.
-/// The response is discarded — this is purely for traffic shadowing / testing.
-/// Runs in a background task so it never blocks the primary request path.
+///
+/// The response is discarded -- this is purely for traffic shadowing / testing.
+/// Runs in a background Tokio task so it never blocks the primary request path.
+///
+/// # Arguments
+///
+/// * `method`           - HTTP method string (e.g. `"GET"`, `"POST"`).
+/// * `uri`              - Request URI path (e.g. `"/api/v1/users"`).
+/// * `headers`          - Cloned header map from the original request.
+/// * `body`             - Buffered request body bytes.
+/// * `mirror_pool_name` - Name of the upstream pool to mirror traffic to.
+/// * `upstreams`        - Shared upstream manager for backend selection.
+///
+/// # Side Effects
+///
+/// Spawns a Tokio task. If the mirror pool or backend is unavailable the
+/// request is silently dropped (logged at debug level).
 pub fn mirror_request(
     method: &str,
     uri: &str,
@@ -64,6 +87,7 @@ pub fn mirror_request(
 
         let mut builder = client.request(req_method, &url);
 
+        // Propagate all original request headers to the mirror backend
         for (key, value) in headers.iter() {
             if let Ok(v) = value.to_str() {
                 builder = builder.header(key.as_str(), v);
@@ -103,7 +127,9 @@ pub fn split_traffic(key: &str, weights: &[u32]) -> usize {
         return 0;
     }
 
+    // Map the hash into the [0, total) range to get a deterministic point
     let point = (hash % total as u64) as u32;
+    // Walk through cumulative weight ranges to find which variant owns this point
     let mut cumulative = 0u32;
     for (i, w) in weights.iter().enumerate() {
         cumulative += w;
@@ -111,6 +137,7 @@ pub fn split_traffic(key: &str, weights: &[u32]) -> usize {
             return i;
         }
     }
+    // Fallback: rounding edge case -- return the last variant
     weights.len() - 1
 }
 

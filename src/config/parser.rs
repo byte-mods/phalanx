@@ -1,6 +1,26 @@
+//! # NGINX-Style Configuration Parser
+//!
+//! A strict recursive-descent parser for Phalanx's NGINX-inspired configuration
+//! syntax. The parser operates in two phases:
+//!
+//! 1. **Lexical analysis** (`tokenize`): Splits the raw config text into tokens,
+//!    handling whitespace, quoted strings, `#` comments, and structural chars
+//!    (`{`, `}`, `;`).
+//!
+//! 2. **Recursive descent parsing** (`parse_phalanx_config` and helpers): Walks
+//!    the token stream to build a typed AST (`PhalanxConfig` → `HttpBlock` →
+//!    `ServerBlock` → `RouteBlock` / `UpstreamBlock`).
+//!
+//! Every directive must end with `;`, every block must be balanced with `{ }`,
+//! and unknown tokens produce immediate, descriptive errors.
+
 use std::collections::HashMap;
 
-/// The root abstract syntax tree (AST) for the parsed Nginx configuration.
+/// The root abstract syntax tree (AST) for the parsed Phalanx configuration.
+///
+/// Mirrors the top-level structure of a `phalanx.conf` file:
+/// global directives (`worker_threads`, `tcp_listen`, `admin_listen`) plus
+/// an optional `http { ... }` block containing servers and upstreams.
 #[derive(Debug, Default)]
 pub struct PhalanxConfig {
     /// Number of worker threads for the Tokio runtime
@@ -14,6 +34,10 @@ pub struct PhalanxConfig {
 }
 
 /// Represents the `http { ... }` block.
+///
+/// Contains one or more `server` blocks (virtual hosts) and zero or more
+/// `upstream` blocks (backend pools). This is the top-level HTTP configuration
+/// container analogous to nginx's `http` context.
 #[derive(Debug, Default)]
 pub struct HttpBlock {
     /// A list of virtual server configurations within the HTTP block
@@ -46,9 +70,17 @@ pub struct UpstreamBlock {
     pub slow_start_secs: u32,
     /// DNS SRV record name for discovery
     pub srv_discover: Option<String>,
+    /// Health check interval in seconds. Default: 5.
+    pub health_check_interval_secs: u64,
+    /// Health check timeout in seconds. Default: 3.
+    pub health_check_timeout_secs: u64,
 }
 
 /// Represents a `server { ... }` block inside the HTTP block.
+///
+/// A server block defines a virtual host with its own listen port, TLS settings,
+/// route handlers, and generic key-value directives. Multiple server blocks can
+/// coexist in a single `http` block for multi-tenant setups.
 #[derive(Debug, Default)]
 pub struct ServerBlock {
     /// The port to listen on (e.g., "8080")
@@ -64,6 +96,10 @@ pub struct ServerBlock {
 }
 
 /// Represents a `route /path { ... }` block inside a server.
+///
+/// Each route block binds a URL prefix to a specific handler (upstream proxy,
+/// static file root, FastCGI, or uWSGI) and carries per-route settings for
+/// authentication, compression, caching, rewrites, and header injection.
 #[derive(Debug, Default)]
 pub struct RouteBlock {
     /// The URL prefix to match against (e.g., "/api")
@@ -82,46 +118,103 @@ pub struct RouteBlock {
     /// Syntax: `rewrite PATTERN REPLACEMENT FLAG;`
     pub rewrite_rules: Vec<(String, String, String)>,
     // ── Auth fields ───────────────────────────────────────────────────────────
+    /// HTTP Basic Auth realm string shown in the WWW-Authenticate challenge header.
     pub auth_basic_realm: Option<String>,
+    /// Map of username -> password (plaintext or bcrypt) for Basic Auth.
     pub auth_basic_users: HashMap<String, String>,
+    /// HMAC secret or RSA public key for JWT Bearer token verification.
     pub auth_jwt_secret: Option<String>,
+    /// JWT signing algorithm (e.g. "HS256", "RS256").
     pub auth_jwt_algorithm: Option<String>,
+    /// RFC 7662 token introspection endpoint URL for OAuth 2.0.
     pub auth_oauth_introspect_url: Option<String>,
+    /// OAuth client ID for introspection authentication.
     pub auth_oauth_client_id: Option<String>,
+    /// OAuth client secret for introspection authentication.
     pub auth_oauth_client_secret: Option<String>,
     // ── Gzip + Cache ────────────────────────────────────────────────────────────
+    /// Enable gzip compression for this route.
     pub gzip: bool,
+    /// Minimum response body size (bytes) to trigger gzip compression.
     pub gzip_min_length: usize,
+    /// Enable response caching for GET 200 responses.
     pub proxy_cache: bool,
+    /// Default cache TTL in seconds when the backend sends no Cache-Control.
     pub proxy_cache_valid_secs: u64,
     // ── Brotli ────────────────────────────────────────────────────────────────
+    /// Enable Brotli compression for this route.
     pub brotli: bool,
     // ── auth_request ──────────────────────────────────────────────────────────
+    /// External auth subrequest URL. A 200 response allows the request through.
     pub auth_request_url: Option<String>,
     // ── Mirror ────────────────────────────────────────────────────────────────
+    /// Upstream pool name for traffic mirroring (shadow copy of live traffic).
     pub mirror_pool: Option<String>,
     // ── JWKS-based JWT Auth ───────────────────────────────────────────────────
+    /// JWKS endpoint URI for dynamic public key fetching (RS256/ES256).
     pub auth_jwks_uri: Option<String>,
     // ── OIDC Session Auth ─────────────────────────────────────────────────────
+    /// OIDC issuer URL for session-based authentication.
     pub auth_oidc_issuer: Option<String>,
+    /// Cookie name holding the OIDC session ID.
     pub auth_oidc_cookie_name: Option<String>,
+
+    // ── Proxy Timeouts ──────────────────────────────────────────────────────
+    /// TCP connect timeout in seconds for this route. 0 = use global default.
+    pub proxy_connect_timeout_secs: u64,
+    /// Response read timeout in seconds for this route. 0 = use global default.
+    pub proxy_read_timeout_secs: u64,
+
+    // ── Retry Policy ────────────────────────────────────────────────────────
+    /// Max upstream retry attempts for this route. 0 = disabled.
+    pub proxy_next_upstream_tries: u32,
+    /// Overall retry timeout in seconds for this route. 0 = no limit.
+    pub proxy_next_upstream_timeout_secs: u64,
+
+    // ── Request Body Size Limit ─────────────────────────────────────────────
+    /// Maximum request body size in bytes. 0 = use global default.
+    pub client_max_body_size: usize,
+
+    // ── CORS ────────────────────────────────────────────────────────────────
+    /// Enable CORS for this route.
+    pub cors_enabled: bool,
+    /// Allowed origins (empty = allow all).
+    pub cors_allowed_origins: Vec<String>,
+    /// Allowed HTTP methods.
+    pub cors_allowed_methods: Vec<String>,
+    /// Allowed request headers.
+    pub cors_allowed_headers: Vec<String>,
+    /// Max age in seconds for preflight cache.
+    pub cors_max_age_secs: u64,
+    /// Whether to include credentials header.
+    pub cors_allow_credentials: bool,
+
+    // ── HTTP/2 Backend Forwarding ────────────────────────────────────────────
+    /// Proxy HTTP version for backend connections ("2" = HTTP/2).
+    pub proxy_http_version: Option<String>,
 }
 
-/// A strict parser for a subset of Nginx configuration syntax.
-/// Returns a descriptive error string if the configuration is malformed.
+/// Entry point: parses a raw NGINX-style configuration string into a `PhalanxConfig` AST.
 ///
-/// Rules enforced:
-/// - Every directive must end with a semicolon `;`
-/// - Every block opened with `{` must be closed with `}`
-/// - Unknown or unexpected tokens cause an immediate parse failure
+/// The parser is strict by design -- it rejects:
+/// - Missing semicolons after directives
+/// - Unclosed `{` blocks
+/// - Unknown or unexpected tokens at any nesting level
+///
+/// # Arguments
+/// * `input` - The full text content of a `phalanx.conf` file.
+///
+/// # Returns
+/// `Ok(PhalanxConfig)` on success, or `Err(String)` with a human-readable
+/// error message describing the exact problem and token position.
 pub fn parse_phalanx_config(input: &str) -> Result<PhalanxConfig, String> {
     let mut config = PhalanxConfig::default();
 
-    // First pass: Lexical analysis (tokenize the string)
+    // Phase 1: Lexical analysis -- split the raw text into a flat token stream.
     let tokens = tokenize(input);
     let mut i = 0;
 
-    // Second pass: Recursive descent parsing
+    // Phase 2: Recursive descent parsing -- walk the token stream and build the AST.
     while i < tokens.len() {
         let token = &tokens[i];
 
@@ -176,6 +269,10 @@ pub fn parse_phalanx_config(input: &str) -> Result<PhalanxConfig, String> {
 }
 
 /// Parses the contents inside an `http { ... }` block.
+///
+/// Expects to be called after the opening `{` has been consumed. Returns the
+/// completed `HttpBlock` and the token index immediately after the closing `}`.
+/// Valid children are `server { ... }` and `upstream name { ... }` blocks.
 fn parse_http_block(tokens: &[String], mut i: usize) -> Result<(HttpBlock, usize), String> {
     let mut block = HttpBlock::default();
     while i < tokens.len() {
@@ -225,6 +322,10 @@ fn parse_http_block(tokens: &[String], mut i: usize) -> Result<(HttpBlock, usize
 }
 
 /// Parses the contents inside a `server { ... }` block.
+///
+/// Recognizes specific directives (`listen`, `ssl_certificate`, `ssl_certificate_key`),
+/// `route /path { ... }` sub-blocks, and generic `key value;` directives that are
+/// stored in the `directives` map for later interpretation by `try_load_config`.
 fn parse_server_block(tokens: &[String], mut i: usize) -> Result<(ServerBlock, usize), String> {
     let mut block = ServerBlock::default();
     while i < tokens.len() {
@@ -279,6 +380,31 @@ fn parse_server_block(tokens: &[String], mut i: usize) -> Result<(ServerBlock, u
             continue;
         }
 
+        // Parse: `api_token TOKEN ROLE;` (3 tokens: keyword, token, role)
+        if token == "api_token" {
+            if i + 3 >= tokens.len() {
+                return Err(format!(
+                    "'api_token' at token {} requires 'TOKEN ROLE;' but found insufficient tokens",
+                    i
+                ));
+            }
+            if tokens[i + 3] != ";" {
+                return Err(format!(
+                    "'api_token {} {}' at token position {} is missing a semicolon ';'",
+                    tokens[i + 1],
+                    tokens[i + 2],
+                    i
+                ));
+            }
+            // Store as "api_token:TOKEN" → "ROLE" in directives map
+            block.directives.insert(
+                format!("api_token:{}", tokens[i + 1]),
+                tokens[i + 2].clone(),
+            );
+            i += 4;
+            continue;
+        }
+
         // Generic directive: `key value;`
         // Must match exactly: TOKEN VALUE ;
         if i + 2 < tokens.len() && tokens[i + 2] == ";" {
@@ -306,6 +432,10 @@ fn parse_server_block(tokens: &[String], mut i: usize) -> Result<(ServerBlock, u
 }
 
 /// Parses the contents inside a `route /path { ... }` block.
+///
+/// Recognizes handler directives (`upstream`, `root`, `fastcgi_pass`, `uwsgi_pass`),
+/// header injection (`add_header`), URL rewrites (`rewrite`), auth directives
+/// (`auth_basic`, `auth_jwt_secret`, `auth_oauth_*`), and compression/cache toggles.
 fn parse_route_block(
     tokens: &[String],
     mut i: usize,
@@ -529,6 +659,121 @@ fn parse_route_block(
             continue;
         }
 
+        // Parse: `proxy_connect_timeout 10;`
+        if token == "proxy_connect_timeout" {
+            expect_directive_value_semicolon(tokens, i, "proxy_connect_timeout")?;
+            block.proxy_connect_timeout_secs = tokens[i + 1].parse().unwrap_or(0);
+            i += 3;
+            continue;
+        }
+
+        // Parse: `proxy_read_timeout 60;`
+        if token == "proxy_read_timeout" {
+            expect_directive_value_semicolon(tokens, i, "proxy_read_timeout")?;
+            block.proxy_read_timeout_secs = tokens[i + 1].parse().unwrap_or(0);
+            i += 3;
+            continue;
+        }
+
+        // Parse: `proxy_next_upstream_tries 3;`
+        if token == "proxy_next_upstream_tries" {
+            expect_directive_value_semicolon(tokens, i, "proxy_next_upstream_tries")?;
+            block.proxy_next_upstream_tries = tokens[i + 1].parse().unwrap_or(0);
+            i += 3;
+            continue;
+        }
+
+        // Parse: `proxy_next_upstream_timeout 30;`
+        if token == "proxy_next_upstream_timeout" {
+            expect_directive_value_semicolon(tokens, i, "proxy_next_upstream_timeout")?;
+            block.proxy_next_upstream_timeout_secs = tokens[i + 1].parse().unwrap_or(0);
+            i += 3;
+            continue;
+        }
+
+        // Parse: `client_max_body_size 10M;`
+        if token == "client_max_body_size" {
+            expect_directive_value_semicolon(tokens, i, "client_max_body_size")?;
+            block.client_max_body_size = crate::config::parse_size_value(&tokens[i + 1]);
+            i += 3;
+            continue;
+        }
+
+        // ── CORS directives ───────────────────────────────────────────────────
+
+        // Parse: `cors_enabled on;`
+        if token == "cors_enabled" {
+            expect_directive_value_semicolon(tokens, i, "cors_enabled")?;
+            block.cors_enabled = tokens[i + 1].to_lowercase() == "on" || tokens[i + 1] == "true";
+            i += 3;
+            continue;
+        }
+
+        // Parse: `cors_allowed_origins "https://example.com" "https://other.com";`
+        if token == "cors_allowed_origins" {
+            i += 1;
+            while i < tokens.len() && tokens[i] != ";" {
+                block.cors_allowed_origins.push(tokens[i].clone());
+                i += 1;
+            }
+            if i < tokens.len() {
+                i += 1; // skip ;
+            }
+            continue;
+        }
+
+        // Parse: `cors_allowed_methods "GET" "POST";`
+        if token == "cors_allowed_methods" {
+            block.cors_allowed_methods.clear();
+            i += 1;
+            while i < tokens.len() && tokens[i] != ";" {
+                block.cors_allowed_methods.push(tokens[i].clone());
+                i += 1;
+            }
+            if i < tokens.len() {
+                i += 1; // skip ;
+            }
+            continue;
+        }
+
+        // Parse: `cors_allowed_headers "Content-Type" "Authorization";`
+        if token == "cors_allowed_headers" {
+            block.cors_allowed_headers.clear();
+            i += 1;
+            while i < tokens.len() && tokens[i] != ";" {
+                block.cors_allowed_headers.push(tokens[i].clone());
+                i += 1;
+            }
+            if i < tokens.len() {
+                i += 1; // skip ;
+            }
+            continue;
+        }
+
+        // Parse: `cors_max_age 86400;`
+        if token == "cors_max_age" {
+            expect_directive_value_semicolon(tokens, i, "cors_max_age")?;
+            block.cors_max_age_secs = tokens[i + 1].parse().unwrap_or(86400);
+            i += 3;
+            continue;
+        }
+
+        // Parse: `cors_allow_credentials on;`
+        if token == "cors_allow_credentials" {
+            expect_directive_value_semicolon(tokens, i, "cors_allow_credentials")?;
+            block.cors_allow_credentials = tokens[i + 1].to_lowercase() == "on" || tokens[i + 1] == "true";
+            i += 3;
+            continue;
+        }
+
+        // Parse: `proxy_http_version 2;`
+        if token == "proxy_http_version" {
+            expect_directive_value_semicolon(tokens, i, "proxy_http_version")?;
+            block.proxy_http_version = Some(tokens[i + 1].clone());
+            i += 3;
+            continue;
+        }
+
         // If we see `key value` without a semicolon next
         if i + 1 < tokens.len() && tokens[i + 1] != "{" && tokens[i + 1] != "}" {
             if i + 2 >= tokens.len() || tokens[i + 2] != ";" {
@@ -551,10 +796,17 @@ fn parse_route_block(
 }
 
 /// Parses the contents inside an `upstream pool_name { ... }` block.
-/// Supports:
-///   `server 127.0.0.1:8081;`
-///   `server 127.0.0.1:8082 weight=3;`
-///   `algorithm roundrobin;`
+///
+/// Recognizes the following directives:
+/// - `server addr [weight=N];` -- backend with optional weight
+/// - `algorithm roundrobin;` -- load balancing strategy
+/// - `keepalive N;` -- idle connection pool size
+/// - `health_check_path /path;` -- HTTP probe endpoint
+/// - `health_check_status N;` -- expected probe status code
+/// - `max_fails N;` -- failure threshold before marking DOWN
+/// - `fail_timeout N;` -- time window for failure counting
+/// - `slow_start N;` -- ramp-up seconds after recovery
+/// - `srv_discover name;` -- DNS SRV-based discovery
 fn parse_upstream_block(
     tokens: &[String],
     mut i: usize,
@@ -571,6 +823,8 @@ fn parse_upstream_block(
         fail_timeout_secs: 30,
         slow_start_secs: 0,
         srv_discover: None,
+        health_check_interval_secs: 5,
+        health_check_timeout_secs: 3,
     };
     while i < tokens.len() {
         let token = &tokens[i];
@@ -683,6 +937,22 @@ fn parse_upstream_block(
             continue;
         }
 
+        // Parse: `health_check_interval 10;`
+        if token == "health_check_interval" {
+            expect_directive_value_semicolon(tokens, i, "health_check_interval")?;
+            block.health_check_interval_secs = tokens[i + 1].parse().unwrap_or(5);
+            i += 3;
+            continue;
+        }
+
+        // Parse: `health_check_timeout 5;`
+        if token == "health_check_timeout" {
+            expect_directive_value_semicolon(tokens, i, "health_check_timeout")?;
+            block.health_check_timeout_secs = tokens[i + 1].parse().unwrap_or(3);
+            i += 3;
+            continue;
+        }
+
         // Generic directive inside upstream block is an error
         return Err(format!(
             "Unknown directive '{}' inside upstream '{}' block at token position {}",
@@ -695,8 +965,10 @@ fn parse_upstream_block(
     ))
 }
 
-/// Asserts that `tokens[i]` is a directive keyword with the pattern: `KEY VALUE ;`
-/// i.e., tokens[i+1] is a value and tokens[i+2] is a semicolon.
+/// Validation helper: asserts that `tokens[i]` follows the `KEY VALUE ;` pattern.
+///
+/// Checks that `tokens[i+1]` exists (the value) and `tokens[i+2]` is a semicolon.
+/// Returns a descriptive error if the directive is incomplete or missing its `;`.
 fn expect_directive_value_semicolon(
     tokens: &[String],
     i: usize,
@@ -717,7 +989,10 @@ fn expect_directive_value_semicolon(
     Ok(())
 }
 
-/// Asserts that `tokens[i+1]` is an opening brace `{`.
+/// Validation helper: asserts that `tokens[i+1]` is an opening brace `{`.
+///
+/// Used before entering a block parser to catch missing braces early with
+/// a clear error message referencing the block name.
 fn expect_open_brace(tokens: &[String], i: usize, block_name: &str) -> Result<(), String> {
     if i + 1 >= tokens.len() {
         return Err(format!(
@@ -733,9 +1008,16 @@ fn expect_open_brace(tokens: &[String], i: usize, block_name: &str) -> Result<()
     Ok(())
 }
 
-/// Basic lexical scanner that breaks a raw configuration string into semantic tokens.
-/// Accounts for whitespace separation and specific control characters (`{`, `}`, `;`).
-/// Also handles string literals wrapped in quotes (single or double).
+/// Lexical scanner that breaks a raw configuration string into a flat token vector.
+///
+/// Token types produced:
+/// - **Structural**: `{`, `}`, `;` (always emitted as standalone single-char tokens)
+/// - **Quoted strings**: Characters between matching `"` or `'` pairs (quotes stripped)
+/// - **Words**: Contiguous non-whitespace, non-structural characters (directives, values, paths)
+/// - **Comments**: Lines starting with `#` are discarded entirely
+///
+/// The scanner is single-pass and operates character-by-character. Quoted strings
+/// preserve embedded whitespace (e.g. `"My Realm"` becomes a single token `My Realm`).
 fn tokenize(input: &str) -> Vec<String> {
     let mut tokens = Vec::new();
     let mut current_token = String::new();
@@ -743,6 +1025,7 @@ fn tokenize(input: &str) -> Vec<String> {
     let mut in_comment = false;
 
     for c in input.chars() {
+        // Inside a comment: consume everything until end-of-line
         if in_comment {
             if c == '\n' {
                 in_comment = false;
@@ -750,6 +1033,7 @@ fn tokenize(input: &str) -> Vec<String> {
             continue;
         }
 
+        // Start of a comment: flush any in-progress token and skip to EOL
         if c == '#' && !in_quotes {
             in_comment = true;
             if !current_token.is_empty() {
@@ -759,7 +1043,7 @@ fn tokenize(input: &str) -> Vec<String> {
             continue;
         }
 
-        // Toggle quote state to capture strings with embedded spaces
+        // Toggle quote state to capture strings with embedded spaces (e.g. realm names)
         if c == '"' || c == '\'' {
             in_quotes = !in_quotes;
             continue;
@@ -1036,5 +1320,221 @@ mod tests {
             err.contains("badkey") || err.contains("Unknown"),
             "Error should mention the unknown directive: {err}"
         );
+    }
+
+    // ── CORS directives ─────────────────────────────────────────────────────
+
+    #[test]
+    fn test_cors_directives_in_route_block() {
+        let cfg = r#"
+            http {
+                server {
+                    listen 8080;
+                    route /api {
+                        upstream default;
+                        cors_enabled on;
+                        cors_allowed_origins "https://example.com" "https://other.com";
+                        cors_allowed_methods "GET" "POST";
+                        cors_allowed_headers "Content-Type" "Authorization" "X-Custom";
+                        cors_max_age 3600;
+                        cors_allow_credentials on;
+                    }
+                }
+            }
+        "#;
+        let result = parse_phalanx_config(cfg);
+        assert!(result.is_ok(), "Expected Ok, got: {:?}", result);
+        let parsed = result.unwrap();
+        let http = parsed.http.unwrap();
+        let server = &http.servers[0];
+        let route = &server.routes["/api"];
+        assert!(route.cors_enabled);
+        assert_eq!(route.cors_allowed_origins.len(), 2);
+        assert_eq!(route.cors_allowed_origins[0], "https://example.com");
+        assert_eq!(route.cors_allowed_methods.len(), 2);
+        assert_eq!(route.cors_allowed_headers.len(), 3);
+        assert_eq!(route.cors_max_age_secs, 3600);
+        assert!(route.cors_allow_credentials);
+    }
+
+    #[test]
+    fn test_cors_disabled_by_default() {
+        let cfg = r#"
+            http {
+                server {
+                    listen 8080;
+                    route / {
+                        upstream default;
+                    }
+                }
+            }
+        "#;
+        let result = parse_phalanx_config(cfg).unwrap();
+        let http = result.http.unwrap();
+        let route = &http.servers[0].routes["/"];
+        assert!(!route.cors_enabled);
+        assert!(route.cors_allowed_origins.is_empty());
+    }
+
+    // ── proxy_http_version ──────────────────────────────────────────────────
+
+    #[test]
+    fn test_proxy_http_version_in_route_block() {
+        let cfg = r#"
+            http {
+                server {
+                    listen 8080;
+                    route /grpc {
+                        upstream default;
+                        proxy_http_version 2;
+                    }
+                }
+            }
+        "#;
+        let result = parse_phalanx_config(cfg).unwrap();
+        let http = result.http.unwrap();
+        let route = &http.servers[0].routes["/grpc"];
+        assert_eq!(route.proxy_http_version, Some("2".to_string()));
+    }
+
+    // ── Health check interval/timeout ────────────────────────────────────────
+
+    #[test]
+    fn test_health_check_interval_timeout_in_upstream() {
+        let cfg = r#"
+            http {
+                upstream backend {
+                    server 127.0.0.1:8081;
+                    health_check_interval 10;
+                    health_check_timeout 5;
+                }
+                server {
+                    listen 8080;
+                }
+            }
+        "#;
+        let result = parse_phalanx_config(cfg).unwrap();
+        let http = result.http.unwrap();
+        let upstream = &http.upstreams[0];
+        assert_eq!(upstream.health_check_interval_secs, 10);
+        assert_eq!(upstream.health_check_timeout_secs, 5);
+    }
+
+    #[test]
+    fn test_health_check_interval_timeout_defaults() {
+        let cfg = r#"
+            http {
+                upstream backend {
+                    server 127.0.0.1:8081;
+                }
+                server {
+                    listen 8080;
+                }
+            }
+        "#;
+        let result = parse_phalanx_config(cfg).unwrap();
+        let http = result.http.unwrap();
+        let upstream = &http.upstreams[0];
+        assert_eq!(upstream.health_check_interval_secs, 5);
+        assert_eq!(upstream.health_check_timeout_secs, 3);
+    }
+
+    // ── api_token ────────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_api_token_in_server_block() {
+        let cfg = r#"
+            http {
+                server {
+                    listen 8080;
+                    api_token mysecrettoken admin;
+                    api_token readtoken readonly;
+                }
+            }
+        "#;
+        let result = parse_phalanx_config(cfg).unwrap();
+        let http = result.http.unwrap();
+        let server = &http.servers[0];
+        assert_eq!(
+            server.directives.get("api_token:mysecrettoken"),
+            Some(&"admin".to_string())
+        );
+        assert_eq!(
+            server.directives.get("api_token:readtoken"),
+            Some(&"readonly".to_string())
+        );
+    }
+
+    #[test]
+    fn test_route_timeout_directives_parsed() {
+        let cfg = r#"
+            http {
+                upstream default { server 127.0.0.1:8081; }
+                server {
+                    listen 8080;
+                    route /api {
+                        upstream default;
+                        proxy_connect_timeout 5;
+                        proxy_read_timeout 30;
+                        proxy_next_upstream_tries 3;
+                        proxy_next_upstream_timeout 10;
+                        client_max_body_size 10M;
+                    }
+                }
+            }
+        "#;
+        let result = parse_phalanx_config(cfg);
+        assert!(result.is_ok(), "Expected Ok, got: {:?}", result);
+        let parsed = result.unwrap();
+        let http = parsed.http.unwrap();
+        let route = &http.servers[0].routes["/api"];
+        assert_eq!(route.proxy_connect_timeout_secs, 5);
+        assert_eq!(route.proxy_read_timeout_secs, 30);
+        assert_eq!(route.proxy_next_upstream_tries, 3);
+        assert_eq!(route.proxy_next_upstream_timeout_secs, 10);
+        assert_eq!(route.client_max_body_size, 10 * 1024 * 1024);
+    }
+
+    #[test]
+    fn test_route_timeout_defaults_when_not_set() {
+        let cfg = r#"
+            http {
+                upstream default { server 127.0.0.1:8081; }
+                server {
+                    listen 8080;
+                    route / {
+                        upstream default;
+                    }
+                }
+            }
+        "#;
+        let result = parse_phalanx_config(cfg);
+        assert!(result.is_ok());
+        let parsed = result.unwrap();
+        let route = &parsed.http.unwrap().servers[0].routes["/"];
+        assert_eq!(route.proxy_connect_timeout_secs, 0);
+        assert_eq!(route.proxy_read_timeout_secs, 0);
+        assert_eq!(route.proxy_next_upstream_tries, 0);
+        assert_eq!(route.client_max_body_size, 0);
+    }
+
+    #[test]
+    fn test_client_max_body_size_suffixes_in_route() {
+        let cfg = r#"
+            http {
+                upstream default { server 127.0.0.1:8081; }
+                server {
+                    listen 8080;
+                    route /upload {
+                        upstream default;
+                        client_max_body_size 1G;
+                    }
+                }
+            }
+        "#;
+        let result = parse_phalanx_config(cfg);
+        assert!(result.is_ok());
+        let route = &result.unwrap().http.unwrap().servers[0].routes["/upload"];
+        assert_eq!(route.client_max_body_size, 1024 * 1024 * 1024);
     }
 }

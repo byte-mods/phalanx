@@ -1,26 +1,41 @@
+/// Declarative WAF policy engine modeled after F5 NGINX App Protect.
+///
+/// Supports named policies with custom signature rules, enforcement modes
+/// (blocking vs. transparent/monitor-only), path exclusions, and configurable
+/// blocking status codes. Policies can be loaded from JSON files or built
+/// programmatically.
 use regex::RegexSet;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::path::Path;
-use tracing::{error, info, warn};
+use tracing::info;
 
 /// A WAF policy is a named collection of signature rules + configuration.
 /// Modeled after F5 NGINX App Protect declarative policies.
+///
+/// Policies are serializable to/from JSON for file-based configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WafPolicy {
+    /// Unique name identifying this policy (used as a lookup key in the engine).
     pub name: String,
+    /// Whether violations result in blocking or are only logged (transparent).
     pub enforcement_mode: EnforcementMode,
+    /// Pre-defined signature categories (SQLi, XSS, etc.) with enable/disable toggles.
     pub signature_sets: Vec<SignatureSet>,
+    /// User-defined rules with custom regex patterns and actions.
     pub custom_rules: Vec<CustomRule>,
-    /// Response status code sent on block (default: 403)
+    /// HTTP status code returned when a request is blocked (default: 403).
     pub blocking_status: u16,
-    /// URLs/paths excluded from WAF inspection
+    /// Regex patterns for URL paths excluded from WAF inspection (e.g., health checks).
     pub exclusions: Vec<String>,
 }
 
+/// Controls whether the WAF actively blocks or passively monitors violations.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
 pub enum EnforcementMode {
+    /// Violations trigger immediate request blocking with the configured status code.
     Blocking,
+    /// Violations are recorded and logged but requests are allowed through.
+    /// Useful for testing new rules before enforcing them.
     Transparent,
 }
 
@@ -31,69 +46,116 @@ impl Default for EnforcementMode {
 }
 
 /// Pre-defined signature categories aligned with OWASP Top 10.
+///
+/// Each set can be individually enabled/disabled and has a severity rating
+/// that affects how violations are prioritized in logs and alerts.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SignatureSet {
+    /// Human-readable name (e.g., "SQL Injection", "Cross-Site Scripting").
     pub name: String,
+    /// Whether this signature set is active.
     pub enabled: bool,
+    /// Severity level for violations from this set.
     pub severity: Severity,
 }
 
+/// Severity classification for WAF rule violations.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
 pub enum Severity {
+    /// Informational or minor concern.
     Low,
+    /// Moderate security risk.
     Medium,
+    /// Significant security risk requiring attention.
     High,
+    /// Active exploitation attempt or critical vulnerability.
     Critical,
 }
 
 /// User-defined rules with custom regex patterns and actions.
+///
+/// Rules are compiled into regex at load time by the [`PolicyEngine`].
+/// Each rule targets a specific part of the request and specifies what
+/// action to take on match.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CustomRule {
+    /// Unique numeric rule identifier (used in violation reports and logs).
     pub id: u32,
+    /// Human-readable description of what this rule detects.
     pub description: String,
+    /// Regex pattern to match against the specified target.
     pub pattern: String,
+    /// Which part of the request to inspect.
     pub target: RuleTarget,
+    /// What to do when the pattern matches.
     pub action: RuleAction,
 }
 
+/// Specifies which part of the HTTP request a custom rule should inspect.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum RuleTarget {
+    /// Match against the URL path only.
     Url,
+    /// Match against the query string only.
     QueryString,
+    /// Match against header values.
     Headers,
+    /// Match against the request body only.
     Body,
+    /// Match against all request components (URL, query, headers, and body).
     All,
 }
 
+/// Action to take when a custom WAF rule matches.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum RuleAction {
+    /// Block the request and return the configured blocking status code.
     Block,
+    /// Log the violation but allow the request through.
     Log,
+    /// Explicitly allow the request (overrides other rules).
     Allow,
 }
 
 /// The compiled policy engine that evaluates requests against loaded policies.
+///
+/// Policies are stored by name. The first policy added becomes the default
+/// unless overridden. Evaluation compiles custom rule regexes once at load
+/// time so per-request matching is fast.
 pub struct PolicyEngine {
+    /// Named policies indexed by policy name.
     policies: HashMap<String, CompiledPolicy>,
+    /// Name of the default policy (used when no explicit name is specified).
     default_policy: Option<String>,
 }
 
+/// Internal representation of a loaded policy with pre-compiled regex patterns.
 struct CompiledPolicy {
+    /// Original policy configuration (for metadata lookups).
     config: WafPolicy,
+    /// Pre-compiled custom rules: (rule_id, regex, target, action).
     custom_patterns: Vec<(u32, regex::Regex, RuleTarget, RuleAction)>,
+    /// Pre-compiled exclusion patterns for fast path matching.
     exclusion_set: Option<RegexSet>,
 }
 
+/// A single policy violation detected during request evaluation.
 #[derive(Debug)]
 pub struct PolicyViolation {
+    /// The rule ID that triggered this violation.
     pub rule_id: u32,
+    /// Category label (e.g., "Custom Rule").
     pub category: String,
+    /// Human-readable description of the match.
     pub description: String,
+    /// Severity of the triggering rule.
     pub severity: Severity,
+    /// Action specified by the rule.
     pub action: RuleAction,
 }
 
 impl PolicyEngine {
+    /// Creates a new empty policy engine with no loaded policies.
     pub fn new() -> Self {
         Self {
             policies: HashMap::new(),
@@ -223,6 +285,8 @@ impl PolicyEngine {
             .any(|v| matches!(v.action, RuleAction::Block))
     }
 
+    /// Returns the HTTP status code to use when blocking for the specified policy.
+    /// Defaults to 403 if no policy is found.
     pub fn blocking_status(&self, policy_name: Option<&str>) -> u16 {
         let policy_key = policy_name
             .map(String::from)

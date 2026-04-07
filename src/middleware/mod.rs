@@ -1,3 +1,14 @@
+/// Middleware layer providing caching, compression, rate limiting, and connection control.
+///
+/// Sub-modules:
+/// - [`cache`] - Advanced two-tier (L1 memory + L2 disk) cache with Vary, stale-while-revalidate, and thundering herd protection
+/// - [`compression`] - Gzip response compression
+/// - [`brotli`] - Brotli response compression
+/// - [`ratelimit`] - Per-IP and global token bucket rate limiting with optional Redis cluster sync
+/// - [`connlimit`] - Zone-based connection and request rate limiting with flexible key extraction
+///
+/// This module also provides a simpler [`ResponseCache`] (L1-only, Moka-backed)
+/// for lightweight caching needs.
 pub mod brotli;
 pub mod cache;
 pub mod compression;
@@ -17,16 +28,29 @@ pub struct ResponseCache {
     store: Cache<String, CachedResponse>,
 }
 
-/// A cached HTTP response with status and body.
+/// A cached HTTP response with status, body, content type, and expiration.
+///
+/// Stored inside [`ResponseCache`] and returned on cache hits. The
+/// `expires_at` field provides a secondary TTL check beyond Moka's
+/// built-in eviction.
 #[derive(Clone, Debug)]
 pub struct CachedResponse {
+    /// HTTP status code of the cached response.
     pub status: u16,
+    /// Response body bytes.
     pub body: bytes::Bytes,
+    /// Value of the Content-Type header.
     pub content_type: String,
+    /// Absolute time after which this entry should be treated as stale.
     pub expires_at: Instant,
 }
 
 impl ResponseCache {
+    /// Creates a new response cache with the given maximum entry count and default TTL.
+    ///
+    /// # Arguments
+    /// * `max_capacity` - Maximum number of entries before LFU eviction kicks in.
+    /// * `ttl_secs` - Default time-to-live for entries in seconds.
     pub fn new(max_capacity: u64, ttl_secs: u64) -> Self {
         Self {
             store: Cache::builder()
@@ -79,9 +103,13 @@ impl ResponseCache {
         // before/after entry_count delta (best-effort, fine for admin use).
         let before = self.store.entry_count();
         let prefix_owned = prefix.to_string();
-        self.store
+        if let Err(e) = self
+            .store
             .invalidate_entries_if(move |k, _v| k.starts_with(&prefix_owned))
-            .expect("invalidate_entries_if failed");
+        {
+            tracing::warn!("Failed to purge cache entries by prefix '{}': {}", prefix, e);
+            return 0;
+        }
         self.store.run_pending_tasks().await;
         let after = self.store.entry_count();
         before.saturating_sub(after)

@@ -9,10 +9,9 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
-use tracing::{debug, info, warn};
 
 /// A geographic data center (point of presence).
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -138,6 +137,12 @@ pub struct GslbRouter {
 }
 
 impl GslbRouter {
+    /// Creates a new GSLB router with the specified routing policy.
+    ///
+    /// # Arguments
+    /// * `policy` - Routing strategy (geographic, latency, weighted, or hybrid).
+    /// * `max_latency_ms` - DCs with latency above this value are marked unhealthy.
+    /// * `max_failures` - Consecutive health-check failures before marking a DC down.
     pub fn new(policy: GslbPolicy, max_latency_ms: f64, max_failures: u32) -> Self {
         Self {
             data_centers: Arc::new(RwLock::new(Vec::new())),
@@ -325,8 +330,140 @@ impl GslbRouter {
         self.data_centers.read().len()
     }
 
+    /// Returns the configured routing policy.
     pub fn policy(&self) -> GslbPolicy {
         self.policy
+    }
+
+    /// Replaces the routing policy (e.g., on SIGHUP config reload).
+    pub fn set_policy(&mut self, policy: GslbPolicy) {
+        self.policy = policy;
+    }
+
+    /// Replaces all data centers with the supplied list, re-initializing health
+    /// entries for new DCs. Called on SIGHUP reload when GSLB config changes.
+    pub fn reload_data_centers(&self, new_dcs: Vec<DataCenter>) {
+        let mut dcs = self.data_centers.write();
+        let mut health = self.health.write();
+
+        // Preserve health status for DCs that still exist
+        let mut new_health = HashMap::new();
+        for dc in &new_dcs {
+            if let Some(existing) = health.get(&dc.id) {
+                new_health.insert(dc.id.clone(), existing.clone());
+            } else {
+                new_health.insert(
+                    dc.id.clone(),
+                    DcHealthStatus {
+                        dc_id: dc.id.clone(),
+                        healthy: true,
+                        latency_ms: 0.0,
+                        last_check: Instant::now(),
+                        consecutive_failures: 0,
+                    },
+                );
+            }
+        }
+
+        *dcs = new_dcs;
+        *health = new_health;
+        tracing::info!("GSLB reloaded: {} data centers", dcs.len());
+    }
+
+    /// Spawns a background task that periodically probes each data center's
+    /// health endpoint, measuring RTT and updating health status.
+    ///
+    /// For each enabled DC, resolves the upstream pool's first backend and
+    /// performs an HTTP GET to its `health_check_path` (or `/` if none).
+    /// Results are fed into `update_health()`.
+    ///
+    /// Runs every 30 seconds. Each probe has a 5-second timeout.
+    pub fn spawn_health_check_loop(
+        self: &Arc<Self>,
+        upstreams: Arc<crate::routing::UpstreamManager>,
+        cancel: tokio_util::sync::CancellationToken,
+    ) {
+        let router = Arc::clone(self);
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(30));
+            // Don't pile up if a round takes longer than 30s
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                tokio::select! {
+                    _ = interval.tick() => {}
+                    _ = cancel.cancelled() => {
+                        tracing::info!("GSLB health check loop stopping");
+                        return;
+                    }
+                }
+
+                let dcs = router.data_centers.read().clone();
+                for dc in &dcs {
+                    if !dc.enabled {
+                        continue;
+                    }
+
+                    // Resolve the first backend in this DC's upstream pool
+                    let health_url = match upstreams.get_pool(&dc.upstream_pool) {
+                        Some(pool) => {
+                            let backends = pool.backends.load();
+                            backends.first().map(|b| {
+                                let path = b.config.health_check_path.clone()
+                                    .unwrap_or_else(|| "/".to_string());
+                                (b.config.address.clone(), path)
+                            })
+                        }
+                        None => None,
+                    };
+
+                    let (addr, health_path) = match health_url {
+                        Some(v) => v,
+                        None => {
+                            router.update_health(&dc.id, false, 0.0);
+                            continue;
+                        }
+                    };
+
+                    let dc_id = dc.id.clone();
+                    let router_probe = Arc::clone(&router);
+                    tokio::spawn(async move {
+                        let start = Instant::now();
+                        let probe_result = tokio::time::timeout(
+                            std::time::Duration::from_secs(5),
+                            async {
+                                let url = format!("http://{}{}", addr, health_path);
+                                let client = match reqwest::Client::builder()
+                                    .timeout(std::time::Duration::from_secs(5))
+                                    .build()
+                                {
+                                    Ok(c) => c,
+                                    Err(_) => return Err("failed to build HTTP client".to_string()),
+                                };
+                                client.get(&url).send().await
+                                    .map(|_| ())
+                                    .map_err(|e| e.to_string())
+                            },
+                        )
+                        .await;
+
+                        let latency_ms = start.elapsed().as_secs_f64() * 1000.0;
+                        match probe_result {
+                            Ok(Ok(())) => {
+                                router_probe.update_health(&dc_id, true, latency_ms);
+                            }
+                            Ok(Err(e)) => {
+                                tracing::debug!("GSLB health probe failed for {}: {}", dc_id, e);
+                                router_probe.update_health(&dc_id, false, latency_ms);
+                            }
+                            Err(_) => {
+                                tracing::debug!("GSLB health probe timed out for {}", dc_id);
+                                router_probe.update_health(&dc_id, false, 5000.0);
+                            }
+                        }
+                    });
+                }
+            }
+        });
     }
 }
 
@@ -555,5 +692,41 @@ mod tests {
         let cloned = status.clone();
         assert_eq!(cloned.dc_id, "test");
         assert_eq!(cloned.latency_ms, 42.0);
+    }
+
+    #[test]
+    fn test_reload_data_centers_preserves_health() {
+        let router = make_router();
+        // Mark us-east as unhealthy
+        router.update_health("us-east", false, 1000.0);
+
+        // Reload with same DCs + a new one
+        let new_dcs = vec![
+            make_dc("us-east", GeoRegion::NorthAmerica, vec!["US", "CA"], 100),
+            make_dc("eu-west", GeoRegion::Europe, vec!["GB", "DE", "FR"], 100),
+            make_dc("new-dc", GeoRegion::Oceania, vec!["AU", "NZ"], 50),
+        ];
+        // ap-south is removed
+        router.reload_data_centers(new_dcs);
+
+        assert_eq!(router.dc_count(), 3);
+        // us-east should still be unhealthy (preserved)
+        let statuses = router.health_statuses();
+        let us = statuses.iter().find(|s| s.dc_id == "us-east").unwrap();
+        assert!(!us.healthy);
+        // new-dc should be healthy (freshly initialized)
+        let new = statuses.iter().find(|s| s.dc_id == "new-dc").unwrap();
+        assert!(new.healthy);
+        // ap-south should be gone
+        assert!(statuses.iter().find(|s| s.dc_id == "ap-south").is_none());
+    }
+
+    #[test]
+    fn test_gslb_router_is_arc_compatible() {
+        // Verify GslbRouter can be wrapped in Arc (required by spawn_health_check_loop)
+        let router = Arc::new(GslbRouter::new(GslbPolicy::Geographic, 500.0, 3));
+        router.add_data_center(make_dc("us-east", GeoRegion::NorthAmerica, vec!["US"], 100));
+        assert_eq!(router.dc_count(), 1);
+        assert_eq!(router.healthy_dc_count(), 1);
     }
 }

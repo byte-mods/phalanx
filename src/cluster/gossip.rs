@@ -54,7 +54,10 @@ pub struct GossipEntry {
     pub ttl_secs: u64,
 }
 
-/// Gossip protocol message types.
+/// Gossip protocol message types exchanged over UDP between cluster peers.
+///
+/// The protocol follows the SWIM paper's Ping/Ack model with Join/Leave extensions.
+/// All messages are JSON-serialized for simplicity (production could use bincode).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum GossipMessage {
     /// Ping with state digest
@@ -119,18 +122,28 @@ impl Default for GossipConfig {
     }
 }
 
-/// The gossip state engine — manages membership and shared KV state.
+/// The gossip state engine -- manages membership and shared KV state.
+///
+/// This is the core data structure for the SWIM-based gossip protocol. It holds:
+/// - A replicated KV store (entries) with last-write-wins conflict resolution
+/// - A membership table (members) tracking peer health via the SWIM lifecycle
+/// - An incarnation counter used to refute false suspicion reports
+///
+/// All state is protected by `parking_lot::RwLock` for high-throughput concurrent access.
 pub struct GossipState {
+    /// Protocol configuration (bind address, fanout, intervals, etc.).
     config: GossipConfig,
-    /// Shared KV store: key → GossipEntry (LWW)
+    /// Shared KV store: key -> GossipEntry (LWW by timestamp).
     entries: Arc<RwLock<HashMap<String, GossipEntry>>>,
-    /// Known cluster members
+    /// Known cluster members indexed by node ID.
     members: Arc<RwLock<HashMap<String, PeerInfo>>>,
-    /// This node's incarnation counter (monotonically increasing)
+    /// Monotonically increasing incarnation counter. Bumped on each outgoing Ping/Ack
+    /// and used to refute suspicion (a node with a higher incarnation overrides Suspect state).
     incarnation: Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl GossipState {
+    /// Creates a new gossip state engine and registers this node as the first member.
     pub fn new(config: GossipConfig) -> Self {
         let node_id = config.node_id.clone();
         let bind_addr = config.bind_addr;
@@ -221,7 +234,12 @@ impl GossipState {
             .count()
     }
 
-    /// Merges incoming entries using LWW semantics.
+    /// Merges incoming entries using last-write-wins (LWW) semantics.
+    ///
+    /// For each incoming entry, if its timestamp is newer than the local copy
+    /// (or the key does not exist locally), the local entry is replaced.
+    /// This is the core convergence mechanism -- after enough gossip rounds,
+    /// all nodes will hold the same set of entries.
     pub fn merge_entries(&self, incoming: &[GossipEntry]) {
         let mut entries = self.entries.write();
         for entry in incoming {
@@ -235,7 +253,11 @@ impl GossipState {
         }
     }
 
-    /// Merges incoming member list.
+    /// Merges incoming member list using incarnation number and last-seen timestamp.
+    ///
+    /// A remote peer's state is accepted if its incarnation number is higher
+    /// (authoritative) or its last_seen timestamp is more recent. This prevents
+    /// stale state from overwriting fresh information.
     pub fn merge_members(&self, incoming: &[PeerInfo]) {
         let mut members = self.members.write();
         for peer in incoming {
@@ -302,6 +324,15 @@ impl GossipState {
     }
 
     /// Processes an incoming gossip message and returns an optional response.
+    ///
+    /// Message handling:
+    /// - **Ping**: Merge the sender's state, then reply with an Ack containing our state.
+    ///   This is the core gossip exchange -- both sides converge after each round.
+    /// - **Ack**: Merge the sender's state silently (no reply to an Ack).
+    /// - **Join**: Register a new peer in the membership table.
+    /// - **Leave**: Mark the departing peer as Dead.
+    /// - **PingReq**: Handled asynchronously in the gossip loop (indirect probe).
+    ///   Returns `None` here; the gossip recv loop spawns an async task for the probe.
     pub fn process_message(&self, msg: GossipMessage) -> Option<GossipMessage> {
         match msg {
             GossipMessage::Ping {
@@ -360,7 +391,8 @@ impl GossipState {
         self.incarnation.load(std::sync::atomic::Ordering::SeqCst)
     }
 
-    /// Evicts expired entries from the store.
+    /// Evicts expired entries from the KV store based on their TTL.
+    /// Entries with `ttl_secs == 0` never expire. Called periodically by the gossip loop.
     pub fn evict_expired(&self) {
         let now = now_secs();
         let mut entries = self.entries.write();
@@ -373,7 +405,8 @@ impl GossipState {
         });
     }
 
-    /// Evicts dead members that have been dead for longer than the suspicion timeout.
+    /// Evicts dead members whose `last_seen` timestamp is older than `max_dead_age_secs`.
+    /// This prevents the membership table from growing unboundedly as nodes leave.
     pub fn evict_dead_members(&self, max_dead_age_secs: u64) {
         let now = now_secs();
         let mut members = self.members.write();
@@ -386,7 +419,14 @@ impl GossipState {
         });
     }
 
-    /// Spawns the background gossip protocol loop.
+    /// Spawns the background gossip protocol loop as a Tokio task.
+    ///
+    /// The loop performs three activities:
+    /// 1. **Bootstrap**: Sends Join messages to all seed peers on startup.
+    /// 2. **Listener**: Spawns a UDP recv loop that processes incoming messages
+    ///    and sends replies.
+    /// 3. **Gossip round**: Every `gossip_interval_ms`, picks up to `fanout` alive
+    ///    peers and sends them a Ping containing our full state snapshot.
     pub fn spawn_gossip_loop(self: Arc<Self>) {
         let state = Arc::clone(&self);
         tokio::spawn(async move {
@@ -417,13 +457,89 @@ impl GossipState {
                 let mut buf = vec![0u8; MAX_DATAGRAM_SIZE];
                 loop {
                     match recv_socket.recv_from(&mut buf).await {
-                        Ok((len, _src)) => {
-                            if let Ok(msg) = GossipState::decode_message(&buf[..len]) {
-                                if let Some(reply) = recv_state.process_message(msg) {
-                                    if let Ok(data) = GossipState::encode_message(&reply) {
-                                        let _ = recv_socket.send_to(&data, _src).await;
+                        Ok((len, src)) => {
+                            match GossipState::decode_message(&buf[..len]) {
+                                Ok(GossipMessage::PingReq { sender_id: _, target_addr }) => {
+                                    // Indirect probe: ping the target on behalf of the requester
+                                    let target = target_addr;
+                                    let sock = Arc::clone(&recv_socket);
+                                    let probe_state = Arc::clone(&recv_state);
+                                    let requester = src;
+                                    tokio::spawn(async move {
+                                        // Use ephemeral socket to avoid interfering with main recv loop
+                                        let probe_sock = match UdpSocket::bind("0.0.0.0:0").await {
+                                            Ok(s) => s,
+                                            Err(_) => return,
+                                        };
+                                        let inc = probe_state.incarnation.fetch_add(
+                                            1,
+                                            std::sync::atomic::Ordering::SeqCst,
+                                        );
+                                        let ping = GossipMessage::Ping {
+                                            sender_id: probe_state.config.node_id.clone(),
+                                            sender_addr: probe_state.config.bind_addr,
+                                            incarnation: inc,
+                                            entries: vec![],
+                                            members: vec![],
+                                        };
+                                        if let Ok(data) = GossipState::encode_message(&ping) {
+                                            if probe_sock.send_to(&data, target).await.is_err() {
+                                                return;
+                                            }
+                                        } else {
+                                            return;
+                                        }
+                                        // Wait for Ack with 2s timeout
+                                        let mut probe_buf = vec![0u8; MAX_DATAGRAM_SIZE];
+                                        match tokio::time::timeout(
+                                            Duration::from_secs(2),
+                                            probe_sock.recv_from(&mut probe_buf),
+                                        )
+                                        .await
+                                        {
+                                            Ok(Ok((plen, _))) => {
+                                                if let Ok(GossipMessage::Ack { .. }) =
+                                                    GossipState::decode_message(&probe_buf[..plen])
+                                                {
+                                                    // Target is alive — relay Ack to requester
+                                                    let ack = GossipMessage::Ack {
+                                                        sender_id: probe_state.config.node_id.clone(),
+                                                        sender_addr: probe_state.config.bind_addr,
+                                                        incarnation: probe_state.incarnation.load(
+                                                            std::sync::atomic::Ordering::SeqCst,
+                                                        ),
+                                                        entries: vec![],
+                                                        members: vec![],
+                                                    };
+                                                    if let Ok(data) =
+                                                        GossipState::encode_message(&ack)
+                                                    {
+                                                        let _ =
+                                                            sock.send_to(&data, requester).await;
+                                                    }
+                                                    debug!(
+                                                        "PingReq: target {} is alive, relayed Ack to {}",
+                                                        target, requester
+                                                    );
+                                                }
+                                            }
+                                            _ => {
+                                                debug!(
+                                                    "PingReq: target {} did not respond within timeout",
+                                                    target
+                                                );
+                                            }
+                                        }
+                                    });
+                                }
+                                Ok(msg) => {
+                                    if let Some(reply) = recv_state.process_message(msg) {
+                                        if let Ok(data) = GossipState::encode_message(&reply) {
+                                            let _ = recv_socket.send_to(&data, src).await;
+                                        }
                                     }
                                 }
+                                Err(_) => {}
                             }
                         }
                         Err(e) => {
@@ -476,6 +592,8 @@ impl GossipState {
     }
 }
 
+/// Returns the current Unix epoch time in seconds. Used for timestamps throughout
+/// the gossip protocol (entry timestamps, last_seen, TTL calculations).
 fn now_secs() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -853,6 +971,35 @@ mod tests {
         state.put("key", "v2", 0);
         state.put("key", "v3", 0);
         assert_eq!(state.get("key"), Some("v3".to_string()));
+    }
+
+    #[test]
+    fn test_gossip_encode_decode_pingreq() {
+        let msg = GossipMessage::PingReq {
+            sender_id: "node-1".to_string(),
+            target_addr: "10.0.0.5:7946".parse().unwrap(),
+        };
+        let data = GossipState::encode_message(&msg).unwrap();
+        let decoded = GossipState::decode_message(&data).unwrap();
+        match decoded {
+            GossipMessage::PingReq { sender_id, target_addr } => {
+                assert_eq!(sender_id, "node-1");
+                assert_eq!(target_addr, "10.0.0.5:7946".parse::<std::net::SocketAddr>().unwrap());
+            }
+            _ => panic!("Expected PingReq"),
+        }
+    }
+
+    #[test]
+    fn test_gossip_process_pingreq_returns_none() {
+        // PingReq is handled async in the gossip loop, so process_message returns None
+        let state = make_state("node-1");
+        let pingreq = GossipMessage::PingReq {
+            sender_id: "node-2".to_string(),
+            target_addr: "10.0.0.3:7946".parse().unwrap(),
+        };
+        let reply = state.process_message(pingreq);
+        assert!(reply.is_none());
     }
 
     #[test]

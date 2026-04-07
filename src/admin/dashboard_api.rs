@@ -21,10 +21,14 @@ pub struct DashboardState {
 
 // ── WAF Ban Management ─────────────────────────────────────────────────────────
 
+/// A banned IP entry returned by the WAF ban list endpoint.
 #[derive(Serialize)]
 pub struct BanEntry {
+    /// The banned IP address.
     pub ip: String,
+    /// Accumulated strike count that triggered the ban.
     pub strikes: u32,
+    /// Seconds remaining until the ban expires.
     pub expires_in_secs: u64,
 }
 
@@ -86,8 +90,10 @@ pub async fn list_strikes(state: web::Data<DashboardState>) -> impl Responder {
 
 // ── Rate Limit Top-N ──────────────────────────────────────────────────────────
 
+/// Query parameters for the top-N rate-limit endpoint.
 #[derive(Deserialize)]
 pub struct TopQuery {
+    /// Number of top IPs to return (default: 10, max: 100).
     pub n: Option<usize>,
 }
 
@@ -108,10 +114,14 @@ pub async fn top_rate_ips(
 
 // ── Cluster Node Status ────────────────────────────────────────────────────────
 
+/// Status of a single cluster node as reported by the cluster status endpoint.
 #[derive(Serialize)]
 pub struct NodeStatus {
+    /// Unique node identifier (from `$HOSTNAME` or config).
     pub node_id: String,
+    /// Health status string (e.g. `"healthy"`, `"degraded"`).
     pub status: String,
+    /// Seconds since the node was last seen by the cluster.
     pub last_seen_secs: u64,
 }
 
@@ -145,10 +155,19 @@ pub async fn bandwidth_stats(state: web::Data<DashboardState>) -> impl Responder
     HttpResponse::Ok().json(serde_json::json!({ "protocols": snap }))
 }
 
+/// GET /api/bandwidth/pools — per-upstream-pool traffic snapshot.
+#[get("/api/bandwidth/pools")]
+pub async fn bandwidth_pool_stats(state: web::Data<DashboardState>) -> impl Responder {
+    let snap = state.bandwidth.pool_snapshot();
+    HttpResponse::Ok().json(serde_json::json!({ "pools": snap }))
+}
+
 // ── Resource Alerts ────────────────────────────────────────────────────────────
 
+/// Query parameters for the alerts endpoint.
 #[derive(serde::Deserialize)]
 pub struct AlertsQuery {
+    /// Number of recent alerts to return (default: 50, max: 500).
     pub n: Option<usize>,
 }
 
@@ -505,5 +524,42 @@ mod tests {
             alerts.iter().any(|a| a["protocol"] == "tcp"),
             "Expected tcp alert"
         );
+    }
+
+    #[actix_web::test]
+    async fn test_bandwidth_pool_stats_empty() {
+        let state = make_state();
+        let app = test::init_service(
+            App::new().app_data(state.clone()).service(bandwidth_pool_stats)
+        ).await;
+        let req = test::TestRequest::get().uri("/api/bandwidth/pools").to_request();
+        let resp = test::call_service(&app, req).await;
+        assert_eq!(resp.status(), 200);
+        let body: serde_json::Value = test::read_body_json(resp).await;
+        assert_eq!(body["pools"].as_array().unwrap().len(), 0);
+    }
+
+    #[actix_web::test]
+    async fn test_bandwidth_pool_stats_with_data() {
+        let state = make_state();
+        state.bandwidth.pool("api_pool").add_in(10000);
+        state.bandwidth.pool("api_pool").add_out(5000);
+        state.bandwidth.pool("api_pool").inc_requests();
+        state.bandwidth.pool("static_pool").add_in(2000);
+
+        let app = test::init_service(
+            App::new().app_data(state.clone()).service(bandwidth_pool_stats)
+        ).await;
+        let req = test::TestRequest::get().uri("/api/bandwidth/pools").to_request();
+        let resp = test::call_service(&app, req).await;
+        assert_eq!(resp.status(), 200);
+        let body: serde_json::Value = test::read_body_json(resp).await;
+        let pools = body["pools"].as_array().unwrap();
+        assert_eq!(pools.len(), 2);
+        // Sorted by total bytes desc — api_pool (15000) should come first
+        assert_eq!(pools[0]["protocol"], "api_pool");
+        assert_eq!(pools[0]["bytes_in"], 10000);
+        assert_eq!(pools[0]["bytes_out"], 5000);
+        assert_eq!(pools[0]["requests"], 1);
     }
 }

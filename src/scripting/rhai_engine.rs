@@ -24,19 +24,46 @@
 //! Any other return value is treated as Continue.
 
 use rhai::{Engine, Map, Scope};
+use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
 use tracing::{error, warn};
 
 use crate::scripting::{HookContext, HookHandler, HookResult};
 
 // ─── RhaiEngine ──────────────────────────────────────────────────────────────
 
-/// Wrapper around a `rhai::Engine` instance configured with Phalanx's API.
+/// Wrapper around a `rhai::Engine` instance configured with Phalanx's safety limits.
+///
+/// The engine is sandboxed with resource limits to prevent script abuse:
+/// - Max 1M operations per execution (prevents infinite loops)
+/// - Max 64KB string length (prevents memory bombs)
+/// - Max 1000 array elements and 100 map entries
+///
+/// Scripts can call `set_header(name, value)` to inject request headers and
+/// `set_var(key, value)` to set metadata variables. These are collected after
+/// execution and returned as part of the `RhaiResult`.
 pub struct RhaiEngine {
+    /// The underlying Rhai scripting engine with configured safety limits.
     engine: Engine,
+    /// Headers set by script via `set_header(name, value)`.
+    pending_headers: Arc<Mutex<HashMap<String, String>>>,
+    /// Variables set by script via `set_var(key, value)`.
+    pending_vars: Arc<Mutex<HashMap<String, String>>>,
+}
+
+/// Result of a Rhai script evaluation including side-effects.
+pub struct RhaiResult {
+    /// The return value of the script.
+    pub value: Option<rhai::Dynamic>,
+    /// Headers set via `set_header()` during execution.
+    pub headers: HashMap<String, String>,
+    /// Variables set via `set_var()` during execution.
+    pub vars: HashMap<String, String>,
 }
 
 impl RhaiEngine {
+    /// Creates a new Rhai engine with security limits applied.
     pub fn new() -> Self {
         let mut engine = Engine::new();
 
@@ -46,12 +73,48 @@ impl RhaiEngine {
         engine.set_max_array_size(1_000);
         engine.set_max_map_size(100);
 
-        Self { engine }
+        let pending_headers: Arc<Mutex<HashMap<String, String>>> =
+            Arc::new(Mutex::new(HashMap::new()));
+        let pending_vars: Arc<Mutex<HashMap<String, String>>> =
+            Arc::new(Mutex::new(HashMap::new()));
+
+        // Register set_header(name, value) function
+        let hdrs = Arc::clone(&pending_headers);
+        engine.register_fn("set_header", move |name: String, value: String| {
+            if let Ok(mut map) = hdrs.lock() {
+                map.insert(name, value);
+            }
+        });
+
+        // Register set_var(key, value) function
+        let vars = Arc::clone(&pending_vars);
+        engine.register_fn("set_var", move |key: String, value: String| {
+            if let Ok(mut map) = vars.lock() {
+                map.insert(key, value);
+            }
+        });
+
+        Self {
+            engine,
+            pending_headers,
+            pending_vars,
+        }
     }
 
-    /// Compile and evaluate a script with context values in scope.
-    /// Returns the raw Rhai `Dynamic` result, or `None` on error.
-    fn eval_script(&self, script: &str, ctx: &HookContext) -> Option<rhai::Dynamic> {
+    /// Compile and evaluate a script with request context values injected into scope.
+    ///
+    /// Populates the Rhai scope with `uri`, `method`, `client_ip`, `status`, and
+    /// `headers` variables, then evaluates the script. Returns the script result
+    /// along with any headers/vars set via `set_header()`/`set_var()`.
+    fn eval_script(&self, script: &str, ctx: &HookContext) -> RhaiResult {
+        // Clear pending state from any previous execution
+        if let Ok(mut h) = self.pending_headers.lock() {
+            h.clear();
+        }
+        if let Ok(mut v) = self.pending_vars.lock() {
+            v.clear();
+        }
+
         let mut scope = Scope::new();
 
         // Populate the scope with request context variables
@@ -67,12 +130,30 @@ impl RhaiEngine {
         }
         scope.push("headers", headers_map);
 
-        match self.engine.eval_with_scope::<rhai::Dynamic>(&mut scope, script) {
+        let value = match self.engine.eval_with_scope::<rhai::Dynamic>(&mut scope, script) {
             Ok(result) => Some(result),
             Err(e) => {
                 warn!("Rhai script execution error: {}", e);
                 None
             }
+        };
+
+        // Collect side-effects
+        let headers = self
+            .pending_headers
+            .lock()
+            .map(|h| h.clone())
+            .unwrap_or_default();
+        let vars = self
+            .pending_vars
+            .lock()
+            .map(|v| v.clone())
+            .unwrap_or_default();
+
+        RhaiResult {
+            value,
+            headers,
+            vars,
         }
     }
 }
@@ -86,12 +167,14 @@ impl Default for RhaiEngine {
 // ─── RhaiHookHandler ─────────────────────────────────────────────────────────
 
 /// A `HookHandler` that executes a `.rhai` script file at a configured hook phase.
+///
+/// The script is loaded once at registration time and re-evaluated on every
+/// request. Each invocation gets a fresh Rhai scope populated with request context.
 pub struct RhaiHookHandler {
+    /// Dedicated Rhai engine instance for this handler.
     engine: RhaiEngine,
-    /// Compiled script content (loaded once at registration time).
+    /// Script source code (loaded once from file or inline string at registration).
     script: String,
-    /// Original path — used for error messages.
-    path: PathBuf,
 }
 
 impl RhaiHookHandler {
@@ -104,7 +187,6 @@ impl RhaiHookHandler {
         Ok(Self {
             engine: RhaiEngine::new(),
             script,
-            path,
         })
     }
 
@@ -113,50 +195,90 @@ impl RhaiHookHandler {
         Self {
             engine: RhaiEngine::new(),
             script: script.into(),
-            path: PathBuf::from("<inline>"),
         }
     }
 }
 
 impl HookHandler for RhaiHookHandler {
+    /// Executes the Rhai script and interprets its return value as a `HookResult`.
+    ///
+    /// Return value interpretation (checked in order):
+    /// 1. `()` (unit) -> Continue (or SetHeaders if `set_header()` was called)
+    /// 2. `String` -> Parsed as a directive ("rewrite:/path" or "respond:403:body")
+    /// 3. `bool` -> false = 403 Forbidden, true = Continue
+    /// 4. Any other type -> Continue (treated as no-op)
+    ///
+    /// If the script called `set_header(name, value)`, those headers are returned
+    /// via `HookResult::SetHeaders` (merged with any directive result).
     fn execute(&self, ctx: &HookContext) -> HookResult {
-        let result = match self.engine.eval_script(&self.script, ctx) {
+        let rhai_result = self.engine.eval_script(&self.script, ctx);
+
+        let result = match rhai_result.value {
             Some(r) => r,
-            None => return HookResult::Continue,
+            // Script error (syntax, runtime, resource limit) -> fail open
+            None => {
+                // Even on error, return any headers that were set before the failure
+                if !rhai_result.headers.is_empty() {
+                    return HookResult::SetHeaders(rhai_result.headers);
+                }
+                return HookResult::Continue;
+            }
         };
 
-        // Unit / void return → Continue
+        // Check for set_header side-effects — if present and no other directive,
+        // return SetHeaders
+        let has_set_headers = !rhai_result.headers.is_empty();
+
+        // Unit / void return -> Continue or SetHeaders
         if result.is_unit() {
+            if has_set_headers {
+                return HookResult::SetHeaders(rhai_result.headers);
+            }
             return HookResult::Continue;
         }
 
-        // String return → parse directive
+        // String return -> parse as a directive command
         if let Some(s) = result.clone().try_cast::<String>() {
-            return parse_rhai_directive(&s);
+            let directive = parse_rhai_directive(&s);
+            // If headers were set and the directive is Continue, upgrade to SetHeaders
+            if has_set_headers && matches!(directive, HookResult::Continue) {
+                return HookResult::SetHeaders(rhai_result.headers);
+            }
+            return directive;
         }
 
-        // Bool return → false = block (403), true = allow
+        // Bool return -> false = block (403), true = allow
         if let Some(b) = result.try_cast::<bool>() {
             if !b {
                 return HookResult::Respond {
                     status: 403,
                     body: "Forbidden by script".to_string(),
-                    headers: std::collections::HashMap::new(),
+                    headers: HashMap::new(),
                 };
+            }
+            if has_set_headers {
+                return HookResult::SetHeaders(rhai_result.headers);
             }
             return HookResult::Continue;
         }
 
+        if has_set_headers {
+            return HookResult::SetHeaders(rhai_result.headers);
+        }
         HookResult::Continue
     }
 }
 
-/// Parse a string directive returned by a Rhai script.
+/// Parses a string directive returned by a Rhai script into a `HookResult`.
 ///
-/// Supported formats:
-/// - `"rewrite:/new/path"` → `RewritePath`
-/// - `"respond:403:Body text"` → `Respond { status, body }`
-/// - Anything else → `Continue`
+/// This is the bridge between Rhai's untyped string return values and Phalanx's
+/// typed hook result system. The format is intentionally simple so scripts can
+/// control behavior with plain string concatenation.
+///
+/// # Supported formats
+/// - `"rewrite:/new/path"` -> `RewritePath("/new/path")`
+/// - `"respond:403:Forbidden"` -> `Respond { status: 403, body: "Forbidden" }`
+/// - Anything else -> `Continue`
 fn parse_rhai_directive(s: &str) -> HookResult {
     if let Some(path) = s.strip_prefix("rewrite:") {
         return HookResult::RewritePath(path.to_string());
@@ -167,7 +289,7 @@ fn parse_rhai_directive(s: &str) -> HookResult {
                 return HookResult::Respond {
                     status,
                     body: body.to_string(),
-                    headers: std::collections::HashMap::new(),
+                    headers: HashMap::new(),
                 };
             }
         }
@@ -298,5 +420,70 @@ mod tests {
         let handler = RhaiHookHandler::from_str("this is not valid rhai code !!!");
         // Should not panic — returns Continue
         assert!(matches!(handler.execute(&ctx()), HookResult::Continue));
+    }
+
+    #[test]
+    fn test_set_header_returns_set_headers() {
+        let script = r#"
+            set_header("X-Custom", "injected-value");
+        "#;
+        let handler = RhaiHookHandler::from_str(script);
+        match handler.execute(&ctx()) {
+            HookResult::SetHeaders(hdrs) => {
+                assert_eq!(hdrs.get("X-Custom").unwrap(), "injected-value");
+            }
+            other => panic!("expected SetHeaders, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_set_var_collected() {
+        // set_var doesn't directly affect HookResult, but set_header does.
+        // Verify both work together.
+        let script = r#"
+            set_var("request_id", "abc-123");
+            set_header("X-Request-Id", "abc-123");
+        "#;
+        let handler = RhaiHookHandler::from_str(script);
+        match handler.execute(&ctx()) {
+            HookResult::SetHeaders(hdrs) => {
+                assert_eq!(hdrs.get("X-Request-Id").unwrap(), "abc-123");
+            }
+            other => panic!("expected SetHeaders, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_set_header_with_rewrite_returns_rewrite() {
+        // When the script explicitly returns a rewrite directive, headers from
+        // set_header() are not merged — the directive takes precedence.
+        let script = r#"
+            set_header("X-Extra", "val");
+            "rewrite:/new-path"
+        "#;
+        let handler = RhaiHookHandler::from_str(script);
+        match handler.execute(&ctx()) {
+            HookResult::RewritePath(p) => assert_eq!(p, "/new-path"),
+            other => panic!("expected RewritePath, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_multiple_set_headers() {
+        let script = r#"
+            set_header("X-One", "1");
+            set_header("X-Two", "2");
+            set_header("X-Three", "3");
+        "#;
+        let handler = RhaiHookHandler::from_str(script);
+        match handler.execute(&ctx()) {
+            HookResult::SetHeaders(hdrs) => {
+                assert_eq!(hdrs.len(), 3);
+                assert_eq!(hdrs.get("X-One").unwrap(), "1");
+                assert_eq!(hdrs.get("X-Two").unwrap(), "2");
+                assert_eq!(hdrs.get("X-Three").unwrap(), "3");
+            }
+            other => panic!("expected SetHeaders, got {:?}", other),
+        }
     }
 }

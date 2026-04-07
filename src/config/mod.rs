@@ -1,7 +1,46 @@
+//! # Configuration Module
+//!
+//! Defines all configuration types for Phalanx: the global `AppConfig`, per-route
+//! `RouteConfig`, per-backend `BackendConfig`, upstream pool settings, and the
+//! load balancing algorithm enum. Also provides config loading with strict/lenient
+//! parse policies.
+//!
+//! Configuration is parsed from an NGINX-style `.conf` file via the `parser` submodule,
+//! then mapped into the typed structs defined here.
+
 pub mod parser;
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+
+/// Controls how the config loader reacts to parse errors when loading `phalanx.conf`.
+///
+/// In production deployments, `Strict` prevents the proxy from starting with a
+/// broken config. In development, `Lenient` lets the proxy fall back to sane
+/// defaults so iterating on config changes is less disruptive.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConfigParsePolicy {
+    /// Fail closed on invalid config: return an error to caller.
+    Strict,
+    /// Log and fall back to `AppConfig::default()` on invalid config.
+    Lenient,
+}
+
+impl ConfigParsePolicy {
+    /// Reads `PHALANX_CONFIG_POLICY` from the environment.
+    /// Returns `Strict` if the variable is set to "strict", otherwise defaults to `Lenient`.
+    pub fn from_env() -> Self {
+        match std::env::var("PHALANX_CONFIG_POLICY")
+            .ok()
+            .as_deref()
+            .map(|v| v.to_ascii_lowercase())
+            .as_deref()
+        {
+            Some("strict") => Self::Strict,
+            _ => Self::Lenient,
+        }
+    }
+}
 
 /// Defines the algorithm used to select a backend from an upstream pool.
 #[derive(Debug, Deserialize, Serialize, Clone, Copy, Default)]
@@ -26,9 +65,16 @@ pub enum LoadBalancingAlgorithm {
 }
 
 /// Represents a single backend server within an upstream pool.
+///
+/// Each backend is independently health-checked and can have its own circuit breaker,
+/// connection limits, and slow-start ramp-up behavior. These fields are populated
+/// from the `server` directive inside an `upstream { }` block.
 #[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct BackendConfig {
+    /// TCP address of the backend (e.g. "127.0.0.1:8081" or "backend.local:3000").
     pub address: String,
+    /// Relative traffic weight for weighted round-robin and consistent hashing.
+    /// Higher weight = more traffic. Default: 1.
     pub weight: u32,
     /// Optional HTTP path to GET for health checks (e.g. "/health"). If None, TCP connect is used.
     pub health_check_path: Option<String>,
@@ -46,6 +92,8 @@ pub struct BackendConfig {
     pub max_conns: u32,
     /// Queue size when max_conns is reached. Requests wait up to `queue_timeout_ms`. 0 = no queue.
     pub queue_size: u32,
+    /// Timeout in milliseconds for queued requests waiting for a backend slot. Default: 5000.
+    pub queue_timeout_ms: u64,
 
     // ── Circuit Breaker ──────────────────────────────────────────────────────
     /// Enable the exponential-backoff circuit breaker for this backend. Default: false.
@@ -70,6 +118,7 @@ impl Default for BackendConfig {
             backup: false,
             max_conns: 0,
             queue_size: 0,
+            queue_timeout_ms: 5000,
             circuit_breaker: false,
             circuit_initial_backoff_secs: 5,
             circuit_max_backoff_secs: 60,
@@ -78,9 +127,14 @@ impl Default for BackendConfig {
 }
 
 /// A pool of backend servers associated with a specific load balancing algorithm.
+///
+/// Corresponds to an `upstream pool_name { ... }` block in the config file.
+/// Each pool independently selects backends using its configured algorithm.
 #[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct UpstreamPoolConfig {
+    /// The load balancing strategy used to select a backend for each request.
     pub algorithm: LoadBalancingAlgorithm,
+    /// Ordered list of backend servers in this pool.
     pub backends: Vec<BackendConfig>,
     /// Maximum number of idle keepalive connections per backend. 0 = disabled.
     pub keepalive: u32,
@@ -89,16 +143,38 @@ pub struct UpstreamPoolConfig {
     /// When set, backends from SRV records are added/removed every 30s.
     #[serde(default)]
     pub srv_discover: Option<String>,
+    /// Health check interval in seconds. Default: 5.
+    #[serde(default = "default_health_check_interval")]
+    pub health_check_interval_secs: u64,
+    /// Health check timeout in seconds. Default: 3.
+    #[serde(default = "default_health_check_timeout")]
+    pub health_check_timeout_secs: u64,
+}
+
+fn default_health_check_interval() -> u64 {
+    5
+}
+
+fn default_health_check_timeout() -> u64 {
+    3
 }
 
 /// Configuration for a specific route (e.g., `/api` or `/static`).
-/// Maps a request path to either an upstream pool or a static file root directory.
+///
+/// Maps a request path to either an upstream pool, a static file root directory,
+/// or a FastCGI/uWSGI backend. Also holds per-route auth, compression, caching,
+/// and traffic mirroring settings. Created from a `route /path { ... }` block.
 #[derive(Debug, Deserialize, Serialize, Clone, Default)]
 pub struct RouteConfig {
+    /// Name of the upstream pool to forward matching requests to (e.g. "backend_api").
     pub upstream: Option<String>,
+    /// Filesystem root directory for serving static files (e.g. "/var/www/html").
     pub root: Option<String>,
+    /// TCP address of a FastCGI backend (e.g. PHP-FPM at "127.0.0.1:9000").
     pub fastcgi_pass: Option<String>,
+    /// TCP address of a uWSGI backend (e.g. Python app at "127.0.0.1:3030").
     pub uwsgi_pass: Option<String>,
+    /// Extra headers to inject into proxied requests/responses for this route.
     pub add_headers: HashMap<String, String>,
     /// Ordered list of `(pattern, replacement, flag)` rewrite rules for this route.
     /// Applied before dispatching to a backend.
@@ -158,14 +234,95 @@ pub struct RouteConfig {
     /// Cookie name that holds the OIDC session ID. Default: "phalanx_oidc".
     #[serde(default)]
     pub auth_oidc_cookie_name: Option<String>,
+
+    // ── Proxy Timeouts ──────────────────────────────────────────────────────
+    /// Timeout in seconds for establishing a TCP connection to the backend.
+    /// 0 = use global default, which itself defaults to 10s.
+    #[serde(default)]
+    pub proxy_connect_timeout_secs: u64,
+    /// Timeout in seconds for reading the full response from the backend.
+    /// 0 = use global default, which itself defaults to 60s.
+    #[serde(default)]
+    pub proxy_read_timeout_secs: u64,
+
+    // ── Retry Policy ────────────────────────────────────────────────────────
+    /// Maximum number of upstream retry attempts on 502/503 for idempotent methods.
+    /// 0 = disabled (default).
+    #[serde(default)]
+    pub proxy_next_upstream_tries: u32,
+    /// Overall timeout in seconds for the entire retry sequence.
+    /// 0 = no limit (default).
+    #[serde(default)]
+    pub proxy_next_upstream_timeout_secs: u64,
+
+    // ── Request Body Size Limit ─────────────────────────────────────────────
+    /// Maximum allowed request body size in bytes. 0 = unlimited (default).
+    /// Supports K/M/G suffixes in config file (e.g. `10M`).
+    #[serde(default)]
+    pub client_max_body_size: usize,
+
+    // ── CORS ────────────────────────────────────────────────────────────────
+    /// Enable CORS header injection for this route. Default: false.
+    #[serde(default)]
+    pub cors_enabled: bool,
+    /// Allowed origins. Empty = allow all ("*").
+    #[serde(default)]
+    pub cors_allowed_origins: Vec<String>,
+    /// Allowed HTTP methods. Defaults to GET, POST, PUT, DELETE, PATCH, OPTIONS.
+    #[serde(default = "default_cors_methods")]
+    pub cors_allowed_methods: Vec<String>,
+    /// Allowed request headers. Defaults to Content-Type, Authorization.
+    #[serde(default = "default_cors_headers")]
+    pub cors_allowed_headers: Vec<String>,
+    /// Max age in seconds for preflight cache. Default: 86400.
+    #[serde(default = "default_cors_max_age")]
+    pub cors_max_age_secs: u64,
+    /// Whether to include Access-Control-Allow-Credentials. Default: false.
+    #[serde(default)]
+    pub cors_allow_credentials: bool,
+
+    // ── HTTP/2 Backend Forwarding ────────────────────────────────────────────
+    /// When set to "2", use HTTP/2 for backend connections (enables gRPC backends).
+    #[serde(default)]
+    pub proxy_http_version: Option<String>,
+}
+
+fn default_cors_methods() -> Vec<String> {
+    vec![
+        "GET".to_string(),
+        "POST".to_string(),
+        "PUT".to_string(),
+        "DELETE".to_string(),
+        "PATCH".to_string(),
+        "OPTIONS".to_string(),
+    ]
+}
+
+fn default_cors_headers() -> Vec<String> {
+    vec![
+        "Content-Type".to_string(),
+        "Authorization".to_string(),
+    ]
+}
+
+fn default_cors_max_age() -> u64 {
+    86400
 }
 
 /// The global application configuration state.
+///
+/// This is the single source of truth for all Phalanx runtime settings. It is
+/// constructed from `phalanx.conf` by `try_load_config()` and can be hot-reloaded
+/// via SIGHUP. Each field has a sensible default defined in `Default for AppConfig`.
 #[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct AppConfig {
+    /// TCP bind address for the HTTP/HTTPS reverse proxy listener (e.g. "0.0.0.0:8080").
     pub proxy_bind: String,
+    /// TCP bind address for the raw TCP stream multiplexer (e.g. "0.0.0.0:5000").
     pub tcp_bind: String,
+    /// TCP bind address for the admin dashboard and metrics API (e.g. "127.0.0.1:9090").
     pub admin_bind: String,
+    /// Number of Tokio worker threads. Maps to `worker_threads` in the config file.
     pub workers: usize,
     /// Maps generic pool names (e.g., "default", "backend_api") to their configuration.
     pub upstreams: HashMap<String, UpstreamPoolConfig>,
@@ -341,9 +498,78 @@ pub struct AppConfig {
     /// Maximum latency (ms) before a DC is considered unhealthy. Default: 500.
     #[serde(default)]
     pub gslb_max_latency_ms: Option<f64>,
+
+    // ── Proxy Timeouts (global defaults) ────────────────────────────────────
+    /// Default TCP connect timeout in seconds for backend connections. Default: 10.
+    #[serde(default)]
+    pub proxy_connect_timeout_secs: u64,
+    /// Default response read timeout in seconds for backend connections. Default: 60.
+    #[serde(default)]
+    pub proxy_read_timeout_secs: u64,
+
+    // ── Retry Policy (global defaults) ──────────────────────────────────────
+    /// Default max upstream retry attempts on 502/503 for idempotent methods. 0 = disabled.
+    #[serde(default)]
+    pub proxy_next_upstream_tries: u32,
+    /// Default overall timeout in seconds for the retry sequence. 0 = no limit.
+    #[serde(default)]
+    pub proxy_next_upstream_timeout_secs: u64,
+
+    // ── Request Body Size Limit (global default) ────────────────────────────
+    /// Default maximum request body size in bytes. 0 = unlimited.
+    #[serde(default)]
+    pub client_max_body_size: usize,
+
+    // ── WebSocket ────────────────────────────────────────────────────────────
+    /// Idle timeout in seconds for WebSocket connections. If no data flows for
+    /// this duration, the tunnel is closed. Default: 3600 (1 hour). 0 = unlimited.
+    #[serde(default)]
+    pub websocket_idle_timeout_secs: u64,
+
+    // ── UDP Proxy ──────────────────────────────────────────────────────────
+    /// Idle session timeout in seconds for the UDP proxy. Sessions without any
+    /// traffic for this duration are garbage-collected. Default: 60.
+    #[serde(default)]
+    pub udp_session_timeout_secs: u64,
+
+    // ── Mail Proxy ─────────────────────────────────────────────────────────
+    /// Whether to verify backend TLS certificates when connecting to mail
+    /// backends over STARTTLS. Default: false (for backwards compatibility).
+    #[serde(default)]
+    pub mail_verify_backend_tls: bool,
+
+    // ── Graceful Shutdown ───────────────────────────────────────────────────
+    /// Timeout in seconds to wait for in-flight requests during shutdown. Default: 30.
+    #[serde(default)]
+    pub shutdown_timeout_secs: u64,
+
+    // ── Admin API Tokens ──────────────────────────────────────────────────
+    /// Mapping of API bearer token → role name (admin, operator, readonly).
+    /// Populated from `api_token TOKEN ROLE;` directives in the server block.
+    #[serde(default)]
+    pub admin_api_tokens: HashMap<String, String>,
+
+    // ── TLS Hardening ──────────────────────────────────────────────────────
+    /// Minimum TLS version: "1.2" or "1.3". Default: "1.2".
+    #[serde(default)]
+    pub tls_min_version: Option<String>,
+    /// Allowed TLS cipher suites (rustls names). Empty = use rustls defaults.
+    #[serde(default)]
+    pub tls_ciphers: Vec<String>,
+    /// HSTS max-age in seconds. When set, `Strict-Transport-Security` header is injected.
+    #[serde(default)]
+    pub hsts_max_age: Option<u64>,
+
+    // ── Rate Limit Response ────────────────────────────────────────────────
+    /// Custom Retry-After value in seconds for 429 responses. Default: 60.
+    #[serde(default)]
+    pub rate_limit_retry_after: Option<u64>,
 }
 
 impl Default for AppConfig {
+    /// Returns a minimal working configuration with a "default" upstream pool
+    /// containing two localhost backends and a single "/" route pointing to it.
+    /// All optional features (TLS, WAF, AI, etc.) are disabled.
     fn default() -> Self {
         let mut upstreams = HashMap::new();
         upstreams.insert(
@@ -352,6 +578,8 @@ impl Default for AppConfig {
                 algorithm: LoadBalancingAlgorithm::RoundRobin,
                 keepalive: 0,
                 srv_discover: None,
+                health_check_interval_secs: 5,
+                health_check_timeout_secs: 3,
                 backends: vec![
                     BackendConfig {
                         address: "127.0.0.1:8081".to_string(),
@@ -439,20 +667,49 @@ impl Default for AppConfig {
             k8s_ingress_class: None,
             gslb_policy: None,
             gslb_max_latency_ms: None,
+            proxy_connect_timeout_secs: 10,
+            proxy_read_timeout_secs: 60,
+            proxy_next_upstream_tries: 0,
+            proxy_next_upstream_timeout_secs: 0,
+            client_max_body_size: 0,
+            websocket_idle_timeout_secs: 3600,
+            udp_session_timeout_secs: 60,
+            mail_verify_backend_tls: false,
+            shutdown_timeout_secs: 30,
+            admin_api_tokens: HashMap::new(),
+            tls_min_version: None,
+            tls_ciphers: Vec::new(),
+            hsts_max_age: None,
+            rate_limit_retry_after: None,
         }
     }
 }
 
-/// Synchronously loads and parses the given config path from the disk.
-/// Panics immediately with a descriptive error if the config file is malformed
-/// (e.g., missing semicolons, unbalanced braces, or unknown directives).
-pub fn load_config(conf_path: &str) -> AppConfig {
-    if let Ok(content) = std::fs::read_to_string(conf_path) {
-        // Use our strict phalanx-syntax parser — panics on malformed config
-        let phalanx_cfg = parser::parse_phalanx_config(&content)
-            .unwrap_or_else(|e| panic!("Configuration error in '{conf_path}': {e}"));
+/// Synchronously loads and parses the given config path from disk.
+/// In strict mode, parse failures return `Err`.
+/// In lenient mode, parse failures are logged and defaults are returned.
+pub fn try_load_config(
+    conf_path: &str,
+    policy: ConfigParsePolicy,
+) -> Result<AppConfig, String> {
+    match std::fs::read_to_string(conf_path) {
+        Ok(content) => {
+        let phalanx_cfg = match parser::parse_phalanx_config(&content) {
+            Ok(cfg) => cfg,
+            Err(e) => {
+                let msg = format!("Configuration error in '{}': {}", conf_path, e);
+                if matches!(policy, ConfigParsePolicy::Strict) {
+                    return Err(msg);
+                }
+                tracing::error!("{}. Falling back to defaults.", msg);
+                return Ok(AppConfig::default());
+            }
+        };
+        // Start from defaults, then overlay values found in the parsed config.
+        // This ensures any field not explicitly set in the file keeps its default.
         let mut app_cfg = AppConfig::default();
 
+        // Map top-level directives
         if let Some(w) = phalanx_cfg.worker_threads {
             app_cfg.workers = w;
         }
@@ -473,6 +730,8 @@ pub fn load_config(conf_path: &str) -> AppConfig {
             }
         }
 
+        // Walk the http → server → route hierarchy and flatten it into AppConfig's
+        // flat HashMap-based structures. Multiple server blocks are merged sequentially.
         if let Some(http) = phalanx_cfg.http {
             for server in http.servers {
                 if let Some(listen) = server.listen {
@@ -685,6 +944,97 @@ pub fn load_config(conf_path: &str) -> AppConfig {
                     }
                 }
 
+                // Proxy timeouts (global defaults)
+                if let Some(v) = server.directives.get("proxy_connect_timeout") {
+                    if let Ok(val) = v.parse::<u64>() {
+                        app_cfg.proxy_connect_timeout_secs = val;
+                    }
+                }
+                if let Some(v) = server.directives.get("proxy_read_timeout") {
+                    if let Ok(val) = v.parse::<u64>() {
+                        app_cfg.proxy_read_timeout_secs = val;
+                    }
+                }
+
+                // Retry policy (global defaults)
+                if let Some(v) = route_or_directive_u32(&server.directives, "proxy_next_upstream_tries") {
+                    app_cfg.proxy_next_upstream_tries = v;
+                }
+                if let Some(v) = server.directives.get("proxy_next_upstream_timeout") {
+                    if let Ok(val) = v.parse::<u64>() {
+                        app_cfg.proxy_next_upstream_timeout_secs = val;
+                    }
+                }
+
+                // Request body size limit (global default)
+                if let Some(v) = server.directives.get("client_max_body_size") {
+                    app_cfg.client_max_body_size = parse_size_value(v);
+                }
+
+                // Graceful shutdown timeout
+                if let Some(v) = server.directives.get("shutdown_timeout") {
+                    if let Ok(val) = v.parse::<u64>() {
+                        app_cfg.shutdown_timeout_secs = val;
+                    }
+                }
+
+                // WebSocket idle timeout
+                if let Some(v) = server.directives.get("websocket_idle_timeout") {
+                    if let Ok(val) = v.parse::<u64>() {
+                        app_cfg.websocket_idle_timeout_secs = val;
+                    }
+                }
+
+                // UDP session timeout
+                if let Some(v) = server.directives.get("udp_session_timeout") {
+                    if let Ok(val) = v.parse::<u64>() {
+                        app_cfg.udp_session_timeout_secs = val;
+                    }
+                }
+
+                // Mail backend TLS verification
+                if let Some(v) = server.directives.get("mail_verify_backend_tls") {
+                    app_cfg.mail_verify_backend_tls = v == "true" || v == "on";
+                }
+
+                // Admin API tokens: `api_token TOKEN ROLE;` in server block
+                if let Some(v) = server.directives.get("api_token") {
+                    // Value format: "TOKEN ROLE" but generic directive only captures one value.
+                    // We handle multi-token api_token via dedicated parser entries instead.
+                    // Single-value fallback: token is the value, role defaults to "admin".
+                    app_cfg.admin_api_tokens.insert(v.clone(), "admin".to_string());
+                }
+                // Consume api_token entries parsed as multi-value directives
+                for (key, value) in &server.directives {
+                    if let Some(token) = key.strip_prefix("api_token:") {
+                        app_cfg.admin_api_tokens.insert(token.to_string(), value.clone());
+                    }
+                }
+
+                // TLS hardening directives
+                if let Some(v) = server.directives.get("ssl_min_version") {
+                    app_cfg.tls_min_version = Some(v.clone());
+                } else if let Some(v) = server.directives.get("tls_min_version") {
+                    app_cfg.tls_min_version = Some(v.clone());
+                }
+                if let Some(v) = server.directives.get("ssl_ciphers") {
+                    app_cfg.tls_ciphers = v.split(':').map(|s| s.trim().to_string()).collect();
+                } else if let Some(v) = server.directives.get("tls_ciphers") {
+                    app_cfg.tls_ciphers = v.split(':').map(|s| s.trim().to_string()).collect();
+                }
+                if let Some(v) = server.directives.get("hsts_max_age") {
+                    if let Ok(val) = v.parse::<u64>() {
+                        app_cfg.hsts_max_age = Some(val);
+                    }
+                }
+
+                // Rate limit response customization
+                if let Some(v) = server.directives.get("rate_limit_retry_after") {
+                    if let Ok(val) = v.parse::<u64>() {
+                        app_cfg.rate_limit_retry_after = Some(val);
+                    }
+                }
+
                 // Map phalanx-style route blocks into our RouteConfig hashmap
                 for (path, route) in server.routes {
                     app_cfg.routes.insert(
@@ -713,12 +1063,26 @@ pub fn load_config(conf_path: &str) -> AppConfig {
                             auth_jwks_uri: route.auth_jwks_uri,
                             auth_oidc_issuer: route.auth_oidc_issuer,
                             auth_oidc_cookie_name: route.auth_oidc_cookie_name,
+                            proxy_connect_timeout_secs: route.proxy_connect_timeout_secs,
+                            proxy_read_timeout_secs: route.proxy_read_timeout_secs,
+                            proxy_next_upstream_tries: route.proxy_next_upstream_tries,
+                            proxy_next_upstream_timeout_secs: route.proxy_next_upstream_timeout_secs,
+                            client_max_body_size: route.client_max_body_size,
+                            cors_enabled: route.cors_enabled,
+                            cors_allowed_origins: route.cors_allowed_origins,
+                            cors_allowed_methods: route.cors_allowed_methods,
+                            cors_allowed_headers: route.cors_allowed_headers,
+                            cors_max_age_secs: route.cors_max_age_secs,
+                            cors_allow_credentials: route.cors_allow_credentials,
+                            proxy_http_version: route.proxy_http_version,
                         },
                     );
                 }
             }
 
-            // Map parsed upstream blocks into AppConfig.upstreams
+            // Convert parsed upstream blocks into typed UpstreamPoolConfig entries.
+            // The algorithm string is mapped to the LoadBalancingAlgorithm enum,
+            // and each server directive becomes a BackendConfig.
             for upstream in http.upstreams {
                 let algorithm = match upstream.algorithm.as_deref() {
                     Some("roundrobin") | Some("round_robin") => LoadBalancingAlgorithm::RoundRobin,
@@ -763,21 +1127,60 @@ pub fn load_config(conf_path: &str) -> AppConfig {
                         backends,
                         keepalive: upstream.keepalive,
                         srv_discover: upstream.srv_discover.clone(),
+                        health_check_interval_secs: upstream.health_check_interval_secs,
+                        health_check_timeout_secs: upstream.health_check_timeout_secs,
                     },
                 );
             }
         }
         tracing::info!("Loaded config from {}", conf_path);
-        app_cfg
-    } else {
-        tracing::warn!("Could not find {}, using default config", conf_path);
-        AppConfig::default()
+        Ok(app_cfg)
+        }
+        Err(e) => {
+            let msg = format!("Could not read config '{}': {}", conf_path, e);
+            if matches!(policy, ConfigParsePolicy::Strict) {
+                return Err(msg);
+            }
+            tracing::warn!("{}. Using default config", msg);
+            Ok(AppConfig::default())
+        }
+    }
+}
+
+/// Backward-compatible loader used by existing call sites.
+/// Uses lenient mode.
+pub fn load_config(conf_path: &str) -> AppConfig {
+    match try_load_config(conf_path, ConfigParsePolicy::Lenient) {
+        Ok(cfg) => cfg,
+        Err(e) => {
+            tracing::error!("{}; using default config", e);
+            AppConfig::default()
+        }
     }
 }
 
 /// Helper to extract a u32 directive from the server block's directives map.
 fn route_or_directive_u32(directives: &HashMap<String, String>, key: &str) -> Option<u32> {
     directives.get(key).and_then(|v| v.parse::<u32>().ok())
+}
+
+/// Parses a size value with optional K/M/G suffix into bytes.
+/// Examples: "1024" -> 1024, "10K" -> 10240, "1M" -> 1048576, "2G" -> 2147483648
+fn parse_size_value(s: &str) -> usize {
+    let s = s.trim();
+    if s.is_empty() {
+        return 0;
+    }
+    let (num_str, multiplier) = if let Some(n) = s.strip_suffix('G').or_else(|| s.strip_suffix('g')) {
+        (n, 1024 * 1024 * 1024)
+    } else if let Some(n) = s.strip_suffix('M').or_else(|| s.strip_suffix('m')) {
+        (n, 1024 * 1024)
+    } else if let Some(n) = s.strip_suffix('K').or_else(|| s.strip_suffix('k')) {
+        (n, 1024)
+    } else {
+        (s, 1)
+    };
+    num_str.trim().parse::<usize>().unwrap_or(0) * multiplier
 }
 
 #[cfg(test)]
@@ -845,6 +1248,9 @@ mod tests {
         assert!(!cfg.brotli_enabled);
         assert!(cfg.auth_request_url.is_none());
         assert!(cfg.mirror_pool.is_none());
+        assert_eq!(cfg.websocket_idle_timeout_secs, 3600);
+        assert_eq!(cfg.udp_session_timeout_secs, 60);
+        assert!(!cfg.mail_verify_backend_tls);
     }
 
     #[test]
@@ -877,6 +1283,47 @@ mod tests {
     }
 
     #[test]
+    fn test_try_load_config_lenient_invalid_returns_default() {
+        let bad = "worker_threads 4\nhttp {";
+        let path = std::env::temp_dir().join(format!(
+            "phalanx_bad_lenient_{}.conf",
+            std::process::id()
+        ));
+        std::fs::write(&path, bad).expect("write temp config");
+        let cfg = try_load_config(path.to_str().unwrap(), ConfigParsePolicy::Lenient)
+            .expect("lenient parse should not fail hard");
+        assert_eq!(cfg.proxy_bind, AppConfig::default().proxy_bind);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn test_try_load_config_strict_invalid_returns_err() {
+        let bad = "worker_threads 4\nhttp {";
+        let path = std::env::temp_dir().join(format!(
+            "phalanx_bad_strict_{}.conf",
+            std::process::id()
+        ));
+        std::fs::write(&path, bad).expect("write temp config");
+        let res = try_load_config(path.to_str().unwrap(), ConfigParsePolicy::Strict);
+        assert!(res.is_err());
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn test_try_load_config_strict_missing_file_returns_err() {
+        let path = std::env::temp_dir().join(format!(
+            "phalanx_missing_strict_{}_{}.conf",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system time before unix epoch")
+                .as_nanos()
+        ));
+        let res = try_load_config(path.to_str().unwrap(), ConfigParsePolicy::Strict);
+        assert!(res.is_err());
+    }
+
+    #[test]
     fn test_route_or_directive_u32_valid() {
         let mut map = HashMap::new();
         map.insert("count".to_string(), "42".to_string());
@@ -900,5 +1347,185 @@ mod tests {
     fn test_load_balancing_algorithm_default() {
         let algo: LoadBalancingAlgorithm = Default::default();
         assert!(matches!(algo, LoadBalancingAlgorithm::RoundRobin));
+    }
+
+    #[test]
+    fn test_route_config_cors_defaults() {
+        let rc = RouteConfig::default();
+        assert!(!rc.cors_enabled);
+        assert!(rc.cors_allowed_origins.is_empty());
+        assert_eq!(rc.cors_max_age_secs, 0);
+        assert!(!rc.cors_allow_credentials);
+        assert!(rc.proxy_http_version.is_none());
+    }
+
+    #[test]
+    fn test_default_cors_methods() {
+        let methods = default_cors_methods();
+        assert!(methods.contains(&"GET".to_string()));
+        assert!(methods.contains(&"POST".to_string()));
+        assert!(methods.contains(&"OPTIONS".to_string()));
+        assert_eq!(methods.len(), 6);
+    }
+
+    #[test]
+    fn test_default_cors_headers() {
+        let headers = default_cors_headers();
+        assert!(headers.contains(&"Content-Type".to_string()));
+        assert!(headers.contains(&"Authorization".to_string()));
+        assert_eq!(headers.len(), 2);
+    }
+
+    #[test]
+    fn test_upstream_pool_config_health_check_defaults() {
+        let pool = UpstreamPoolConfig {
+            algorithm: LoadBalancingAlgorithm::RoundRobin,
+            backends: vec![],
+            keepalive: 0,
+            srv_discover: None,
+            health_check_interval_secs: default_health_check_interval(),
+            health_check_timeout_secs: default_health_check_timeout(),
+        };
+        assert_eq!(pool.health_check_interval_secs, 5);
+        assert_eq!(pool.health_check_timeout_secs, 3);
+    }
+
+    #[test]
+    fn test_app_config_admin_api_tokens_default() {
+        let cfg = AppConfig::default();
+        assert!(cfg.admin_api_tokens.is_empty());
+    }
+
+    #[test]
+    fn test_default_config_timeout_defaults() {
+        let cfg = AppConfig::default();
+        assert_eq!(cfg.proxy_connect_timeout_secs, 10);
+        assert_eq!(cfg.proxy_read_timeout_secs, 60);
+        assert_eq!(cfg.proxy_next_upstream_tries, 0);
+        assert_eq!(cfg.proxy_next_upstream_timeout_secs, 0);
+        assert_eq!(cfg.client_max_body_size, 0);
+        assert_eq!(cfg.shutdown_timeout_secs, 30);
+    }
+
+    #[test]
+    fn test_route_config_timeout_defaults() {
+        let rc = RouteConfig::default();
+        assert_eq!(rc.proxy_connect_timeout_secs, 0);
+        assert_eq!(rc.proxy_read_timeout_secs, 0);
+        assert_eq!(rc.proxy_next_upstream_tries, 0);
+        assert_eq!(rc.proxy_next_upstream_timeout_secs, 0);
+        assert_eq!(rc.client_max_body_size, 0);
+    }
+
+    #[test]
+    fn test_parse_size_value_bytes() {
+        assert_eq!(parse_size_value("1024"), 1024);
+        assert_eq!(parse_size_value("0"), 0);
+        assert_eq!(parse_size_value(""), 0);
+    }
+
+    #[test]
+    fn test_parse_size_value_suffixes() {
+        assert_eq!(parse_size_value("10K"), 10 * 1024);
+        assert_eq!(parse_size_value("10k"), 10 * 1024);
+        assert_eq!(parse_size_value("1M"), 1024 * 1024);
+        assert_eq!(parse_size_value("1m"), 1024 * 1024);
+        assert_eq!(parse_size_value("2G"), 2 * 1024 * 1024 * 1024);
+        assert_eq!(parse_size_value("2g"), 2 * 1024 * 1024 * 1024);
+    }
+
+    #[test]
+    fn test_parse_size_value_invalid() {
+        assert_eq!(parse_size_value("abc"), 0);
+        assert_eq!(parse_size_value("M"), 0);
+    }
+
+    #[test]
+    fn test_try_load_config_timeouts_and_retries() {
+        let cfg_str = r#"
+            http {
+                upstream default {
+                    server 127.0.0.1:8081;
+                }
+                server {
+                    listen 8080;
+                    proxy_connect_timeout 5;
+                    proxy_read_timeout 30;
+                    proxy_next_upstream_tries 3;
+                    proxy_next_upstream_timeout 10;
+                    client_max_body_size 10M;
+                    shutdown_timeout 60;
+                    route / {
+                        upstream default;
+                        proxy_connect_timeout 2;
+                        proxy_read_timeout 15;
+                        proxy_next_upstream_tries 2;
+                        proxy_next_upstream_timeout 5;
+                        client_max_body_size 1M;
+                    }
+                }
+            }
+        "#;
+        let path = std::env::temp_dir().join(format!(
+            "phalanx_timeout_test_{}.conf",
+            std::process::id()
+        ));
+        std::fs::write(&path, cfg_str).expect("write temp config");
+        let cfg = try_load_config(path.to_str().unwrap(), ConfigParsePolicy::Lenient)
+            .expect("parse should succeed");
+        assert_eq!(cfg.proxy_connect_timeout_secs, 5);
+        assert_eq!(cfg.proxy_read_timeout_secs, 30);
+        assert_eq!(cfg.proxy_next_upstream_tries, 3);
+        assert_eq!(cfg.proxy_next_upstream_timeout_secs, 10);
+        assert_eq!(cfg.client_max_body_size, 10 * 1024 * 1024);
+        assert_eq!(cfg.shutdown_timeout_secs, 60);
+        let route = &cfg.routes["/"];
+        assert_eq!(route.proxy_connect_timeout_secs, 2);
+        assert_eq!(route.proxy_read_timeout_secs, 15);
+        assert_eq!(route.proxy_next_upstream_tries, 2);
+        assert_eq!(route.proxy_next_upstream_timeout_secs, 5);
+        assert_eq!(route.client_max_body_size, 1024 * 1024);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn test_default_config_tls_hardening_fields() {
+        let cfg = AppConfig::default();
+        assert!(cfg.tls_min_version.is_none());
+        assert!(cfg.tls_ciphers.is_empty());
+        assert!(cfg.hsts_max_age.is_none());
+        assert!(cfg.rate_limit_retry_after.is_none());
+    }
+
+    #[test]
+    fn test_try_load_config_tls_and_hsts() {
+        let cfg_str = r#"
+            http {
+                server {
+                    listen 8080;
+                    ssl_min_version 1.3;
+                    ssl_ciphers TLS_AES_256_GCM_SHA384:TLS_CHACHA20_POLY1305_SHA256;
+                    hsts_max_age 31536000;
+                    rate_limit_retry_after 120;
+                    route / {
+                        upstream default;
+                    }
+                }
+            }
+        "#;
+        let path = std::env::temp_dir().join(format!(
+            "phalanx_tls_test_{}.conf",
+            std::process::id()
+        ));
+        std::fs::write(&path, cfg_str).expect("write temp config");
+        let cfg = try_load_config(path.to_str().unwrap(), ConfigParsePolicy::Lenient)
+            .expect("parse should succeed");
+        assert_eq!(cfg.tls_min_version.as_deref(), Some("1.3"));
+        assert_eq!(cfg.tls_ciphers.len(), 2);
+        assert_eq!(cfg.tls_ciphers[0], "TLS_AES_256_GCM_SHA384");
+        assert_eq!(cfg.tls_ciphers[1], "TLS_CHACHA20_POLY1305_SHA256");
+        assert_eq!(cfg.hsts_max_age, Some(31536000));
+        assert_eq!(cfg.rate_limit_retry_after, Some(120));
+        let _ = std::fs::remove_file(path);
     }
 }

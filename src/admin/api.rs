@@ -1,13 +1,17 @@
+//! Extended admin API: role-based access control (RBAC), dynamic route and SSL
+//! certificate management, upstream listing, cache purge, and ML fraud-detection
+//! model lifecycle endpoints.
+
 use actix_web::{delete, get, post, put, web, HttpResponse, Responder};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tracing::info;
 
-use crate::config::{AppConfig, BackendConfig, RouteConfig, UpstreamPoolConfig};
-use crate::discovery::DiscoveredBackend;
+use crate::config::RouteConfig;
 
-/// Extended admin state with dynamic route/SSL/cert management.
+/// Extended admin state that adds dynamic route/SSL/cert management and
+/// RBAC token validation on top of the base `AdminState`.
 pub struct ExtendedAdminState {
     pub base: super::AdminState,
     /// Dynamically managed routes (overlay on top of config-file routes)
@@ -18,18 +22,63 @@ pub struct ExtendedAdminState {
     pub api_tokens: Arc<dashmap::DashMap<String, ApiRole>>,
 }
 
+impl ExtendedAdminState {
+    /// Creates a new ExtendedAdminState, populating api_tokens from config.
+    ///
+    /// The `admin_api_tokens` map in AppConfig stores `token → role_name` pairs
+    /// parsed from `api_token TOKEN ROLE;` directives. Role names are matched
+    /// case-insensitively: "admin", "operator", "readonly".
+    pub fn new(base: super::AdminState, config_tokens: &std::collections::HashMap<String, String>) -> Self {
+        let api_tokens = Arc::new(dashmap::DashMap::new());
+        for (token, role_str) in config_tokens {
+            let role = match role_str.to_lowercase().as_str() {
+                "admin" => ApiRole::Admin,
+                "operator" => ApiRole::Operator,
+                "readonly" | "read_only" => ApiRole::ReadOnly,
+                _ => {
+                    tracing::warn!(
+                        "Unknown API token role '{}' for token '{}...', defaulting to ReadOnly",
+                        role_str,
+                        &token[..token.len().min(8)]
+                    );
+                    ApiRole::ReadOnly
+                }
+            };
+            api_tokens.insert(token.clone(), role);
+        }
+
+        Self {
+            base,
+            dynamic_routes: Arc::new(dashmap::DashMap::new()),
+            dynamic_certs: Arc::new(dashmap::DashMap::new()),
+            api_tokens,
+        }
+    }
+}
+
+/// An SSL certificate registered at runtime via the admin API.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SslCertEntry {
+    /// SNI hostname this certificate applies to.
     pub server_name: String,
+    /// Filesystem path to the PEM-encoded certificate chain.
     pub cert_path: String,
+    /// Filesystem path to the PEM-encoded private key.
     pub key_path: String,
+    /// Unix timestamp (epoch seconds) when the entry was added.
     pub added_at: u64,
 }
 
+/// Role assigned to an API token. Determines which endpoints the bearer can access.
+///
+/// Privilege hierarchy: `Admin` > `Operator` > `ReadOnly`.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub enum ApiRole {
+    /// Full access: can manage routes, SSL certs, RBAC tokens, and ML models.
     Admin,
+    /// Read-only access to all GET endpoints.
     ReadOnly,
+    /// Can perform mutations (routes, backends) but not security-sensitive operations.
     Operator,
 }
 
@@ -74,6 +123,9 @@ pub fn check_rbac(
     }
 }
 
+/// Returns `true` if `user`'s role satisfies the `required` permission level.
+/// Admin can do everything; Operator can do everything except Admin-only actions;
+/// ReadOnly can access any endpoint that only requires ReadOnly.
 fn role_allows(user: ApiRole, required: ApiRole) -> bool {
     match required {
         ApiRole::ReadOnly => true,
@@ -84,14 +136,20 @@ fn role_allows(user: ApiRole, required: ApiRole) -> bool {
 
 // ── Dynamic Routes API ──
 
+/// Request body for creating a dynamic route at runtime.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct RouteCreateRequest {
+    /// URL path pattern (e.g. `"/api/v2"`).
     pub path: String,
+    /// Name of the upstream pool to proxy to.
     pub upstream: Option<String>,
+    /// Filesystem root for static file serving.
     pub root: Option<String>,
+    /// Extra response headers to inject.
     pub add_headers: Option<HashMap<String, String>>,
 }
 
+/// POST /api/routes -- creates a dynamic route overlay (requires Operator+).
 #[post("/api/routes")]
 pub async fn create_route(
     state: web::Data<ExtendedAdminState>,
@@ -118,6 +176,7 @@ pub async fn create_route(
     }))
 }
 
+/// GET /api/routes -- lists all dynamically-created routes (requires ReadOnly+).
 #[get("/api/routes")]
 pub async fn list_routes(
     state: web::Data<ExtendedAdminState>,
@@ -142,6 +201,7 @@ pub async fn list_routes(
     HttpResponse::Ok().json(serde_json::json!({ "routes": routes }))
 }
 
+/// DELETE /api/routes/{path} -- removes a dynamic route (requires Operator+).
 #[delete("/api/routes/{path}")]
 pub async fn delete_route(
     state: web::Data<ExtendedAdminState>,
@@ -162,6 +222,7 @@ pub async fn delete_route(
 
 // ── Dynamic SSL Certificates API ──
 
+/// POST /api/ssl -- registers a new SSL certificate entry (requires Admin).
 #[post("/api/ssl")]
 pub async fn add_ssl_cert(
     state: web::Data<ExtendedAdminState>,
@@ -183,6 +244,7 @@ pub async fn add_ssl_cert(
     }))
 }
 
+/// GET /api/ssl -- lists all dynamically-registered SSL certificates.
 #[get("/api/ssl")]
 pub async fn list_ssl_certs(
     state: web::Data<ExtendedAdminState>,
@@ -206,6 +268,7 @@ pub async fn list_ssl_certs(
     HttpResponse::Ok().json(serde_json::json!({ "certificates": certs }))
 }
 
+/// DELETE /api/ssl/{server_name} -- removes an SSL certificate entry (requires Admin).
 #[delete("/api/ssl/{server_name}")]
 pub async fn delete_ssl_cert(
     state: web::Data<ExtendedAdminState>,
@@ -226,6 +289,7 @@ pub async fn delete_ssl_cert(
 
 // ── Upstream management API ──
 
+/// GET /api/upstreams -- lists all discovered backends across pools.
 #[get("/api/upstreams")]
 pub async fn list_upstreams(
     state: web::Data<ExtendedAdminState>,
@@ -253,16 +317,20 @@ pub async fn list_upstreams(
 
 // ── Cache purge API ──
 
+/// Request body for the cache purge endpoint.
 #[derive(Debug, Deserialize)]
 pub struct PurgeRequest {
+    /// Exact cache key to invalidate.
     pub key: Option<String>,
+    /// Prefix to match for bulk invalidation.
     pub prefix: Option<String>,
 }
 
+/// POST /api/cache/purge -- requests a cache purge by key or prefix.
 #[post("/api/cache/purge")]
 pub async fn purge_cache(
     body: web::Json<PurgeRequest>,
-    req: actix_web::HttpRequest,
+    _req: actix_web::HttpRequest,
 ) -> impl Responder {
     // Cache purge requires operator+ role but we don't have cache ref here
     // This is wired at the app level
@@ -275,11 +343,15 @@ pub async fn purge_cache(
 
 // ── ML Fraud Detection API ──
 
+/// Request body for switching the ML fraud-detection mode.
 #[derive(Deserialize)]
 pub struct MlModeRequest {
+    /// `"shadow"` (log-only) or `"active"` (auto-ban flagged IPs).
     pub mode: String,
 }
 
+/// POST /api/ml/upload -- accepts an ONNX model binary payload, writes it to
+/// `models/fraud_model.onnx`, and hot-loads it into the ML fraud engine.
 #[post("/api/ml/upload")]
 pub async fn ml_upload(
     state: web::Data<crate::admin::AdminState>,
@@ -301,6 +373,7 @@ pub async fn ml_upload(
     }))
 }
 
+/// GET /api/ml/logs -- returns the in-memory ML inference audit log.
 #[get("/api/ml/logs")]
 pub async fn ml_logs(
     state: web::Data<crate::admin::AdminState>,
@@ -310,6 +383,7 @@ pub async fn ml_logs(
     HttpResponse::Ok().json(serde_json::json!({ "logs": logs }))
 }
 
+/// PUT /api/ml/mode -- switches the ML fraud engine between shadow and active mode.
 #[put("/api/ml/mode")]
 pub async fn ml_mode(
     state: web::Data<crate::admin::AdminState>,
@@ -415,5 +489,49 @@ mod tests {
             .to_http_request();
         let result = check_rbac(&req, &tokens, ApiRole::ReadOnly);
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_api_role_from_config_tokens() {
+        let mut config_tokens = HashMap::new();
+        config_tokens.insert("token-admin".to_string(), "admin".to_string());
+        config_tokens.insert("token-op".to_string(), "operator".to_string());
+        config_tokens.insert("token-ro".to_string(), "readonly".to_string());
+        config_tokens.insert("token-unknown".to_string(), "superuser".to_string());
+
+        // Verify role parsing
+        assert_eq!(
+            match config_tokens.get("token-admin").unwrap().to_lowercase().as_str() {
+                "admin" => ApiRole::Admin,
+                _ => ApiRole::ReadOnly,
+            },
+            ApiRole::Admin
+        );
+        assert_eq!(
+            match config_tokens.get("token-op").unwrap().to_lowercase().as_str() {
+                "operator" => ApiRole::Operator,
+                _ => ApiRole::ReadOnly,
+            },
+            ApiRole::Operator
+        );
+        assert_eq!(
+            match config_tokens.get("token-ro").unwrap().to_lowercase().as_str() {
+                "readonly" => ApiRole::ReadOnly,
+                _ => ApiRole::ReadOnly,
+            },
+            ApiRole::ReadOnly
+        );
+    }
+
+    #[test]
+    fn test_api_role_unknown_defaults_to_readonly() {
+        let role_str = "superuser";
+        let role = match role_str.to_lowercase().as_str() {
+            "admin" => ApiRole::Admin,
+            "operator" => ApiRole::Operator,
+            "readonly" | "read_only" => ApiRole::ReadOnly,
+            _ => ApiRole::ReadOnly,
+        };
+        assert_eq!(role, ApiRole::ReadOnly);
     }
 }

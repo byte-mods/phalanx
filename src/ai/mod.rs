@@ -1,3 +1,12 @@
+//! # AI-Powered Load Balancing Algorithms
+//!
+//! Implements four multi-armed bandit algorithms for adaptive backend selection.
+//! Each algorithm learns from request outcomes (latency, errors) and dynamically
+//! shifts traffic toward the best-performing backends.
+//!
+//! All implementations are thread-safe (`Send + Sync`) via `DashMap` and can be
+//! swapped at startup via the `ai_algorithm` config directive.
+
 use dashmap::DashMap;
 use std::sync::Arc;
 use tracing::{debug, info};
@@ -29,11 +38,18 @@ pub trait AiRouter: Send + Sync {
 /// Simple, battle-tested, and used widely at Netflix and AWS for traffic shifting.
 #[derive(Clone)]
 pub struct EpsilonGreedyRouter {
+    /// Exploration probability (0.0-1.0). Higher values explore more.
     epsilon: f64,
+    /// Running weighted average penalty score per backend address.
+    /// Lower score = better backend. Updated with exponential moving average (alpha=0.2).
     scores: Arc<DashMap<String, f64>>,
 }
 
 impl EpsilonGreedyRouter {
+    /// Creates a new router with the given exploration rate.
+    ///
+    /// # Arguments
+    /// * `epsilon` - Probability of random exploration (e.g. 0.1 = 10% random picks).
     pub fn new(epsilon: f64) -> Self {
         info!("Initializing AI Epsilon-Greedy Router (ε={})", epsilon);
         Self {
@@ -45,10 +61,13 @@ impl EpsilonGreedyRouter {
 
 impl AiRouter for EpsilonGreedyRouter {
     fn update_score(&self, backend: &str, latency_ms: u64, is_error: bool) {
+        // Penalty = raw latency + a large constant for errors to heavily penalize failures
         let mut penalty = latency_ms as f64;
         if is_error {
             penalty += 10_000.0;
         }
+        // Exponential moving average (EMA) with alpha=0.2: recent observations
+        // have 20% influence, decaying old data gradually without storing history.
         self.scores
             .entry(backend.to_string())
             .and_modify(|s| {
@@ -62,6 +81,7 @@ impl AiRouter for EpsilonGreedyRouter {
         if backends.is_empty() {
             return None;
         }
+        // With probability epsilon: explore by picking a random backend
         if rand::random::<f64>() < self.epsilon {
             let idx = (rand::random::<u32>() as usize) % backends.len();
             debug!(
@@ -70,6 +90,8 @@ impl AiRouter for EpsilonGreedyRouter {
             );
             return Some(Arc::clone(&backends[idx]));
         }
+        // With probability (1-epsilon): exploit by picking the best-known backend
+        // (the one with the lowest cumulative penalty score)
         backends
             .iter()
             .min_by(|a, b| {
@@ -101,18 +123,34 @@ impl AiRouter for EpsilonGreedyRouter {
 ///
 /// Formula: select backend with min( avg_score - C * sqrt(ln(N) / n_i) )
 /// Where N = total requests, n_i = requests to backend i, C = exploration constant.
+/// Per-backend statistics tracked by the UCB1 algorithm.
 struct BackendStats {
+    /// Incrementally-updated mean penalty score for this backend.
     avg_score: f64,
+    /// Total number of requests routed to this backend.
     count: u64,
 }
 
+/// UCB1 (Upper Confidence Bound) router.
+///
+/// Balances exploration and exploitation using a mathematically-derived confidence
+/// bonus that shrinks as a backend receives more traffic. Never-tried backends
+/// get `NEG_INFINITY` score, guaranteeing they are tried at least once.
 pub struct Ucb1Router {
+    /// Per-backend statistics: running average score and request count.
     stats: DashMap<String, BackendStats>,
+    /// Global request counter across all backends (N in the UCB1 formula).
     total_count: std::sync::atomic::AtomicU64,
+    /// Tunable exploration constant (C). Higher values explore more aggressively.
     exploration_constant: f64,
 }
 
 impl Ucb1Router {
+    /// Creates a new UCB1 router.
+    ///
+    /// # Arguments
+    /// * `exploration_constant` - The C parameter in the UCB1 formula.
+    ///   Typical values: 1.0-2.0. Higher = more exploration.
     pub fn new(exploration_constant: f64) -> Self {
         info!("Initializing AI UCB1 Router (C={})", exploration_constant);
         Self {
@@ -129,8 +167,11 @@ impl AiRouter for Ucb1Router {
         if is_error {
             penalty += 10_000.0;
         }
+        // Increment global counter: used as N in the UCB1 confidence term
         self.total_count
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        // Update per-backend stats with an incremental mean:
+        // alpha = 1/n gives a true running average (not exponential decay like epsilon-greedy)
         self.stats
             .entry(backend.to_string())
             .and_modify(|s| {
@@ -154,6 +195,9 @@ impl AiRouter for Ucb1Router {
             .max(1) as f64;
         let c = self.exploration_constant;
 
+        // UCB1 formula: score(i) = avg_score(i) - C * sqrt(ln(N) / n_i)
+        // We minimize score (lower = better), so the confidence bonus is SUBTRACTED,
+        // giving under-explored backends a lower (better) adjusted score.
         backends
             .iter()
             .min_by(|a, b| {
@@ -161,7 +205,7 @@ impl AiRouter for Ucb1Router {
                     .stats
                     .get(&a.config.address)
                     .map(|s| s.avg_score - c * (total_n.ln() / s.count as f64).sqrt())
-                    .unwrap_or(f64::NEG_INFINITY); // Never tried → explore first
+                    .unwrap_or(f64::NEG_INFINITY); // Never tried -> guaranteed to be explored first
                 let ucb_b = self
                     .stats
                     .get(&b.config.address)
@@ -188,11 +232,20 @@ impl AiRouter for Ucb1Router {
 ///
 /// Used at LinkedIn and Twitter for gradual traffic migration and canary deployments.
 pub struct SoftmaxRouter {
+    /// Temperature parameter (tau). Controls randomness of selection:
+    /// tau -> infinity: uniform random; tau -> 0: greedy deterministic.
+    /// Clamped to a minimum of 0.001 to avoid division by zero.
     temperature: f64,
+    /// Running penalty scores per backend (same EMA as epsilon-greedy).
     scores: Arc<DashMap<String, f64>>,
 }
 
 impl SoftmaxRouter {
+    /// Creates a new Softmax router with the given temperature.
+    ///
+    /// # Arguments
+    /// * `temperature` - Boltzmann temperature (tau). Values near 0 are greedy;
+    ///   values >> 1 are nearly uniform. Clamped to a minimum of 0.001.
     pub fn new(temperature: f64) -> Self {
         info!(
             "Initializing AI Softmax/Boltzmann Router (τ={})",
@@ -225,7 +278,10 @@ impl AiRouter for SoftmaxRouter {
             return None;
         }
 
-        // Compute negative-score / temperature for each backend (lower score = higher weight)
+        // Step 1: Compute Boltzmann weights for each backend.
+        // w_i = exp(-score_i / tau)
+        // Backends with lower scores (better performance) get exponentially higher weights.
+        // The negative sign converts our "penalty" (lower = better) into a probability distribution.
         let weights: Vec<f64> = backends
             .iter()
             .map(|b| {
@@ -238,13 +294,14 @@ impl AiRouter for SoftmaxRouter {
             })
             .collect();
 
+        // Step 2: Normalize weights into a probability distribution
         let total_weight: f64 = weights.iter().sum();
         if total_weight <= 0.0 || total_weight.is_nan() {
-            // Fallback to first backend if math breaks
+            // Fallback to first backend if numerical instability occurs
             return Some(Arc::clone(&backends[0]));
         }
 
-        // Weighted random selection
+        // Step 3: Weighted random selection (roulette wheel)
         let mut rng_val = rand::random::<f64>() * total_weight;
         for (i, w) in weights.iter().enumerate() {
             rng_val -= w;
@@ -272,18 +329,38 @@ impl AiRouter for SoftmaxRouter {
 ///
 /// This is considered the gold standard for online exploration-exploitation tradeoffs.
 /// Used at Microsoft (Bing Ads), Spotify, and Adobe for real-time optimization.
+/// Parameters of the Beta distribution for a single backend in Thompson Sampling.
+///
+/// The Beta(alpha, beta) distribution models the probability of a backend being "good".
+/// alpha grows with successes (fast, non-error responses) and beta grows with failures.
 struct BetaParams {
-    alpha: f64, // successes (fast responses)
-    beta: f64,  // failures (slow/error responses)
+    /// Pseudo-count of successes (fast responses under the latency threshold).
+    alpha: f64,
+    /// Pseudo-count of failures (slow responses or errors).
+    beta: f64,
 }
 
+/// Thompson Sampling router using Bayesian posterior updating.
+///
+/// Each backend maintains a Beta(alpha, beta) distribution. On each selection,
+/// we draw a random sample from each backend's distribution and pick the one
+/// with the highest sample (highest estimated probability of being "good").
+/// This naturally balances exploration (uncertain backends have wide distributions)
+/// and exploitation (proven backends have tight, high distributions).
 pub struct ThompsonSamplingRouter {
+    /// Per-backend Beta distribution parameters.
     params: DashMap<String, BetaParams>,
-    /// Latency threshold in ms: anything below this counts as a "success"
+    /// Latency threshold in ms: anything below this counts as a "success".
+    /// Responses above this threshold or with errors count as "failures".
     latency_threshold_ms: f64,
 }
 
 impl ThompsonSamplingRouter {
+    /// Creates a new Thompson Sampling router.
+    ///
+    /// # Arguments
+    /// * `latency_threshold_ms` - Latency cutoff for success/failure classification.
+    ///   E.g., 200.0 means responses under 200ms are "successes".
     pub fn new(latency_threshold_ms: f64) -> Self {
         info!(
             "Initializing AI Thompson Sampling Router (threshold={}ms)",
@@ -310,21 +387,26 @@ impl ThompsonSamplingRouter {
 
 impl AiRouter for ThompsonSamplingRouter {
     fn update_score(&self, backend: &str, latency_ms: u64, is_error: bool) {
+        // Classify the outcome: success if no error AND latency is below threshold
         let is_success = !is_error && (latency_ms as f64) < self.latency_threshold_ms;
         self.params
             .entry(backend.to_string())
             .and_modify(|p| {
+                // Increment the appropriate pseudo-count
                 if is_success {
                     p.alpha += 1.0;
                 } else {
                     p.beta += 1.0;
                 }
-                // Apply decay to prevent old data from dominating forever
+                // Apply multiplicative decay (0.999) to both parameters to
+                // gradually forget old data, making the algorithm adaptive to
+                // changing backend performance over time.
                 let decay = 0.999;
                 p.alpha *= decay;
                 p.beta *= decay;
             })
             .or_insert(BetaParams {
+                // Informative prior: slightly biased toward the observed outcome
                 alpha: if is_success { 2.0 } else { 1.0 },
                 beta: if is_success { 1.0 } else { 2.0 },
             });
@@ -387,7 +469,17 @@ impl AiAlgorithm {
     }
 }
 
-/// Factory function: constructs the appropriate AI router based on config.
+/// Factory function: constructs the appropriate AI router based on the config selection.
+///
+/// # Arguments
+/// * `algorithm` - Which bandit algorithm to use.
+/// * `epsilon` - Exploration rate for EpsilonGreedy (ignored by other algorithms).
+/// * `temperature` - Boltzmann temperature for Softmax (ignored by others).
+/// * `ucb_constant` - Exploration constant C for UCB1 (ignored by others).
+/// * `thompson_threshold_ms` - Latency threshold for Thompson Sampling (ignored by others).
+///
+/// # Returns
+/// A trait object wrapping the selected algorithm, ready for concurrent use.
 pub fn build_ai_router(
     algorithm: AiAlgorithm,
     epsilon: f64,

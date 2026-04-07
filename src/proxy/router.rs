@@ -1,3 +1,11 @@
+//! Protocol detection (sniffing) for the multiplexer proxy.
+//!
+//! When a new TCP connection arrives on the main proxy port, Phalanx does not
+//! know in advance whether the client will speak HTTP/1, HTTP/2, TLS, or raw
+//! TCP. This module reads the first few bytes from the socket to classify the
+//! protocol, then stashes those bytes so they can be replayed to the actual
+//! protocol handler (see `PeekableStream` in `mod.rs`).
+
 use bytes::BytesMut;
 use std::io::Error as IoError;
 use tokio::io::AsyncReadExt;

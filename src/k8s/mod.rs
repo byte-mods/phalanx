@@ -12,7 +12,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
-use tracing::{debug, error, info, warn};
+use tracing::{debug, info, warn};
 
 /// Represents a Kubernetes Ingress resource (simplified).
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -177,6 +177,8 @@ pub struct IngressController {
 }
 
 impl IngressController {
+    /// Creates a new ingress controller that watches Ingress resources with
+    /// the given class name and resolves services using the cluster DNS suffix.
     pub fn new(ingress_class: &str, cluster_dns_suffix: &str) -> Self {
         Self {
             routes: Arc::new(RwLock::new(Vec::new())),
@@ -441,6 +443,340 @@ impl IngressController {
     pub fn route_count(&self) -> usize {
         self.routes.read().len()
     }
+
+    /// Spawns a Kubernetes watcher that subscribes to Ingress resource changes.
+    ///
+    /// Connects to the K8s API server (using in-cluster config or kubeconfig),
+    /// watches Ingress resources filtered by the configured ingress class, and
+    /// calls `reconcile_ingress()` on Added/Modified events.
+    ///
+    /// Accepts a `CancellationToken` for graceful shutdown.
+    pub fn spawn_ingress_watcher(
+        self: Arc<Self>,
+        cancel: tokio_util::sync::CancellationToken,
+    ) {
+        tokio::spawn(async move {
+            use futures_util::TryStreamExt;
+
+            let client = match kube::Client::try_default().await {
+                Ok(c) => c,
+                Err(e) => {
+                    warn!("K8s Ingress watcher: failed to create client: {}", e);
+                    return;
+                }
+            };
+
+            let ingresses: kube::Api<k8s_openapi::api::networking::v1::Ingress> =
+                kube::Api::all(client);
+            let watcher_config = kube::runtime::watcher::Config::default();
+            let mut stream = std::pin::pin!(
+                kube::runtime::watcher(ingresses, watcher_config)
+            );
+
+            info!("K8s Ingress watcher started for class '{}'", self.ingress_class);
+
+            loop {
+                tokio::select! {
+                    event = stream.try_next() => {
+                        match event {
+                            Ok(Some(kube::runtime::watcher::Event::Apply(ingress))) |
+                            Ok(Some(kube::runtime::watcher::Event::InitApply(ingress))) => {
+                                if let Some(resource) = k8s_ingress_to_internal(&ingress) {
+                                    self.reconcile_ingress(&resource);
+                                }
+                            }
+                            Ok(Some(kube::runtime::watcher::Event::Delete(ingress))) => {
+                                let name = ingress.metadata.name.as_deref().unwrap_or("unknown");
+                                let ns = ingress.metadata.namespace.as_deref().unwrap_or("default");
+                                self.remove_ingress(ns, name);
+                            }
+                            Ok(Some(kube::runtime::watcher::Event::Init)) |
+                            Ok(Some(kube::runtime::watcher::Event::InitDone)) => {}
+                            Ok(None) => {
+                                info!("K8s Ingress watcher stream ended");
+                                break;
+                            }
+                            Err(e) => {
+                                warn!("K8s Ingress watcher error: {}, retrying...", e);
+                                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                            }
+                        }
+                    }
+                    _ = cancel.cancelled() => {
+                        info!("K8s Ingress watcher stopping");
+                        return;
+                    }
+                }
+            }
+        });
+    }
+
+    /// Removes all routes generated from a specific Gateway API HTTPRoute resource.
+    pub fn remove_gateway_route(&self, namespace: &str, name: &str) {
+        let prefix = format!("{}-gateway-", namespace);
+        self.routes
+            .write()
+            .retain(|r| !r.upstream_pool.starts_with(&prefix));
+        info!("Removed routes for gateway route {}/{}", namespace, name);
+    }
+
+    /// Spawns a Kubernetes watcher that subscribes to Gateway API HTTPRoute
+    /// resource changes (gateway.networking.k8s.io/v1).
+    ///
+    /// On Add/Modify events, calls `reconcile_gateway_route()` to generate
+    /// Phalanx routes. On Delete, removes the associated routes.
+    ///
+    /// Accepts a `CancellationToken` for graceful shutdown.
+    pub fn spawn_gateway_watcher(
+        self: Arc<Self>,
+        cancel: tokio_util::sync::CancellationToken,
+    ) {
+        tokio::spawn(async move {
+            // Gateway API HTTPRoute is a CRD — we use dynamic API access
+            let client = match kube::Client::try_default().await {
+                Ok(c) => c,
+                Err(e) => {
+                    warn!("K8s Gateway watcher: failed to create client: {}", e);
+                    return;
+                }
+            };
+
+            // Construct ApiResource for gateway.networking.k8s.io/v1 HTTPRoute
+            // This does not require the discovery feature; it builds the resource
+            // metadata statically from the well-known Gateway API spec.
+            let ar = kube::api::ApiResource {
+                group: "gateway.networking.k8s.io".to_string(),
+                version: "v1".to_string(),
+                kind: "HTTPRoute".to_string(),
+                api_version: "gateway.networking.k8s.io/v1".to_string(),
+                plural: "httproutes".to_string(),
+            };
+
+            let api: kube::Api<kube::api::DynamicObject> =
+                kube::Api::all_with(client, &ar);
+            let watcher_config = kube::runtime::watcher::Config::default();
+
+            use futures_util::TryStreamExt;
+            let mut stream = std::pin::pin!(
+                kube::runtime::watcher(api, watcher_config)
+            );
+
+            info!("K8s Gateway API watcher started");
+
+            loop {
+                tokio::select! {
+                    event = stream.try_next() => {
+                        match event {
+                            Ok(Some(kube::runtime::watcher::Event::Apply(obj))) |
+                            Ok(Some(kube::runtime::watcher::Event::InitApply(obj))) => {
+                                if let Some(route) = dynamic_to_gateway_route(&obj) {
+                                    self.reconcile_gateway_route(&route);
+                                }
+                            }
+                            Ok(Some(kube::runtime::watcher::Event::Delete(obj))) => {
+                                let name = obj.metadata.name.as_deref().unwrap_or("unknown");
+                                let ns = obj.metadata.namespace.as_deref().unwrap_or("default");
+                                self.remove_gateway_route(ns, name);
+                            }
+                            Ok(Some(kube::runtime::watcher::Event::Init)) |
+                            Ok(Some(kube::runtime::watcher::Event::InitDone)) => {}
+                            Ok(None) => {
+                                info!("K8s Gateway watcher stream ended");
+                                break;
+                            }
+                            Err(e) => {
+                                warn!("K8s Gateway watcher error: {}, retrying...", e);
+                                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                            }
+                        }
+                    }
+                    _ = cancel.cancelled() => {
+                        info!("K8s Gateway watcher stopping");
+                        return;
+                    }
+                }
+            }
+        });
+    }
+}
+
+/// Converts a dynamic K8s object into our internal `GatewayHttpRoute` format.
+///
+/// Parses the unstructured JSON data from the Gateway API HTTPRoute CRD.
+fn dynamic_to_gateway_route(obj: &kube::api::DynamicObject) -> Option<GatewayHttpRoute> {
+    let name = obj.metadata.name.clone().unwrap_or_default();
+    let namespace = obj
+        .metadata
+        .namespace
+        .clone()
+        .unwrap_or_else(|| "default".to_string());
+
+    let spec = obj.data.get("spec")?;
+
+    let hostnames: Vec<String> = spec
+        .get("hostnames")
+        .and_then(|h| serde_json::from_value(h.clone()).ok())
+        .unwrap_or_default();
+
+    let rules: Vec<GatewayRule> = spec
+        .get("rules")
+        .and_then(|r| r.as_array())
+        .map(|rules_arr| {
+            rules_arr
+                .iter()
+                .filter_map(|rule| {
+                    let matches = rule
+                        .get("matches")
+                        .and_then(|m| m.as_array())
+                        .map(|matches_arr| {
+                            matches_arr
+                                .iter()
+                                .map(|m| {
+                                    let path = m.get("path").map(|p| GatewayPathMatch {
+                                        match_type: p
+                                            .get("type")
+                                            .and_then(|t| t.as_str())
+                                            .map(PathType::from_str)
+                                            .unwrap_or(PathType::Prefix),
+                                        value: p
+                                            .get("value")
+                                            .and_then(|v| v.as_str())
+                                            .unwrap_or("/")
+                                            .to_string(),
+                                    });
+                                    let method = m
+                                        .get("method")
+                                        .and_then(|v| v.as_str())
+                                        .map(String::from);
+                                    GatewayMatch {
+                                        path,
+                                        headers: vec![],
+                                        method,
+                                    }
+                                })
+                                .collect()
+                        })
+                        .unwrap_or_default();
+
+                    let backends = rule
+                        .get("backendRefs")
+                        .and_then(|b| b.as_array())
+                        .map(|arr| {
+                            arr.iter()
+                                .filter_map(|b| {
+                                    Some(GatewayBackendRef {
+                                        service_name: b.get("name")?.as_str()?.to_string(),
+                                        service_port: b.get("port")?.as_u64()? as u16,
+                                        weight: b
+                                            .get("weight")
+                                            .and_then(|w| w.as_u64())
+                                            .unwrap_or(1) as u32,
+                                    })
+                                })
+                                .collect()
+                        })
+                        .unwrap_or_default();
+
+                    Some(GatewayRule {
+                        matches,
+                        backends,
+                        filters: vec![],
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+
+    Some(GatewayHttpRoute {
+        name,
+        namespace,
+        hostnames,
+        rules,
+    })
+}
+
+/// Converts a native K8s Ingress resource into our internal `IngressResource` format.
+fn k8s_ingress_to_internal(
+    ingress: &k8s_openapi::api::networking::v1::Ingress,
+) -> Option<IngressResource> {
+    let metadata = &ingress.metadata;
+    let name = metadata.name.clone().unwrap_or_default();
+    let namespace = metadata.namespace.clone().unwrap_or_else(|| "default".to_string());
+    let annotations: HashMap<String, String> = metadata
+        .annotations
+        .clone()
+        .unwrap_or_default()
+        .into_iter()
+        .collect();
+
+    let spec = ingress.spec.as_ref()?;
+
+    let rules = spec
+        .rules
+        .as_ref()
+        .map(|rules| {
+            rules
+                .iter()
+                .map(|rule| {
+                    let host = rule.host.clone();
+                    let paths = rule
+                        .http
+                        .as_ref()
+                        .map(|http| {
+                            http.paths
+                                .iter()
+                                .map(|p| {
+                                    let path_type = PathType::from_str(&p.path_type);
+                                    IngressPath {
+                                        path: p.path.clone().unwrap_or_else(|| "/".to_string()),
+                                        path_type,
+                                        backend: IngressBackend {
+                                            service_name: p
+                                                .backend
+                                                .service
+                                                .as_ref()
+                                                .map(|s| s.name.clone())
+                                                .unwrap_or_default(),
+                                            service_port: p
+                                                .backend
+                                                .service
+                                                .as_ref()
+                                                .and_then(|s| s.port.as_ref())
+                                                .and_then(|p| p.number)
+                                                .unwrap_or(80) as u16,
+                                        },
+                                    }
+                                })
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    IngressRule { host, paths }
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let tls = spec
+        .tls
+        .as_ref()
+        .map(|tls_list| {
+            tls_list
+                .iter()
+                .map(|tls| IngressTls {
+                    hosts: tls.hosts.clone().unwrap_or_default(),
+                    secret_name: tls.secret_name.clone().unwrap_or_default(),
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+
+    Some(IngressResource {
+        name,
+        namespace,
+        annotations,
+        rules,
+        tls,
+    })
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -765,6 +1101,74 @@ mod tests {
     }
 
     #[test]
+    fn test_k8s_ingress_to_internal_basic() {
+        use k8s_openapi::api::networking::v1 as netv1;
+
+        let ingress = netv1::Ingress {
+            metadata: kube::api::ObjectMeta {
+                name: Some("my-ingress".to_string()),
+                namespace: Some("default".to_string()),
+                annotations: Some({
+                    let mut a = std::collections::BTreeMap::new();
+                    a.insert("kubernetes.io/ingress.class".to_string(), "phalanx".to_string());
+                    a
+                }),
+                ..Default::default()
+            },
+            spec: Some(netv1::IngressSpec {
+                rules: Some(vec![netv1::IngressRule {
+                    host: Some("example.com".to_string()),
+                    http: Some(netv1::HTTPIngressRuleValue {
+                        paths: vec![netv1::HTTPIngressPath {
+                            path: Some("/api".to_string()),
+                            path_type: "Prefix".to_string(),
+                            backend: netv1::IngressBackend {
+                                service: Some(netv1::IngressServiceBackend {
+                                    name: "api-svc".to_string(),
+                                    port: Some(netv1::ServiceBackendPort {
+                                        number: Some(8080),
+                                        ..Default::default()
+                                    }),
+                                }),
+                                ..Default::default()
+                            },
+                        }],
+                    }),
+                }]),
+                tls: Some(vec![netv1::IngressTLS {
+                    hosts: Some(vec!["example.com".to_string()]),
+                    secret_name: Some("tls-secret".to_string()),
+                }]),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let result = k8s_ingress_to_internal(&ingress);
+        assert!(result.is_some());
+        let resource = result.unwrap();
+        assert_eq!(resource.name, "my-ingress");
+        assert_eq!(resource.namespace, "default");
+        assert_eq!(resource.rules.len(), 1);
+        assert_eq!(resource.rules[0].paths[0].path, "/api");
+        assert_eq!(resource.rules[0].paths[0].backend.service_name, "api-svc");
+        assert_eq!(resource.rules[0].paths[0].backend.service_port, 8080);
+        assert_eq!(resource.tls.len(), 1);
+        assert_eq!(resource.tls[0].secret_name, "tls-secret");
+    }
+
+    #[test]
+    fn test_k8s_ingress_to_internal_no_spec() {
+        use k8s_openapi::api::networking::v1 as netv1;
+        let ingress = netv1::Ingress {
+            metadata: kube::api::ObjectMeta::default(),
+            spec: None,
+            ..Default::default()
+        };
+        assert!(k8s_ingress_to_internal(&ingress).is_none());
+    }
+
+    #[test]
     fn test_phalanx_route_serialization() {
         let route = PhalanxRoute {
             path: "/test".to_string(),
@@ -780,5 +1184,88 @@ mod tests {
         let json = serde_json::to_string(&route).unwrap();
         let decoded: PhalanxRoute = serde_json::from_str(&json).unwrap();
         assert_eq!(decoded.path, "/test");
+    }
+
+    #[test]
+    fn test_remove_gateway_route() {
+        let ctrl = make_controller();
+        let route = GatewayHttpRoute {
+            name: "api-route".to_string(),
+            namespace: "default".to_string(),
+            hostnames: vec!["api.example.com".to_string()],
+            rules: vec![GatewayRule {
+                matches: vec![GatewayMatch {
+                    path: Some(GatewayPathMatch {
+                        match_type: PathType::Prefix,
+                        value: "/v1".to_string(),
+                    }),
+                    headers: vec![],
+                    method: None,
+                }],
+                backends: vec![GatewayBackendRef {
+                    service_name: "api-v1".to_string(),
+                    service_port: 8080,
+                    weight: 1,
+                }],
+                filters: vec![],
+            }],
+        };
+        ctrl.reconcile_gateway_route(&route);
+        assert!(ctrl.route_count() > 0);
+        ctrl.remove_gateway_route("default", "api-route");
+        assert_eq!(ctrl.route_count(), 0);
+    }
+
+    #[test]
+    fn test_dynamic_to_gateway_route_basic() {
+        let mut data = serde_json::Map::new();
+        let spec = serde_json::json!({
+            "hostnames": ["test.example.com"],
+            "rules": [{
+                "matches": [{
+                    "path": {
+                        "type": "Prefix",
+                        "value": "/api"
+                    }
+                }],
+                "backendRefs": [{
+                    "name": "api-svc",
+                    "port": 8080,
+                    "weight": 1
+                }]
+            }]
+        });
+        data.insert("spec".to_string(), spec);
+
+        let obj = kube::api::DynamicObject {
+            metadata: kube::api::ObjectMeta {
+                name: Some("test-route".to_string()),
+                namespace: Some("default".to_string()),
+                ..Default::default()
+            },
+            types: None,
+            data: serde_json::Value::Object(data),
+        };
+
+        let route = dynamic_to_gateway_route(&obj);
+        assert!(route.is_some());
+        let route = route.unwrap();
+        assert_eq!(route.name, "test-route");
+        assert_eq!(route.namespace, "default");
+        assert_eq!(route.hostnames, vec!["test.example.com"]);
+        assert_eq!(route.rules.len(), 1);
+        assert_eq!(route.rules[0].backends.len(), 1);
+        assert_eq!(route.rules[0].backends[0].service_name, "api-svc");
+        assert_eq!(route.rules[0].backends[0].service_port, 8080);
+    }
+
+    #[test]
+    fn test_dynamic_to_gateway_route_no_spec() {
+        let obj = kube::api::DynamicObject {
+            metadata: kube::api::ObjectMeta::default(),
+            types: None,
+            data: serde_json::Value::Object(serde_json::Map::new()),
+        };
+        assert!(dynamic_to_gateway_route(&obj).is_none());
     }
 }

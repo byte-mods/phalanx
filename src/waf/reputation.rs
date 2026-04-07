@@ -1,8 +1,19 @@
+/// IP reputation and automatic ban management.
+///
+/// Tracks per-IP "strike" points accumulated from WAF violations. When an IP
+/// exceeds the configured threshold, it is automatically banned for a
+/// configurable duration. Bans expire automatically (checked lazily on
+/// next lookup). Optionally broadcasts strikes to other cluster nodes
+/// via Redis Pub/Sub for consistent enforcement across a fleet.
 use dashmap::DashMap;
-use std::time::Instant;
 use std::sync::Arc;
-use tokio::sync::mpsc;
+use std::time::Instant;
 
+/// Thread-safe IP reputation manager that tracks strikes and enforces bans.
+///
+/// Strikes are weighted by severity (e.g., SQLi = 3, missing User-Agent = 1).
+/// Once strikes exceed `ban_threshold`, the IP is considered banned until
+/// `ban_duration_secs` elapse since the last strike.
 pub struct IpReputationManager {
     /// Tracks (strike_count, last_strike_time) for each IP Address
     strikes: DashMap<String, (u32, Instant)>,
@@ -15,6 +26,15 @@ pub struct IpReputationManager {
 }
 
 impl IpReputationManager {
+    /// Creates a new reputation manager and optionally starts a Redis Pub/Sub subscriber.
+    ///
+    /// # Arguments
+    /// * `ban_threshold` - Number of strike points before an IP is auto-banned.
+    /// * `ban_duration_secs` - How long a ban lasts before automatic expiry.
+    /// * `redis_client` - Optional Redis client for cluster-wide strike propagation.
+    ///
+    /// Returns an `Arc<Self>` because the manager is shared across request handlers
+    /// and the optional background Pub/Sub task.
     pub fn new(ban_threshold: u32, ban_duration_secs: u64, redis_client: Option<redis::Client>) -> Arc<Self> {
         let mgr = Arc::new(Self {
             strikes: DashMap::new(),

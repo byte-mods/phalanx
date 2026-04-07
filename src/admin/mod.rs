@@ -1,5 +1,14 @@
+//! Admin API server and Prometheus metrics registry.
+//!
+//! Exposes endpoints for health checks, Prometheus metrics, backend discovery
+//! management, keyval operations, cache purge, upstream details, config reload,
+//! and a built-in HTML dashboard.
+
+/// Resource alert engine for bandwidth, memory, and file-descriptor monitoring.
 pub mod alerts;
+/// Extended admin API: RBAC, dynamic routes, SSL certificate management, ML endpoints.
 pub mod api;
+/// Dashboard-specific API: WAF bans, attack logs, rate-limit top-N, cluster status.
 pub mod dashboard_api;
 
 use crate::discovery::{DiscoveredBackend, ServiceDiscovery};
@@ -13,6 +22,11 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use tracing::info;
 
+/// Shared application state injected into every admin API handler via Actix-Web `web::Data`.
+///
+/// Holds `Arc` references to the major subsystems so handlers can query
+/// metrics, manage backends, manipulate the keyval store, and trigger WAF actions.
+#[derive(Clone)]
 pub struct AdminState {
     pub metrics: Arc<ProxyMetrics>,
     pub discovery: Arc<ServiceDiscovery>,
@@ -47,9 +61,15 @@ pub struct ProxyMetrics {
     pub rate_limit_rejections: IntCounterVec,
     /// Response cache hit/miss counters.
     pub cache_hits_total: IntCounterVec,
+    /// Per-backend request duration in seconds, labeled by backend address and pool.
+    pub backend_request_duration: HistogramVec,
+    /// Per-backend error counter, labeled by backend address, pool, and error type.
+    pub backend_errors_total: IntCounterVec,
 }
 
 impl ProxyMetrics {
+    /// Creates a new metrics registry and registers all Phalanx-specific
+    /// counters, histograms, and gauges. Called once at startup.
     pub fn new() -> Self {
         let registry = Registry::new();
 
@@ -101,6 +121,27 @@ impl ProxyMetrics {
         )
         .unwrap();
 
+        let backend_request_duration = HistogramVec::new(
+            HistogramOpts::new(
+                "phalanx_backend_request_duration_seconds",
+                "Per-backend request latency in seconds",
+            )
+            .buckets(vec![
+                0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0,
+            ]),
+            &["backend", "pool"],
+        )
+        .unwrap();
+
+        let backend_errors_total = IntCounterVec::new(
+            Opts::new(
+                "phalanx_backend_errors_total",
+                "Per-backend error counter",
+            ),
+            &["backend", "pool", "error_type"],
+        )
+        .unwrap();
+
         // Register all metrics
         registry
             .register(Box::new(http_requests_total.clone()))
@@ -120,6 +161,12 @@ impl ProxyMetrics {
         registry
             .register(Box::new(cache_hits_total.clone()))
             .unwrap();
+        registry
+            .register(Box::new(backend_request_duration.clone()))
+            .unwrap();
+        registry
+            .register(Box::new(backend_errors_total.clone()))
+            .unwrap();
 
         Self {
             registry,
@@ -129,6 +176,8 @@ impl ProxyMetrics {
             waf_blocks_total,
             rate_limit_rejections,
             cache_hits_total,
+            backend_request_duration,
+            backend_errors_total,
         }
     }
 
@@ -142,11 +191,13 @@ impl ProxyMetrics {
     }
 }
 
+/// GET /health -- simple liveness probe returning 200 OK.
 #[get("/health")]
 async fn health() -> impl Responder {
     HttpResponse::Ok().body("OK")
 }
 
+/// GET /metrics -- Prometheus text exposition format for all registered metrics.
 #[get("/metrics")]
 async fn metrics_endpoint(state: web::Data<AdminState>) -> impl Responder {
     let body = state.metrics.encode();
@@ -155,6 +206,9 @@ async fn metrics_endpoint(state: web::Data<AdminState>) -> impl Responder {
         .body(body)
 }
 
+/// GET /api/stats -- JSON summary of key metrics for the dashboard UI.
+/// Builds a custom JSON structure by iterating the Prometheus registry so
+/// the frontend can render counters without parsing the text format.
 #[get("/api/stats")]
 async fn api_stats(state: web::Data<AdminState>) -> impl Responder {
     // Instead of using generic Prometheus encoding which is hard to parse in JS,
@@ -222,12 +276,15 @@ async fn api_stats(state: web::Data<AdminState>) -> impl Responder {
     HttpResponse::Ok().json(stats)
 }
 
+/// GET /dashboard -- serves the embedded HTML dashboard (compiled into the binary).
 #[get("/dashboard")]
 async fn dashboard_ui() -> impl Responder {
     let html = include_str!("dashboard.html");
     HttpResponse::Ok().content_type("text/html").body(html)
 }
 
+/// POST /api/discovery/backends -- registers a new backend in persistent
+/// storage (RocksDB) and adds it to the in-memory routing pool.
 #[post("/api/discovery/backends")]
 async fn add_backend(
     state: web::Data<AdminState>,
@@ -251,6 +308,8 @@ async fn add_backend(
     }
 }
 
+/// DELETE /api/discovery/backends/{pool}/{address} -- deregisters a backend
+/// from persistent storage and removes it from the in-memory routing pool.
 #[delete("/api/discovery/backends/{pool}/{address}")]
 async fn remove_backend(
     state: web::Data<AdminState>,
@@ -270,7 +329,21 @@ async fn remove_backend(
     }
 }
 
-pub async fn start_admin_server(bind_addr: String, state: AdminState) {
+/// Starts the Actix-Web admin/metrics server.
+///
+/// Registers all admin and dashboard endpoints and runs until the
+/// `shutdown` cancellation token is triggered, at which point it
+/// performs a graceful stop.
+///
+/// # Arguments
+/// * `bind_addr` - TCP address to listen on (e.g. `"127.0.0.1:9090"`).
+/// * `state` - Shared admin state containing metrics, discovery, WAF, etc.
+/// * `shutdown` - Token signalled by the main supervisor on graceful shutdown.
+pub async fn start_admin_server(
+    bind_addr: String,
+    state: AdminState,
+    shutdown: tokio_util::sync::CancellationToken,
+) {
     info!("Admin API listening on http://{}", bind_addr);
 
     let rate_limiter = Arc::clone(&state.rate_limiter);
@@ -312,6 +385,8 @@ pub async fn start_admin_server(bind_addr: String, state: AdminState) {
             .service(keyval_delete)
             .service(keyval_list)
             .service(upstreams_detail)
+            .service(upstreams_health)
+            .service(config_validate)
             .service(config_reload)
             .service(api::ml_upload)
             .service(api::ml_logs)
@@ -327,26 +402,45 @@ pub async fn start_admin_server(bind_addr: String, state: AdminState) {
             .service(dashboard_api::cluster_nodes)
             .service(dashboard_api::cache_stats)
             .service(dashboard_api::bandwidth_stats)
+            .service(dashboard_api::bandwidth_pool_stats)
             .service(dashboard_api::list_alerts)
             .service(dashboard_api::trigger_alert_check)
-    })
-    .bind(&bind_addr)
-    .expect("Invalid admin bind address")
-    .run();
+    });
+    let server = match server.bind(&bind_addr) {
+        Ok(s) => s.run(),
+        Err(e) => {
+            tracing::error!("Invalid admin bind address '{}': {}", bind_addr, e);
+            return;
+        }
+    };
+    let handle = server.handle();
 
-    if let Err(e) = server.await {
-        tracing::error!("Admin server error: {}", e);
+    tokio::select! {
+        res = server => {
+            if let Err(e) = res {
+                tracing::error!("Admin server error: {}", e);
+            }
+        }
+        _ = shutdown.cancelled() => {
+            handle.stop(true).await;
+            tracing::info!("Admin server shutdown signal received.");
+        }
     }
 }
 
 // ─── Cache Purge Endpoint ─────────────────────────────────────────────────────
 
+/// Request body for the cache purge endpoint.
 #[derive(serde::Deserialize)]
 struct PurgeBody {
+    /// If set, purge this exact cache key.
     key: Option<String>,
+    /// If set, purge all keys matching this prefix.
     prefix: Option<String>,
 }
 
+/// POST /api/cache/purge -- invalidates cached responses by key, prefix,
+/// or all entries if neither is specified.
 #[post("/api/cache/purge")]
 async fn cache_purge(
     state: web::Data<AdminState>,
@@ -367,6 +461,7 @@ async fn cache_purge(
 
 // ─── Keyval Endpoints ─────────────────────────────────────────────────────────
 
+/// GET /api/keyval/{key} -- retrieves a single key-value entry.
 #[get("/api/keyval/{key}")]
 async fn keyval_get(
     state: web::Data<AdminState>,
@@ -379,6 +474,7 @@ async fn keyval_get(
     }
 }
 
+/// POST /api/keyval/{key} -- sets a key-value entry with optional TTL.
 #[post("/api/keyval/{key}")]
 async fn keyval_set(
     state: web::Data<AdminState>,
@@ -391,6 +487,7 @@ async fn keyval_set(
     HttpResponse::Ok().json(serde_json::json!({ "status": "ok", "key": key }))
 }
 
+/// DELETE /api/keyval/{key} -- removes a key-value entry.
 #[delete("/api/keyval/{key}")]
 async fn keyval_delete(
     state: web::Data<AdminState>,
@@ -405,6 +502,7 @@ async fn keyval_delete(
     }
 }
 
+/// GET /api/keyval -- lists all non-expired key-value entries.
 #[get("/api/keyval")]
 async fn keyval_list(state: web::Data<AdminState>) -> impl Responder {
     let entries: Vec<KeyvalListEntry> = state
@@ -418,6 +516,8 @@ async fn keyval_list(state: web::Data<AdminState>) -> impl Responder {
 
 // ─── Upstream Detail Endpoint ────────────────────────────────────────────────
 
+/// GET /api/upstreams/detail -- returns per-pool backend details including
+/// health status, active connections, and weight for the dashboard.
 #[get("/api/upstreams/detail")]
 async fn upstreams_detail(state: web::Data<AdminState>) -> impl Responder {
     let mut pools = serde_json::Map::new();
@@ -452,8 +552,61 @@ async fn upstreams_detail(state: web::Data<AdminState>) -> impl Responder {
     HttpResponse::Ok().json(pools)
 }
 
+// ─── Upstream Health Endpoint ─────────────────────────────────────────────────
+
+/// GET /api/upstreams/health -- returns per-backend health info for all pools.
+#[get("/api/upstreams/health")]
+async fn upstreams_health(state: web::Data<AdminState>) -> impl Responder {
+    let mut entries = Vec::new();
+    for (pool_name, pool) in state.manager.inner_pools() {
+        let backends_snap = pool.backends.load();
+        for backend in backends_snap.iter() {
+            let circuit_state_val = backend.circuit_state_str();
+            entries.push(serde_json::json!({
+                "pool": pool_name,
+                "backend": backend.config.address,
+                "healthy": backend.is_healthy.load(Ordering::Relaxed),
+                "active_connections": backend.active_connections.load(Ordering::Relaxed),
+                "fail_count": backend.fail_count(),
+                "circuit_state": circuit_state_val,
+                "effective_weight": backend.effective_weight(),
+            }));
+        }
+    }
+    HttpResponse::Ok().json(entries)
+}
+
+// ─── Config Validate Endpoint ────────────────────────────────────────────────
+
+/// POST /api/config/validate -- validates config content without applying it.
+#[post("/api/config/validate")]
+async fn config_validate(body: web::Bytes) -> impl Responder {
+    let content = match String::from_utf8(body.to_vec()) {
+        Ok(s) => s,
+        Err(e) => {
+            return HttpResponse::BadRequest().json(serde_json::json!({
+                "valid": false,
+                "errors": [format!("Invalid UTF-8: {}", e)],
+            }));
+        }
+    };
+
+    match crate::config::parser::parse_phalanx_config(&content) {
+        Ok(_) => HttpResponse::Ok().json(serde_json::json!({
+            "valid": true,
+            "errors": [],
+        })),
+        Err(e) => HttpResponse::Ok().json(serde_json::json!({
+            "valid": false,
+            "errors": [e],
+        })),
+    }
+}
+
 // ─── Config Reload ────────────────────────────────────────────────────────────
 
+/// POST /api/reload -- triggers a configuration reload by sending SIGHUP
+/// to the current process (Unix only).
 #[post("/api/reload")]
 async fn config_reload() -> impl Responder {
     // Signal a config reload via SIGHUP (Unix only)
@@ -466,7 +619,9 @@ async fn config_reload() -> impl Responder {
         }
         let sighup: c_int = 1; // SIGHUP = 1
         unsafe { kill(getpid(), sighup); }
-        return HttpResponse::Ok().json(serde_json::json!({ "status": "reload signaled" }));
+        return HttpResponse::Ok().json(serde_json::json!({
+            "status": "reload signaled (live-routed components and listeners will refresh)"
+        }));
     }
     #[cfg(not(unix))]
     HttpResponse::Ok().json(serde_json::json!({ "status": "reload not supported on this platform" }))

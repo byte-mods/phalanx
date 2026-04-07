@@ -1,3 +1,13 @@
+/// Zone-based connection and request rate limiting.
+///
+/// Provides NGINX-style `limit_conn_zone` and `limit_req_zone` functionality
+/// with flexible key extraction from client IP, headers, cookies, JWT claims,
+/// query parameters, or composite combinations. Each zone independently tracks
+/// both request rate (token bucket) and concurrent connection count.
+///
+/// Use [`ConnectionGuard`] for RAII-style connection slot management that
+/// automatically releases on drop.
+use arc_swap::ArcSwap;
 use dashmap::DashMap;
 use std::sync::Arc;
 use governor::{
@@ -7,7 +17,7 @@ use governor::{
 };
 use std::num::NonZeroU32;
 use std::sync::atomic::{AtomicU32, Ordering};
-use tracing::warn;
+use tracing::{info, warn};
 
 /// Zone-based rate and connection limiter.
 ///
@@ -15,31 +25,55 @@ use tracing::warn;
 /// (header values, JWT claims, cookie values, API keys, URI patterns, etc.)
 /// and enforces both request rate and concurrent connection limits per key.
 pub struct ZoneLimiter {
+    /// Human-readable zone name for logging.
     name: String,
-    rate_limiter: RateLimiter<String, DefaultKeyedStateStore<String>, DefaultClock>,
-    /// Concurrent connection tracking per key
+    /// Per-key token bucket rate limiter (governor-based, hot-swappable via ArcSwap).
+    rate_limiter: ArcSwap<RateLimiter<String, DefaultKeyedStateStore<String>, DefaultClock>>,
+    /// Concurrent connection counter per key (atomic for lock-free updates).
     connections: DashMap<String, AtomicU32>,
-    /// Max concurrent connections per key (0 = unlimited)
-    max_connections: u32,
+    /// Max concurrent connections per key (0 = unlimited, no enforcement).
+    max_connections: AtomicU32,
 }
 
 impl ZoneLimiter {
+    /// Creates a new zone limiter with the specified rate and connection limits.
+    ///
+    /// # Arguments
+    /// * `name` - Human-readable zone name (used in log messages).
+    /// * `rate_per_sec` - Sustained request rate limit per key (minimum 1).
+    /// * `burst` - Maximum burst allowance per key (minimum 1).
+    /// * `max_connections` - Max concurrent connections per key (0 = unlimited).
     pub fn new(name: &str, rate_per_sec: u32, burst: u32, max_connections: u32) -> Self {
         let quota = Quota::per_second(NonZeroU32::new(rate_per_sec.max(1)).unwrap())
             .allow_burst(NonZeroU32::new(burst.max(1)).unwrap());
 
         Self {
             name: name.to_string(),
-            rate_limiter: RateLimiter::keyed(quota),
+            rate_limiter: ArcSwap::from_pointee(RateLimiter::keyed(quota)),
             connections: DashMap::new(),
-            max_connections,
+            max_connections: AtomicU32::new(max_connections),
         }
+    }
+
+    /// Atomically replaces the zone rate limiter with new rate/burst/connection limits.
+    ///
+    /// Called on SIGHUP reload. Existing connection counters are preserved.
+    pub fn reload(&self, rate_per_sec: u32, burst: u32, max_connections: u32) {
+        let quota = Quota::per_second(NonZeroU32::new(rate_per_sec.max(1)).unwrap())
+            .allow_burst(NonZeroU32::new(burst.max(1)).unwrap());
+        self.rate_limiter.store(Arc::new(RateLimiter::keyed(quota)));
+        self.max_connections.store(max_connections, Ordering::Relaxed);
+        info!(
+            "Zone '{}' reloaded: rate={}/s burst={} max_conns={}",
+            self.name, rate_per_sec, burst, max_connections
+        );
     }
 
     /// Checks if the request is allowed for the given key.
     /// Returns `true` if allowed.
     pub fn check_rate(&self, key: &str) -> bool {
-        if self.rate_limiter.check_key(&key.to_string()).is_err() {
+        let limiter = self.rate_limiter.load();
+        if limiter.check_key(&key.to_string()).is_err() {
             warn!(
                 "Zone '{}' rate limit exceeded for key '{}'",
                 self.name, key
@@ -52,7 +86,8 @@ impl ZoneLimiter {
     /// Attempts to acquire a connection slot for the given key.
     /// Returns `true` if the connection is allowed.
     pub fn acquire_connection(&self, key: &str) -> bool {
-        if self.max_connections == 0 {
+        let max_conns = self.max_connections.load(Ordering::Relaxed);
+        if max_conns == 0 {
             return true;
         }
 
@@ -62,11 +97,11 @@ impl ZoneLimiter {
             .or_insert_with(|| AtomicU32::new(0));
         let current = counter.fetch_add(1, Ordering::Relaxed);
 
-        if current >= self.max_connections {
+        if current >= max_conns {
             counter.fetch_sub(1, Ordering::Relaxed);
             warn!(
                 "Zone '{}' connection limit ({}) exceeded for key '{}'",
-                self.name, self.max_connections, key
+                self.name, max_conns, key
             );
             return false;
         }
@@ -84,27 +119,33 @@ impl ZoneLimiter {
         }
     }
 
+    /// Returns the human-readable name of this zone.
     pub fn name(&self) -> &str {
         &self.name
     }
 }
 
 /// Key extraction strategy for zone-based limiting.
+///
+/// Determines how to derive the rate-limit key from the incoming request.
+/// For example, `ClientIp` uses the source IP, `Header("X-Api-Key")` uses
+/// the value of that header, and `Composite` concatenates multiple sources
+/// with `:` separators for fine-grained limiting (e.g., per-user-per-endpoint).
 #[derive(Debug, Clone)]
 pub enum ZoneKeySource {
-    /// Key by client IP address
+    /// Key by client IP address (most common for per-client limiting).
     ClientIp,
-    /// Key by value of a specific request header
+    /// Key by value of a specific request header (e.g., `X-Api-Key`).
     Header(String),
-    /// Key by value of a specific cookie
+    /// Key by value of a specific cookie (e.g., `session_id`).
     Cookie(String),
-    /// Key by a JWT claim name
+    /// Key by a JWT claim name extracted from the `Authorization: Bearer` header.
     JwtClaim(String),
-    /// Key by the request URI path
+    /// Key by the request URI path (for per-endpoint limiting).
     Uri,
-    /// Key by a query parameter
+    /// Key by a specific query parameter value.
     QueryParam(String),
-    /// Composite: combine multiple sources
+    /// Composite: combine multiple sources into a single key joined by `:`.
     Composite(Vec<ZoneKeySource>),
 }
 
@@ -151,6 +192,7 @@ impl ZoneKeySource {
     }
 }
 
+/// Extracts a named cookie value from the `Cookie` request header.
 fn extract_cookie_value(headers: &hyper::HeaderMap, name: &str) -> Option<String> {
     headers
         .get(hyper::header::COOKIE)
@@ -169,6 +211,11 @@ fn extract_cookie_value(headers: &hyper::HeaderMap, name: &str) -> Option<String
         })
 }
 
+/// Extracts a named claim from a JWT Bearer token without full cryptographic validation.
+///
+/// Splits the token on `.`, base64url-decodes the payload, and reads the
+/// specified claim as a string. Returns `None` if the header is absent,
+/// the token is malformed, or the claim is missing.
 fn extract_jwt_claim(headers: &hyper::HeaderMap, claim: &str) -> Option<String> {
     let auth = headers
         .get(hyper::header::AUTHORIZATION)
@@ -326,16 +373,35 @@ mod tests {
         let headers = hyper::HeaderMap::new();
         assert_eq!(extract_jwt_claim(&headers, "sub"), None);
     }
+
+    #[test]
+    fn test_zone_limiter_reload_updates_connection_limit() {
+        let limiter = ZoneLimiter::new("test", 100, 10, 2);
+        assert!(limiter.acquire_connection("k"));
+        assert!(limiter.acquire_connection("k"));
+        assert!(!limiter.acquire_connection("k"), "should be limited at 2");
+
+        // Reload with higher connection limit
+        limiter.reload(100, 10, 5);
+        // Existing counters are preserved (2 active), but limit is now 5
+        assert!(limiter.acquire_connection("k"), "should allow 3rd after reload to 5");
+    }
 }
 
 /// RAII guard that automatically releases a connection slot when dropped.
-/// Use this to ensure `release_connection` is always called even on early returns.
+///
+/// Ensures `release_connection` is called even on early returns or panics,
+/// preventing connection slot leaks under all code paths.
 pub struct ConnectionGuard {
+    /// The zone limiter that owns the connection slot.
     zone: Arc<ZoneLimiter>,
+    /// The key whose connection slot this guard holds.
     key: String,
 }
 
 impl ConnectionGuard {
+    /// Creates a new guard that will release the connection slot for `key`
+    /// in `zone` when dropped.
     pub fn new(zone: Arc<ZoneLimiter>, key: String) -> Self {
         Self { zone, key }
     }

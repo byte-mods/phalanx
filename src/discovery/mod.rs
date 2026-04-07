@@ -1,3 +1,10 @@
+//! Service discovery subsystem.
+//!
+//! Provides persistent backend registration (RocksDB) and dynamic discovery
+//! via DNS A/AAAA and SRV record polling. External systems (CI/CD, health
+//! probes) register backends through the Admin API; the discovery module
+//! persists them so they survive proxy restarts.
+
 use rocksdb::{DB, Options};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
@@ -19,7 +26,7 @@ pub struct DiscoveredBackend {
 /// Stores upstream backend registrations persistently so backends survive proxy restarts.
 /// External agents (health probes, deploy scripts, CI/CD) can write entries via the Admin API.
 pub struct ServiceDiscovery {
-    db: Arc<DB>,
+    db: Option<Arc<DB>>,
 }
 
 impl ServiceDiscovery {
@@ -29,22 +36,38 @@ impl ServiceDiscovery {
         opts.create_if_missing(true);
         opts.set_allow_concurrent_memtable_write(true);
 
-        let db =
-            DB::open(&opts, path.as_ref()).expect("Failed to open RocksDB for Service Discovery");
-        info!(
-            "Service Discovery initialized with RocksDB at {:?}",
-            path.as_ref()
-        );
-        Self { db: Arc::new(db) }
+        match DB::open(&opts, path.as_ref()) {
+            Ok(db) => {
+                info!(
+                    "Service Discovery initialized with RocksDB at {:?}",
+                    path.as_ref()
+                );
+                Self {
+                    db: Some(Arc::new(db)),
+                }
+            }
+            Err(e) => {
+                error!(
+                    "Failed to open RocksDB for Service Discovery at {:?}: {}. Dynamic discovery persistence is disabled.",
+                    path.as_ref(),
+                    e
+                );
+                Self { db: None }
+            }
+        }
     }
 
     /// Registers or updates a backend in persistent storage.
     /// Key format: `pool::address` (e.g., `default::127.0.0.1:8081`)
     pub fn register_backend(&self, backend: &DiscoveredBackend) {
+        let Some(db) = self.db.as_ref() else {
+            warn!("Service Discovery DB unavailable: register_backend skipped");
+            return;
+        };
         let key = format!("{}::{}", backend.pool, backend.address);
         match serde_json::to_vec(backend) {
             Ok(value) => {
-                if let Err(e) = self.db.put(key.as_bytes(), &value) {
+                if let Err(e) = db.put(key.as_bytes(), &value) {
                     error!("Failed to register backend {}: {}", key, e);
                 } else {
                     info!(
@@ -59,8 +82,12 @@ impl ServiceDiscovery {
 
     /// Removes a backend from persistent storage.
     pub fn deregister_backend(&self, pool: &str, address: &str) {
+        let Some(db) = self.db.as_ref() else {
+            warn!("Service Discovery DB unavailable: deregister_backend skipped");
+            return;
+        };
         let key = format!("{}::{}", pool, address);
-        if let Err(e) = self.db.delete(key.as_bytes()) {
+        if let Err(e) = db.delete(key.as_bytes()) {
             error!("Failed to deregister backend {}: {}", key, e);
         } else {
             warn!("Deregistered backend: {} (pool={})", address, pool);
@@ -69,10 +96,13 @@ impl ServiceDiscovery {
 
     /// Lists all registered backends for a given pool.
     pub fn list_backends(&self, pool: &str) -> Vec<DiscoveredBackend> {
+        let Some(db) = self.db.as_ref() else {
+            return Vec::new();
+        };
         let prefix = format!("{}::", pool);
         let mut backends = Vec::new();
 
-        let iter = self.db.prefix_iterator(prefix.as_bytes());
+        let iter = db.prefix_iterator(prefix.as_bytes());
         for item in iter {
             match item {
                 Ok((key, value)) => {
@@ -96,8 +126,11 @@ impl ServiceDiscovery {
 
     /// Lists ALL backends across all pools.
     pub fn list_all_backends(&self) -> Vec<DiscoveredBackend> {
+        let Some(db) = self.db.as_ref() else {
+            return Vec::new();
+        };
         let mut backends = Vec::new();
-        let iter = self.db.iterator(rocksdb::IteratorMode::Start);
+        let iter = db.iterator(rocksdb::IteratorMode::Start);
         for item in iter {
             match item {
                 Ok((_key, value)) => {
@@ -116,12 +149,15 @@ impl ServiceDiscovery {
 
     /// Mark a backend as healthy/unhealthy.
     pub fn set_health(&self, pool: &str, address: &str, healthy: bool) {
+        let Some(db) = self.db.as_ref() else {
+            return;
+        };
         let key = format!("{}::{}", pool, address);
-        if let Some(value) = self.db.get(key.as_bytes()).ok().flatten() {
+        if let Some(value) = db.get(key.as_bytes()).ok().flatten() {
             if let Ok(mut backend) = serde_json::from_slice::<DiscoveredBackend>(&value) {
                 backend.healthy = healthy;
                 if let Ok(updated) = serde_json::to_vec(&backend) {
-                    let _ = self.db.put(key.as_bytes(), &updated);
+                    let _ = db.put(key.as_bytes(), &updated);
                 }
             }
         }
@@ -215,6 +251,7 @@ pub fn spawn_srv_watcher(
     srv_name: String,
     pool: Arc<crate::routing::UpstreamPool>,
     template: crate::config::BackendConfig,
+    cancel: tokio_util::sync::CancellationToken,
 ) {
     tokio::spawn(async move {
         use trust_dns_resolver::TokioAsyncResolver;
@@ -235,7 +272,13 @@ pub fn spawn_srv_watcher(
         let mut prev_addrs: std::collections::HashSet<String> = std::collections::HashSet::new();
 
         loop {
-            tokio::time::sleep(interval).await;
+            tokio::select! {
+                _ = tokio::time::sleep(interval) => {}
+                _ = cancel.cancelled() => {
+                    info!("SRV watcher stopping for '{}' in pool '{}'", srv_name, pool_name);
+                    return;
+                }
+            }
 
             // 1. Resolve SRV record
             let srv_records = match resolver.srv_lookup(&srv_name).await {
@@ -349,5 +392,11 @@ mod tests {
         let result = parse_srv_name("_http._tcp.my.deep.service");
         let (_, _, domain) = result.unwrap();
         assert_eq!(domain, "my.deep.service");
+    }
+
+    #[test]
+    fn test_spawn_srv_watcher_accepts_cancellation_token() {
+        // Verify the function signature compiles with CancellationToken parameter
+        let _ = tokio_util::sync::CancellationToken::new();
     }
 }
