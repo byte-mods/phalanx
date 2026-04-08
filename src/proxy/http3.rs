@@ -690,6 +690,34 @@ async fn handle_h3_request(
         status.is_server_error(),
     );
 
+    // ── PostUpstream hooks ──
+    if hook_engine.has_hooks(crate::scripting::HookPhase::PostUpstream) {
+        let resp_hdrs: std::collections::HashMap<String, String> = backend_resp
+            .headers()
+            .iter()
+            .filter_map(|(k, v)| v.to_str().ok().map(|vs| (k.as_str().to_string(), vs.to_string())))
+            .collect();
+        let hook_ctx = crate::scripting::HookContext {
+            client_ip: ip_str.clone(),
+            method: method_str.clone(),
+            path: path.clone(),
+            query: None,
+            headers: Default::default(),
+            status: Some(status.as_u16()),
+            response_headers: resp_hdrs,
+        };
+        for result in hook_engine.execute(crate::scripting::HookPhase::PostUpstream, &hook_ctx) {
+            match result {
+                crate::scripting::HookResult::Respond { status: s, .. } => {
+                    let sc = hyper::StatusCode::from_u16(s).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+                    send_h3_error(&mut stream, sc).await;
+                    return;
+                }
+                _ => {}
+            }
+        }
+    }
+
     // Collect response body from backend
     let content_type = backend_resp
         .headers()

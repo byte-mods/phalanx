@@ -345,9 +345,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // Zone-based concurrent request limiter (tracks per-IP active requests)
         let zone_limiter = Arc::new(middleware::connlimit::ZoneLimiter::new(
             "per_ip",
-            1_000_000, // use PhalanxRateLimiter for actual rate; zone tracks concurrency
-            1_000_000,
-            0, // 0 = unlimited concurrent connections by default
+            cfg_snapshot.zone_rate_per_sec,
+            cfg_snapshot.zone_burst,
+            cfg_snapshot.zone_max_connections,
         ));
 
         // OIDC session store (shared across all connections)
@@ -417,7 +417,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 waf_engine.ml_engine.mode.store(std::sync::Arc::new(waf::ml_fraud::MlFraudMode::Active));
             }
             let ml_reputation = std::sync::Arc::clone(&waf_engine.reputation);
-            waf_engine.ml_engine.load_model(model_path, ml_reputation).await;
+            waf_engine.ml_engine.load_model(
+                model_path,
+                ml_reputation,
+                Some(metrics.ml_model_load_failures.clone()),
+            ).await;
             tracing::info!("ML Fraud Engine started in {} mode from {}", mode_str, model_path);
         }
 

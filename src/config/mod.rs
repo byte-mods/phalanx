@@ -285,6 +285,15 @@ pub struct RouteConfig {
     /// When set to "2", use HTTP/2 for backend connections (enables gRPC backends).
     #[serde(default)]
     pub proxy_http_version: Option<String>,
+
+    // ── Traffic Splitting ──────────────────────────────────────────────────
+    /// Upstream pool names for A/B/canary traffic splitting (e.g. ["pool_v1", "pool_v2"]).
+    /// Used with `split_weights` to deterministically route by client IP.
+    #[serde(default)]
+    pub split_pools: Vec<String>,
+    /// Relative weights for each pool in `split_pools` (e.g. [90, 10] for 90/10 split).
+    #[serde(default)]
+    pub split_weights: Vec<u32>,
 }
 
 fn default_cors_methods() -> Vec<String> {
@@ -564,6 +573,17 @@ pub struct AppConfig {
     /// Custom Retry-After value in seconds for 429 responses. Default: 60.
     #[serde(default)]
     pub rate_limit_retry_after: Option<u64>,
+
+    // ── Zone Limiter ──────────────────────────────────────────────────────
+    /// Zone limiter sustained request rate per key per second. Default: 1,000,000 (effectively unlimited).
+    #[serde(default)]
+    pub zone_rate_per_sec: u32,
+    /// Zone limiter burst allowance per key. Default: 1,000,000 (effectively unlimited).
+    #[serde(default)]
+    pub zone_burst: u32,
+    /// Zone limiter max concurrent connections per key. 0 = unlimited. Default: 0.
+    #[serde(default)]
+    pub zone_max_connections: u32,
 }
 
 impl Default for AppConfig {
@@ -681,6 +701,9 @@ impl Default for AppConfig {
             tls_ciphers: Vec::new(),
             hsts_max_age: None,
             rate_limit_retry_after: None,
+            zone_rate_per_sec: 1_000_000,
+            zone_burst: 1_000_000,
+            zone_max_connections: 0,
         }
     }
 }
@@ -1035,6 +1058,17 @@ pub fn try_load_config(
                     }
                 }
 
+                // Zone limiter directives
+                if let Some(v) = route_or_directive_u32(&server.directives, "zone_rate_per_sec") {
+                    app_cfg.zone_rate_per_sec = v;
+                }
+                if let Some(v) = route_or_directive_u32(&server.directives, "zone_burst") {
+                    app_cfg.zone_burst = v;
+                }
+                if let Some(v) = route_or_directive_u32(&server.directives, "zone_max_connections") {
+                    app_cfg.zone_max_connections = v;
+                }
+
                 // Map phalanx-style route blocks into our RouteConfig hashmap
                 for (path, route) in server.routes {
                     app_cfg.routes.insert(
@@ -1075,6 +1109,8 @@ pub fn try_load_config(
                             cors_max_age_secs: route.cors_max_age_secs,
                             cors_allow_credentials: route.cors_allow_credentials,
                             proxy_http_version: route.proxy_http_version,
+                            split_pools: route.split_pools,
+                            split_weights: route.split_weights,
                         },
                     );
                 }
@@ -1526,6 +1562,42 @@ mod tests {
         assert_eq!(cfg.tls_ciphers[1], "TLS_CHACHA20_POLY1305_SHA256");
         assert_eq!(cfg.hsts_max_age, Some(31536000));
         assert_eq!(cfg.rate_limit_retry_after, Some(120));
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn test_default_config_zone_limiter_fields() {
+        let cfg = AppConfig::default();
+        assert_eq!(cfg.zone_rate_per_sec, 1_000_000);
+        assert_eq!(cfg.zone_burst, 1_000_000);
+        assert_eq!(cfg.zone_max_connections, 0);
+    }
+
+    #[test]
+    fn test_try_load_config_zone_limiter() {
+        let cfg_str = r#"
+            http {
+                server {
+                    listen 8080;
+                    zone_rate_per_sec 500;
+                    zone_burst 1000;
+                    zone_max_connections 100;
+                    route / {
+                        upstream default;
+                    }
+                }
+            }
+        "#;
+        let path = std::env::temp_dir().join(format!(
+            "phalanx_zone_test_{}.conf",
+            std::process::id()
+        ));
+        std::fs::write(&path, cfg_str).expect("write temp config");
+        let cfg = try_load_config(path.to_str().unwrap(), ConfigParsePolicy::Lenient)
+            .expect("parse should succeed");
+        assert_eq!(cfg.zone_rate_per_sec, 500);
+        assert_eq!(cfg.zone_burst, 1000);
+        assert_eq!(cfg.zone_max_connections, 100);
         let _ = std::fs::remove_file(path);
     }
 }

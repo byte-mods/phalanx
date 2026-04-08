@@ -16,7 +16,8 @@ use crate::keyval::{KeyvalGetResponse, KeyvalListEntry, KeyvalSetRequest, Keyval
 use crate::routing::UpstreamManager;
 use actix_web::{App, HttpResponse, HttpServer, Responder, delete, get, post, web};
 use prometheus::{
-    Encoder, HistogramOpts, HistogramVec, IntCounterVec, IntGauge, Opts, Registry, TextEncoder,
+    Encoder, HistogramOpts, HistogramVec, IntCounter, IntCounterVec, IntGauge, Opts, Registry,
+    TextEncoder,
 };
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
@@ -65,6 +66,8 @@ pub struct ProxyMetrics {
     pub backend_request_duration: HistogramVec,
     /// Per-backend error counter, labeled by backend address, pool, and error type.
     pub backend_errors_total: IntCounterVec,
+    /// Counter for ML fraud model load failures (fallback to rule-based mode).
+    pub ml_model_load_failures: IntCounter,
 }
 
 impl ProxyMetrics {
@@ -142,6 +145,12 @@ impl ProxyMetrics {
         )
         .unwrap();
 
+        let ml_model_load_failures = IntCounter::new(
+            "phalanx_ml_model_load_failures_total",
+            "Number of times the ML fraud ONNX model failed to load (rule-based fallback active)",
+        )
+        .unwrap();
+
         // Register all metrics
         registry
             .register(Box::new(http_requests_total.clone()))
@@ -167,6 +176,9 @@ impl ProxyMetrics {
         registry
             .register(Box::new(backend_errors_total.clone()))
             .unwrap();
+        registry
+            .register(Box::new(ml_model_load_failures.clone()))
+            .unwrap();
 
         Self {
             registry,
@@ -178,6 +190,7 @@ impl ProxyMetrics {
             cache_hits_total,
             backend_request_duration,
             backend_errors_total,
+            ml_model_load_failures,
         }
     }
 

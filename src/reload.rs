@@ -119,9 +119,11 @@ pub fn spawn_reload_handler(
                 }
 
                 // ── Zone limiter ──
-                // Zone limiter currently uses high defaults; reload preserves
-                // connection counters while swapping the rate limiter.
-                zone_limiter.reload(1_000_000, 1_000_000, 0);
+                zone_limiter.reload(
+                    new_config.zone_rate_per_sec,
+                    new_config.zone_burst,
+                    new_config.zone_max_connections,
+                );
 
                 // ── GSLB router ──
                 if let Some(ref router) = *gslb_router {

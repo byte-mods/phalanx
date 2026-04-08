@@ -192,6 +192,12 @@ pub struct RouteBlock {
     // ── HTTP/2 Backend Forwarding ────────────────────────────────────────────
     /// Proxy HTTP version for backend connections ("2" = HTTP/2).
     pub proxy_http_version: Option<String>,
+
+    // ── Traffic Splitting ──────────────────────────────────────────────────
+    /// Upstream pool names for A/B/canary traffic splitting.
+    pub split_pools: Vec<String>,
+    /// Relative weights for each pool (e.g. [90, 10] for 90/10).
+    pub split_weights: Vec<u32>,
 }
 
 /// Entry point: parses a raw NGINX-style configuration string into a `PhalanxConfig` AST.
@@ -771,6 +777,26 @@ fn parse_route_block(
             expect_directive_value_semicolon(tokens, i, "proxy_http_version")?;
             block.proxy_http_version = Some(tokens[i + 1].clone());
             i += 3;
+            continue;
+        }
+
+        // Parse: `split_pools pool_v1:90 pool_v2:10;`
+        // Format: pool_name:weight pairs separated by spaces, ending with semicolon.
+        if token == "split_traffic" {
+            i += 1;
+            while i < tokens.len() && tokens[i] != ";" {
+                let part = &tokens[i];
+                if let Some((pool, weight_str)) = part.split_once(':') {
+                    if let Ok(w) = weight_str.parse::<u32>() {
+                        block.split_pools.push(pool.to_string());
+                        block.split_weights.push(w);
+                    }
+                }
+                i += 1;
+            }
+            if i < tokens.len() && tokens[i] == ";" {
+                i += 1;
+            }
             continue;
         }
 
@@ -1395,6 +1421,47 @@ mod tests {
         let http = result.http.unwrap();
         let route = &http.servers[0].routes["/grpc"];
         assert_eq!(route.proxy_http_version, Some("2".to_string()));
+    }
+
+    // ── Traffic Splitting ──────────────────────────────────────────────────
+
+    #[test]
+    fn test_split_traffic_in_route_block() {
+        let cfg = r#"
+            http {
+                server {
+                    listen 8080;
+                    route /api {
+                        upstream default;
+                        split_traffic pool_v1:90 pool_v2:10;
+                    }
+                }
+            }
+        "#;
+        let result = parse_phalanx_config(cfg).unwrap();
+        let http = result.http.unwrap();
+        let route = &http.servers[0].routes["/api"];
+        assert_eq!(route.split_pools, vec!["pool_v1", "pool_v2"]);
+        assert_eq!(route.split_weights, vec![90, 10]);
+    }
+
+    #[test]
+    fn test_split_traffic_empty_by_default() {
+        let cfg = r#"
+            http {
+                server {
+                    listen 8080;
+                    route / {
+                        upstream default;
+                    }
+                }
+            }
+        "#;
+        let result = parse_phalanx_config(cfg).unwrap();
+        let http = result.http.unwrap();
+        let route = &http.servers[0].routes["/"];
+        assert!(route.split_pools.is_empty());
+        assert!(route.split_weights.is_empty());
     }
 
     // ── Health check interval/timeout ────────────────────────────────────────

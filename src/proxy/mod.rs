@@ -1110,7 +1110,7 @@ async fn handle_http_request(
                         *resp.status_mut() = status;
                         resp.headers_mut().insert(
                             hyper::header::LOCATION,
-                            location.parse().unwrap_or_else(|_| "/".parse().unwrap()),
+                            location.parse().unwrap_or_else(|_| hyper::header::HeaderValue::from_static("/")),
                         );
                         return Ok(resp);
                     }
@@ -1210,26 +1210,22 @@ async fn handle_http_request(
                         .boxed(),
                 );
                 *resp.status_mut() = hyper::StatusCode::NO_CONTENT;
-                resp.headers_mut().insert(
-                    "access-control-allow-origin",
-                    allowed_origin.parse().unwrap(),
-                );
-                resp.headers_mut().insert(
-                    "access-control-allow-methods",
-                    methods_str.parse().unwrap(),
-                );
-                resp.headers_mut().insert(
-                    "access-control-allow-headers",
-                    headers_str.parse().unwrap(),
-                );
-                resp.headers_mut().insert(
-                    "access-control-max-age",
-                    max_age_str.parse().unwrap(),
-                );
+                if let Ok(hv) = allowed_origin.parse() {
+                    resp.headers_mut().insert("access-control-allow-origin", hv);
+                }
+                if let Ok(hv) = methods_str.parse() {
+                    resp.headers_mut().insert("access-control-allow-methods", hv);
+                }
+                if let Ok(hv) = headers_str.parse() {
+                    resp.headers_mut().insert("access-control-allow-headers", hv);
+                }
+                if let Ok(hv) = max_age_str.parse() {
+                    resp.headers_mut().insert("access-control-max-age", hv);
+                }
                 if r_config.cors_allow_credentials {
                     resp.headers_mut().insert(
                         "access-control-allow-credentials",
-                        "true".parse().unwrap(),
+                        hyper::header::HeaderValue::from_static("true"),
                     );
                 }
                 return Ok(resp);
@@ -1695,6 +1691,16 @@ async fn handle_http_request(
         pool_name
     };
 
+    // Traffic splitting: if the route has split_pools + split_weights, use
+    // consistent hashing on the client IP to deterministically pick a pool.
+    let pool_name = match route {
+        Some((_, r)) if !r.split_pools.is_empty() && !r.split_weights.is_empty() => {
+            let variant = crate::proxy::mirror::split_traffic(&ip_str, &r.split_weights);
+            r.split_pools.get(variant).cloned().unwrap_or(pool_name)
+        }
+        _ => pool_name,
+    };
+
     // ── Resolve gzip + brotli + cache + mirror flags from matched route config ──
     let (route_gzip, route_gzip_min, route_cache, route_cache_ttl, route_brotli, route_mirror) = match route {
         Some((_, r)) => (
@@ -2127,6 +2133,51 @@ async fn handle_http_request(
             let is_error = response.status().is_server_error();
             ai_engine.update_score(&backend_addr, latency, is_error);
 
+            // PostUpstream hooks — inspect/modify response before compression/caching
+            if hook_engine.has_hooks(crate::scripting::HookPhase::PostUpstream) {
+                let resp_headers: std::collections::HashMap<String, String> = response
+                    .headers()
+                    .iter()
+                    .filter_map(|(k, v)| v.to_str().ok().map(|v| (k.to_string(), v.to_string())))
+                    .collect();
+                let hook_ctx = crate::scripting::HookContext {
+                    client_ip: ip_str.clone(),
+                    method: method_str.clone(),
+                    path: path.clone(),
+                    query: None,
+                    headers: Default::default(),
+                    status: Some(response.status().as_u16()),
+                    response_headers: resp_headers,
+                };
+                for result in hook_engine.execute(crate::scripting::HookPhase::PostUpstream, &hook_ctx) {
+                    match result {
+                        crate::scripting::HookResult::Respond { status, body, .. } => {
+                            let sc = hyper::StatusCode::from_u16(status)
+                                .unwrap_or(hyper::StatusCode::INTERNAL_SERVER_ERROR);
+                            return Ok(Response::builder()
+                                .status(sc)
+                                .body(
+                                    Full::new(Bytes::from(body))
+                                        .map_err(|never| match never {})
+                                        .boxed(),
+                                )
+                                .unwrap());
+                        }
+                        crate::scripting::HookResult::SetHeaders(hdrs) => {
+                            for (k, v) in hdrs {
+                                if let (Ok(hk), Ok(hv)) = (
+                                    hyper::header::HeaderName::from_bytes(k.as_bytes()),
+                                    hyper::header::HeaderValue::from_str(&v),
+                                ) {
+                                    response.headers_mut().insert(hk, hv);
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+
             // Record Prometheus metrics
             let status_code = response.status().as_u16();
             let status_str = status_code.to_string();
@@ -2462,7 +2513,7 @@ async fn handle_http_request(
 /// - Uses `hyper::client::conn::http2::handshake` for backend connections.
 /// - Detects native gRPC (`application/grpc`) and records `grpc-status` metrics.
 /// - Does not support WebSocket upgrades (HTTP/2 uses different mechanisms).
-/// - Does not support traffic mirroring or Brotli compression (planned).
+/// - Supports traffic mirroring, Brotli compression, and gRPC detection.
 /// - The backend HTTP/2 connection is spawned as a background task since HTTP/2
 ///   multiplexes streams over a single TCP connection.
 async fn handle_http2_request(
@@ -2690,7 +2741,7 @@ async fn handle_http2_request(
                         *resp.status_mut() = status;
                         resp.headers_mut().insert(
                             hyper::header::LOCATION,
-                            location.parse().unwrap_or_else(|_| "/".parse().unwrap()),
+                            location.parse().unwrap_or_else(|_| hyper::header::HeaderValue::from_static("/")),
                         );
                         return Ok(resp);
                     }
@@ -2783,26 +2834,22 @@ async fn handle_http2_request(
                         .boxed(),
                 );
                 *resp.status_mut() = hyper::StatusCode::NO_CONTENT;
-                resp.headers_mut().insert(
-                    "access-control-allow-origin",
-                    allowed_origin.parse().unwrap(),
-                );
-                resp.headers_mut().insert(
-                    "access-control-allow-methods",
-                    methods_str.parse().unwrap(),
-                );
-                resp.headers_mut().insert(
-                    "access-control-allow-headers",
-                    headers_str.parse().unwrap(),
-                );
-                resp.headers_mut().insert(
-                    "access-control-max-age",
-                    max_age_str.parse().unwrap(),
-                );
+                if let Ok(hv) = allowed_origin.parse() {
+                    resp.headers_mut().insert("access-control-allow-origin", hv);
+                }
+                if let Ok(hv) = methods_str.parse() {
+                    resp.headers_mut().insert("access-control-allow-methods", hv);
+                }
+                if let Ok(hv) = headers_str.parse() {
+                    resp.headers_mut().insert("access-control-allow-headers", hv);
+                }
+                if let Ok(hv) = max_age_str.parse() {
+                    resp.headers_mut().insert("access-control-max-age", hv);
+                }
                 if r_config.cors_allow_credentials {
                     resp.headers_mut().insert(
                         "access-control-allow-credentials",
-                        "true".parse().unwrap(),
+                        hyper::header::HeaderValue::from_static("true"),
                     );
                 }
                 return Ok(resp);
@@ -3225,6 +3272,15 @@ async fn handle_http2_request(
         pool_name
     };
 
+    // Traffic splitting (HTTP/2)
+    let pool_name = match route {
+        Some((_, r)) if !r.split_pools.is_empty() && !r.split_weights.is_empty() => {
+            let variant = crate::proxy::mirror::split_traffic(&ip_str, &r.split_weights);
+            r.split_pools.get(variant).cloned().unwrap_or(pool_name)
+        }
+        _ => pool_name,
+    };
+
     // ── PreUpstream Hooks ──
     if hook_engine.has_hooks(crate::scripting::HookPhase::PreUpstream) {
         let hook_ctx = crate::scripting::HookContext {
@@ -3440,6 +3496,51 @@ async fn handle_http2_request(
             let latency = start_time.elapsed().as_millis() as u64;
             let is_error = response.status().is_server_error();
             ai_engine.update_score(&backend_addr, latency, is_error);
+
+            // PostUpstream hooks — inspect/modify response before compression/caching
+            if hook_engine.has_hooks(crate::scripting::HookPhase::PostUpstream) {
+                let resp_headers: std::collections::HashMap<String, String> = response
+                    .headers()
+                    .iter()
+                    .filter_map(|(k, v)| v.to_str().ok().map(|v| (k.to_string(), v.to_string())))
+                    .collect();
+                let hook_ctx = crate::scripting::HookContext {
+                    client_ip: ip_str.clone(),
+                    method: method_str.clone(),
+                    path: path.clone(),
+                    query: None,
+                    headers: Default::default(),
+                    status: Some(response.status().as_u16()),
+                    response_headers: resp_headers,
+                };
+                for result in hook_engine.execute(crate::scripting::HookPhase::PostUpstream, &hook_ctx) {
+                    match result {
+                        crate::scripting::HookResult::Respond { status, body, .. } => {
+                            let sc = hyper::StatusCode::from_u16(status)
+                                .unwrap_or(hyper::StatusCode::INTERNAL_SERVER_ERROR);
+                            return Ok(Response::builder()
+                                .status(sc)
+                                .body(
+                                    Full::new(Bytes::from(body))
+                                        .map_err(|never| match never {})
+                                        .boxed(),
+                                )
+                                .unwrap());
+                        }
+                        crate::scripting::HookResult::SetHeaders(hdrs) => {
+                            for (k, v) in hdrs {
+                                if let (Ok(hk), Ok(hv)) = (
+                                    hyper::header::HeaderName::from_bytes(k.as_bytes()),
+                                    hyper::header::HeaderValue::from_str(&v),
+                                ) {
+                                    response.headers_mut().insert(hk, hv);
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
 
             let status_code = response.status().as_u16();
 

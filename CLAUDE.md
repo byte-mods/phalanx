@@ -116,14 +116,18 @@ What gets reloaded on SIGHUP (via `spawn_reload_handler()`):
 - ✅ TLS certificates (reload from disk)
 - ✅ Upstream pools (3-way diff: add/update/remove)
 - ✅ Bind addresses (supervisor restarts listener)
-- ❌ Rate limiter (uses startup config)
-- ❌ WAF policy engine (startup-loaded)
+- ✅ Rate limiter (per-IP rate, burst, global rate from new config)
+- ✅ WAF rules + policy (RegexSet recompiled, policy file re-read)
+- ✅ GeoIP database (CSV re-read, lookup cache cleared)
+- ✅ Hook engine / Rhai scripts (script file re-read and re-registered)
+- ✅ Zone limiter (rate/burst/max-connections from config)
+- ✅ GSLB router (data center list preserved, health state kept)
 - ❌ AI router algorithm/params
-- ❌ GeoIP database
-- ❌ Hook engine / Rhai scripts
 - ❌ CAPTCHA provider config
-- ❌ Zone limiter zones
 - ❌ Wasm plugins
+- ❌ K8s ingress class
+- ❌ ML fraud model
+- ❌ Worker thread count
 
 ---
 

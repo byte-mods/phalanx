@@ -211,6 +211,12 @@ impl PolicyEngine {
     }
 
     /// Evaluates a request against the named policy (or default).
+    ///
+    /// `matched_categories` is a list of OWASP category names already detected
+    /// by `WafRules::inspect_payload()` (e.g., "SQL Injection (SQLi)"). These
+    /// are cross-referenced against the policy's enabled signature sets to
+    /// produce violations with the correct severity. Pass an empty slice to
+    /// skip signature set evaluation.
     pub fn evaluate(
         &self,
         policy_name: Option<&str>,
@@ -218,6 +224,19 @@ impl PolicyEngine {
         query: Option<&str>,
         headers: &[(String, String)],
         body: Option<&str>,
+    ) -> Vec<PolicyViolation> {
+        self.evaluate_with_categories(policy_name, path, query, headers, body, &[])
+    }
+
+    /// Full evaluation including matched WAF rule categories.
+    pub fn evaluate_with_categories(
+        &self,
+        policy_name: Option<&str>,
+        path: &str,
+        query: Option<&str>,
+        headers: &[(String, String)],
+        body: Option<&str>,
+        matched_categories: &[&str],
     ) -> Vec<PolicyViolation> {
         let policy_key = policy_name
             .map(String::from)
@@ -236,6 +255,32 @@ impl PolicyEngine {
         }
 
         let mut violations = Vec::new();
+
+        // Evaluate enabled signature sets against matched WAF rule categories
+        for category in matched_categories {
+            for sig_set in &compiled.config.signature_sets {
+                if !sig_set.enabled {
+                    continue;
+                }
+                // Match category names loosely: "SQL Injection (SQLi)" contains "SQL Injection"
+                let sig_name_lower = sig_set.name.to_lowercase();
+                let cat_lower = category.to_lowercase();
+                if cat_lower.contains(&sig_name_lower)
+                    || sig_name_lower.contains(&cat_lower)
+                {
+                    violations.push(PolicyViolation {
+                        rule_id: 0, // signature-set match, not a numbered rule
+                        category: sig_set.name.clone(),
+                        description: format!(
+                            "Signature set '{}' matched category '{}'",
+                            sig_set.name, category
+                        ),
+                        severity: sig_set.severity,
+                        action: RuleAction::Block,
+                    });
+                }
+            }
+        }
 
         for (id, pattern, target, action) in &compiled.custom_patterns {
             let matched = match target {
@@ -574,5 +619,97 @@ mod tests {
         assert_eq!(default_owasp_policy().blocking_status, 403);
         let engine = PolicyEngine::new();
         assert_eq!(engine.blocking_status(None), 403);
+    }
+
+    #[test]
+    fn test_signature_set_sqli_produces_violation() {
+        let mut engine = PolicyEngine::new();
+        engine.add_policy(default_owasp_policy()).expect("add_policy");
+        let v = engine.evaluate_with_categories(
+            None,
+            "/api/data",
+            None,
+            &[],
+            None,
+            &["SQL Injection (SQLi)"],
+        );
+        assert!(
+            v.iter().any(|x| x.category == "SQL Injection"),
+            "expected SQL Injection signature set violation, got {:?}",
+            v.iter().map(|x| &x.category).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn test_signature_set_xss_produces_violation() {
+        let mut engine = PolicyEngine::new();
+        engine.add_policy(default_owasp_policy()).expect("add_policy");
+        let v = engine.evaluate_with_categories(
+            None,
+            "/",
+            None,
+            &[],
+            None,
+            &["Cross-Site Scripting (XSS)"],
+        );
+        assert!(
+            v.iter().any(|x| x.category == "Cross-Site Scripting"),
+            "expected XSS signature set violation, got {:?}",
+            v.iter().map(|x| &x.category).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn test_disabled_signature_set_skipped() {
+        let mut policy = default_owasp_policy();
+        // Disable SQL Injection set
+        for sig in &mut policy.signature_sets {
+            if sig.name == "SQL Injection" {
+                sig.enabled = false;
+            }
+        }
+        let mut engine = PolicyEngine::new();
+        engine.add_policy(policy).expect("add_policy");
+        let v = engine.evaluate_with_categories(
+            None,
+            "/",
+            None,
+            &[],
+            None,
+            &["SQL Injection (SQLi)"],
+        );
+        assert!(
+            !v.iter().any(|x| x.category == "SQL Injection"),
+            "disabled signature set should not produce violation"
+        );
+    }
+
+    #[test]
+    fn test_signature_set_unmatched_category_no_violation() {
+        let mut engine = PolicyEngine::new();
+        engine.add_policy(default_owasp_policy()).expect("add_policy");
+        let v = engine.evaluate_with_categories(
+            None,
+            "/",
+            None,
+            &[],
+            None,
+            &["Unknown Attack Category"],
+        );
+        // Only custom_rules might match, not signature sets
+        let sig_violations: Vec<_> = v.iter().filter(|x| x.rule_id == 0).collect();
+        assert!(
+            sig_violations.is_empty(),
+            "unknown category should not match any signature set"
+        );
+    }
+
+    #[test]
+    fn test_evaluate_backward_compatible_without_categories() {
+        let mut engine = PolicyEngine::new();
+        engine.add_policy(default_owasp_policy()).expect("add_policy");
+        // Original evaluate() without categories still works
+        let v = engine.evaluate(None, "/x", None, &[], Some("127.0.0.1"));
+        assert!(!v.is_empty(), "SSRF custom rule should still match");
     }
 }

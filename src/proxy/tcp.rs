@@ -75,6 +75,31 @@ pub async fn start_tcp_proxy(
 
         // Spawn a green thread for each connection
         tokio::spawn(async move {
+            // ── PROXY Protocol v2 detection ──
+            // Peek at the first bytes to detect a PP2 header. If present, extract
+            // the real client address and strip the header before forwarding.
+            let mut pp2_buf = [0u8; 232]; // max PP2 header size (16 + 216 TLV)
+            let real_peer = match client_stream.peek(&mut pp2_buf).await {
+                Ok(n) if n >= 16 => {
+                    match crate::proxy::proxy_proto_v2::parse_v2_header(&pp2_buf[..n]) {
+                        Ok((hdr, consumed)) => {
+                            // Consume the PP2 header bytes from the stream
+                            let mut discard = vec![0u8; consumed];
+                            let _ = tokio::io::AsyncReadExt::read_exact(
+                                &mut client_stream, &mut discard,
+                            ).await;
+                            let addr = hdr.src_addr.unwrap_or(peer);
+                            debug!("TCP proxy: PP2 real client IP: {}", addr);
+                            addr
+                        }
+                        Err(crate::proxy::proxy_proto_v2::ParseError::NotProxyProtocol) => peer,
+                        Err(_) => peer,
+                    }
+                }
+                _ => peer,
+            };
+            debug!("TCP proxy: effective client: {}", real_peer);
+
             // Because it's a raw TCP proxy, we don't have SNI or Host header (unless we parse TLS/HTTP),
             // so we route everything to the 'default' pool for this dedicated port.
             let pool = match upts.get_pool("default") {

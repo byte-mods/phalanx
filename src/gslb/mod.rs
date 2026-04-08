@@ -109,14 +109,46 @@ impl GslbPolicy {
 /// Country-to-region mapping for GeoIP integration.
 pub fn country_to_region(country_code: &str) -> GeoRegion {
     match country_code.to_uppercase().as_str() {
-        "US" | "CA" | "MX" => GeoRegion::NorthAmerica,
-        "BR" | "AR" | "CL" | "CO" | "PE" | "VE" | "EC" | "UY" | "PY" | "BO" => GeoRegion::SouthAmerica,
-        "GB" | "DE" | "FR" | "IT" | "ES" | "NL" | "BE" | "CH" | "AT" | "SE" | "NO" | "DK" | "FI" | "PL" | "CZ" | "PT" | "IE" | "RO" | "HU" | "GR" | "UA" | "RU" => GeoRegion::Europe,
-        "ZA" | "NG" | "KE" | "EG" | "GH" | "TZ" | "ET" | "MA" | "DZ" | "TN" => GeoRegion::Africa,
-        "AE" | "SA" | "IL" | "TR" | "QA" | "KW" | "BH" | "OM" | "JO" | "LB" | "IQ" | "IR" => GeoRegion::MiddleEast,
-        "CN" | "JP" | "KR" | "IN" | "SG" | "TH" | "VN" | "MY" | "ID" | "PH" | "TW" | "HK" | "PK" | "BD" => GeoRegion::Asia,
-        "AU" | "NZ" | "FJ" | "PG" => GeoRegion::Oceania,
-        _ => GeoRegion::NorthAmerica, // default fallback
+        // North America (23 countries/territories)
+        "US" | "CA" | "MX" | "GT" | "BZ" | "HN" | "SV" | "NI" | "CR" | "PA"
+        | "CU" | "JM" | "HT" | "DO" | "PR" | "TT" | "BB" | "BS" | "AG" | "DM"
+        | "GD" | "KN" | "LC" => GeoRegion::NorthAmerica,
+
+        // South America (14 countries)
+        "BR" | "AR" | "CL" | "CO" | "PE" | "VE" | "EC" | "UY" | "PY" | "BO"
+        | "GY" | "SR" | "GF" | "FK" => GeoRegion::SouthAmerica,
+
+        // Europe (50 countries)
+        "GB" | "DE" | "FR" | "IT" | "ES" | "NL" | "BE" | "CH" | "AT" | "SE"
+        | "NO" | "DK" | "FI" | "PL" | "CZ" | "PT" | "IE" | "RO" | "HU" | "GR"
+        | "UA" | "RU" | "SK" | "BG" | "HR" | "RS" | "SI" | "LT" | "LV" | "EE"
+        | "IS" | "LU" | "MT" | "CY" | "AL" | "MK" | "BA" | "ME" | "MD" | "BY"
+        | "GE" | "AM" | "AZ" | "KZ" | "LI" | "MC" | "SM" | "AD" | "VA" | "XK"
+        => GeoRegion::Europe,
+
+        // Africa (54 countries)
+        "ZA" | "NG" | "KE" | "EG" | "GH" | "TZ" | "ET" | "MA" | "DZ" | "TN"
+        | "UG" | "CI" | "CM" | "MG" | "MZ" | "AO" | "SN" | "ML" | "BF" | "NE"
+        | "TD" | "SO" | "ZW" | "RW" | "BJ" | "BI" | "TG" | "SL" | "LR" | "MR"
+        | "ER" | "GM" | "GA" | "BW" | "NA" | "LS" | "SZ" | "DJ" | "KM" | "CV"
+        | "ST" | "SC" | "MU" | "GN" | "GW" | "GQ" | "CG" | "CD" | "CF" | "MW"
+        | "ZM" | "SS" | "LY" | "SD" => GeoRegion::Africa,
+
+        // Middle East (16 countries)
+        "AE" | "SA" | "IL" | "TR" | "QA" | "KW" | "BH" | "OM" | "JO" | "LB"
+        | "IQ" | "IR" | "YE" | "SY" | "PS" | "AF" => GeoRegion::MiddleEast,
+
+        // Asia (30 countries)
+        "CN" | "JP" | "KR" | "IN" | "SG" | "TH" | "VN" | "MY" | "ID" | "PH"
+        | "TW" | "HK" | "PK" | "BD" | "LK" | "NP" | "MM" | "KH" | "LA" | "MN"
+        | "KP" | "BN" | "MO" | "BT" | "MV" | "TL" | "UZ" | "TM" | "TJ" | "KG"
+        => GeoRegion::Asia,
+
+        // Oceania (14 countries/territories)
+        "AU" | "NZ" | "FJ" | "PG" | "WS" | "TO" | "VU" | "SB" | "KI" | "MH"
+        | "FM" | "PW" | "TV" | "NR" => GeoRegion::Oceania,
+
+        _ => GeoRegion::NorthAmerica, // default fallback for unmapped territories
     }
 }
 
@@ -636,6 +668,42 @@ mod tests {
         assert_eq!(country_to_region("JP"), GeoRegion::Asia);
         assert_eq!(country_to_region("AU"), GeoRegion::Oceania);
         assert_eq!(country_to_region("XX"), GeoRegion::NorthAmerica); // unknown
+
+        // Expanded coverage: spot-check newly added countries per region
+        // North America (Caribbean/Central America)
+        assert_eq!(country_to_region("GT"), GeoRegion::NorthAmerica);
+        assert_eq!(country_to_region("JM"), GeoRegion::NorthAmerica);
+        assert_eq!(country_to_region("CR"), GeoRegion::NorthAmerica);
+        assert_eq!(country_to_region("TT"), GeoRegion::NorthAmerica);
+        // South America
+        assert_eq!(country_to_region("GY"), GeoRegion::SouthAmerica);
+        assert_eq!(country_to_region("SR"), GeoRegion::SouthAmerica);
+        // Europe (Eastern/Balkan/Caucasus)
+        assert_eq!(country_to_region("SK"), GeoRegion::Europe);
+        assert_eq!(country_to_region("HR"), GeoRegion::Europe);
+        assert_eq!(country_to_region("GE"), GeoRegion::Europe);
+        assert_eq!(country_to_region("AM"), GeoRegion::Europe);
+        assert_eq!(country_to_region("XK"), GeoRegion::Europe);
+        assert_eq!(country_to_region("BY"), GeoRegion::Europe);
+        // Africa
+        assert_eq!(country_to_region("UG"), GeoRegion::Africa);
+        assert_eq!(country_to_region("CI"), GeoRegion::Africa);
+        assert_eq!(country_to_region("BW"), GeoRegion::Africa);
+        assert_eq!(country_to_region("SS"), GeoRegion::Africa);
+        assert_eq!(country_to_region("MU"), GeoRegion::Africa);
+        // Middle East
+        assert_eq!(country_to_region("YE"), GeoRegion::MiddleEast);
+        assert_eq!(country_to_region("SY"), GeoRegion::MiddleEast);
+        assert_eq!(country_to_region("AF"), GeoRegion::MiddleEast);
+        // Asia
+        assert_eq!(country_to_region("LK"), GeoRegion::Asia);
+        assert_eq!(country_to_region("NP"), GeoRegion::Asia);
+        assert_eq!(country_to_region("MN"), GeoRegion::Asia);
+        assert_eq!(country_to_region("KG"), GeoRegion::Asia);
+        // Oceania
+        assert_eq!(country_to_region("WS"), GeoRegion::Oceania);
+        assert_eq!(country_to_region("TO"), GeoRegion::Oceania);
+        assert_eq!(country_to_region("PW"), GeoRegion::Oceania);
     }
 
     #[test]

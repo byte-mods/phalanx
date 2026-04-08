@@ -12,6 +12,7 @@
 use arc_swap::ArcSwap;
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tokio::sync::{mpsc, RwLock};
 use tracing::{error, info, warn};
@@ -90,6 +91,9 @@ pub struct MlFraudEngine {
     pub mode: Arc<ArcSwap<MlFraudMode>>,
     /// Rolling log of the last 100 inference results for the admin dashboard.
     pub logs: Arc<RwLock<VecDeque<MlLogEntry>>>,
+    /// Indicates whether the ONNX model loaded successfully.
+    /// `false` means the engine is running in rule-based fallback mode.
+    model_loaded: Arc<AtomicBool>,
 }
 
 impl MlFraudEngine {
@@ -99,27 +103,41 @@ impl MlFraudEngine {
             tx: std::sync::RwLock::new(None),
             mode: Arc::new(ArcSwap::from_pointee(MlFraudMode::Shadow)),
             logs: Arc::new(RwLock::new(VecDeque::with_capacity(100))),
+            model_loaded: Arc::new(AtomicBool::new(false)),
         }
     }
 
+    /// Returns whether the ONNX model was successfully loaded.
+    /// When `false`, the engine is operating in rule-based fallback mode.
+    pub fn is_model_loaded(&self) -> bool {
+        self.model_loaded.load(Ordering::Relaxed)
+    }
+
     /// Triggers an asynchronous reload of the ONNX model and spawns the inference worker.
-    pub async fn load_model(&self, model_path: &str, reputation: Arc<IpReputationManager>) {
+    pub async fn load_model(
+        &self,
+        model_path: &str,
+        reputation: Arc<IpReputationManager>,
+        ml_load_failure_metric: Option<prometheus::IntCounter>,
+    ) {
         info!("ML Fraud Engine: Loading ONNX model from {}", model_path);
 
         let model_path_v = model_path.to_string();
-        
+
         let (tx, mut rx) = mpsc::channel::<MlEvent>(10_000);
         if let Ok(mut guard) = self.tx.write() {
             *guard = Some(tx);
         }
-        
+
         let mode_ref = Arc::clone(&self.mode);
         let logs_ref = Arc::clone(&self.logs);
+        let model_loaded_ref = Arc::clone(&self.model_loaded);
 
         // Spawn the dedicated background worker
         tokio::spawn(async move {
             info!("ML Fraud Worker: Booting and compiling ONNX graph...");
-            
+
+            let model_path_v_log = model_path_v.clone();
             // Model compilation is blocking, so yield to blocking thread
             let model_result = tokio::task::spawn_blocking(move || {
                 tract_onnx::onnx()
@@ -129,18 +147,23 @@ impl MlFraudEngine {
             }).await.unwrap_or_else(|e| Err(anyhow::anyhow!("JoinError: {}", e)));
 
             let model = match model_result {
-                Ok(m) => Some(m),
+                Ok(m) => {
+                    model_loaded_ref.store(true, Ordering::Relaxed);
+                    info!("ML Fraud Worker: ONNX model successfully loaded and active.");
+                    Some(m)
+                }
                 Err(e) => {
+                    model_loaded_ref.store(false, Ordering::Relaxed);
                     error!("ML Fraud Worker: Failed to load ONNX model, using rule-based fallback. Error: {}", e);
+                    warn!("ML Fraud Worker: ONNX model load failure — falling back to rule-based heuristic scoring. \
+                           Model path: '{}'. Fraud detection accuracy will be degraded until a valid model is loaded.",
+                           model_path_v_log);
+                    if let Some(ref metric) = ml_load_failure_metric {
+                        metric.inc();
+                    }
                     None
                 }
             };
-
-            if model.is_some() {
-                info!("ML Fraud Worker: ONNX model successfully loaded and active.");
-            } else {
-                warn!("ML Fraud Worker: Running in rule-based fallback mode.");
-            }
 
             while let Some(event) = rx.recv().await {
                 // Convert metadata into a standardized feature vector (6 floats)
@@ -298,6 +321,14 @@ fn rule_based_score(event: &MlEvent, mode: MlFraudMode) -> MlLogEntry {
 impl Default for MlFraudEngine {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+impl MlFraudEngine {
+    /// Returns `true` if the engine is running in rule-based fallback mode
+    /// (ONNX model not loaded or failed to load).
+    pub fn is_fallback_mode(&self) -> bool {
+        !self.model_loaded.load(Ordering::Relaxed)
     }
 }
 
@@ -483,5 +514,39 @@ mod tests {
             body_snippet: String::new(),
         };
         assert_eq!(event_with_query.query, Some("q=test".to_string()));
+    }
+
+    #[test]
+    fn test_model_loaded_flag_defaults_to_false() {
+        let engine = MlFraudEngine::new();
+        assert!(!engine.is_model_loaded(), "model should not be loaded on fresh engine");
+        assert!(engine.is_fallback_mode(), "should be in fallback mode when no model loaded");
+    }
+
+    #[tokio::test]
+    async fn test_load_model_with_invalid_path_sets_fallback() {
+        let engine = MlFraudEngine::new();
+        let reputation = IpReputationManager::new(10, 3600, None);
+        // Load with a nonexistent model path — should trigger fallback
+        engine.load_model("/nonexistent/model.onnx", reputation, None).await;
+        // Give the spawned worker a moment to attempt model load
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        assert!(!engine.is_model_loaded(), "model should not be loaded for invalid path");
+        assert!(engine.is_fallback_mode(), "should be in fallback mode after load failure");
+    }
+
+    #[tokio::test]
+    async fn test_load_model_failure_increments_metric() {
+        let engine = MlFraudEngine::new();
+        let reputation = IpReputationManager::new(10, 3600, None);
+        let counter = prometheus::IntCounter::new(
+            "test_ml_load_failures",
+            "test counter",
+        ).unwrap();
+        assert_eq!(counter.get(), 0);
+        engine.load_model("/nonexistent/model.onnx", reputation, Some(counter.clone())).await;
+        // Give the spawned worker time to attempt model load and increment counter
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        assert_eq!(counter.get(), 1, "metric should be incremented on model load failure");
     }
 }

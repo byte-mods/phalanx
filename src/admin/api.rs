@@ -365,7 +365,11 @@ pub async fn ml_upload(
         return HttpResponse::InternalServerError().json(serde_json::json!({ "error": format!("Failed to write model: {}", e) }));
     }
 
-    state.waf.ml_engine.load_model(model_path, Arc::clone(&state.waf.reputation)).await;
+    state.waf.ml_engine.load_model(
+        model_path,
+        Arc::clone(&state.waf.reputation),
+        Some(state.metrics.ml_model_load_failures.clone()),
+    ).await;
 
     HttpResponse::Ok().json(serde_json::json!({
         "status": "model_loaded",

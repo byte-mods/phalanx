@@ -1476,6 +1476,98 @@ mod hook_engine_phase_tests {
         }).collect();
         assert_eq!(paths, vec!["/a", "/b", "/c"]);
     }
+
+    #[test]
+    fn test_post_upstream_hook_receives_status_and_response_headers() {
+        use std::sync::{Arc, Mutex};
+
+        // Custom hook that captures the context it receives
+        struct CaptureHook {
+            captured: Arc<Mutex<Option<(Option<u16>, HashMap<String, String>)>>>,
+        }
+        impl HookHandler for CaptureHook {
+            fn execute(&self, ctx: &HookContext) -> HookResult {
+                *self.captured.lock().unwrap() = Some((
+                    ctx.status,
+                    ctx.response_headers.clone(),
+                ));
+                HookResult::Continue
+            }
+        }
+
+        let captured = Arc::new(Mutex::new(None));
+        let engine = HookEngine::new();
+        engine.register(Hook {
+            name: "capture_post".to_string(),
+            phase: HookPhase::PostUpstream,
+            priority: 0,
+            handler: Box::new(CaptureHook { captured: captured.clone() }),
+        });
+
+        assert!(engine.has_hooks(HookPhase::PostUpstream));
+        assert!(!engine.has_hooks(HookPhase::PreRoute));
+
+        let mut resp_headers = HashMap::new();
+        resp_headers.insert("x-custom".to_string(), "value123".to_string());
+
+        let hook_ctx = HookContext {
+            client_ip: "10.0.0.1".to_string(),
+            method: "POST".to_string(),
+            path: "/api/data".to_string(),
+            query: None,
+            headers: HashMap::new(),
+            status: Some(200),
+            response_headers: resp_headers,
+        };
+
+        let results = engine.execute(HookPhase::PostUpstream, &hook_ctx);
+        assert_eq!(results.len(), 1);
+        assert!(matches!(results[0], HookResult::Continue));
+
+        let captured = captured.lock().unwrap();
+        let (status, headers) = captured.as_ref().unwrap();
+        assert_eq!(*status, Some(200));
+        assert_eq!(headers.get("x-custom").map(|s| s.as_str()), Some("value123"));
+    }
+
+    #[test]
+    fn test_post_upstream_hook_set_headers_modifies_response() {
+        struct InjectHeader;
+        impl HookHandler for InjectHeader {
+            fn execute(&self, _ctx: &HookContext) -> HookResult {
+                let mut headers = HashMap::new();
+                headers.insert("x-injected".to_string(), "from-hook".to_string());
+                HookResult::SetHeaders(headers)
+            }
+        }
+
+        let engine = HookEngine::new();
+        engine.register(Hook {
+            name: "inject".to_string(),
+            phase: HookPhase::PostUpstream,
+            priority: 0,
+            handler: Box::new(InjectHeader),
+        });
+
+        let hook_ctx = HookContext {
+            client_ip: "10.0.0.1".to_string(),
+            method: "GET".to_string(),
+            path: "/".to_string(),
+            query: None,
+            headers: HashMap::new(),
+            status: Some(200),
+            response_headers: HashMap::new(),
+        };
+
+        let results = engine.execute(HookPhase::PostUpstream, &hook_ctx);
+        assert_eq!(results.len(), 1);
+        match &results[0] {
+            HookResult::SetHeaders(hdrs) => {
+                assert_eq!(hdrs.get("x-injected").map(|s| s.as_str()), Some("from-hook"));
+            }
+            other => panic!("Expected SetHeaders, got {:?}", other),
+        }
+    }
 }
 
 // ─── WAF Policy Engine tests ───────────────────────────────────────────────────
