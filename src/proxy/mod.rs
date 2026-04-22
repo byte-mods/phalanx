@@ -1253,8 +1253,7 @@ async fn handle_http_request(
                     *resp.status_mut() = status;
                     resp.headers_mut().insert(
                         hyper::header::WWW_AUTHENTICATE,
-                        crate::auth::basic::www_authenticate_header(realm)
-                            .unwrap_or_else(|_| hyper::header::HeaderValue::from_static("Bearer")),
+                        hyper::header::HeaderValue::from_static("Bearer"),
                     );
                     return Ok(resp);
                 }
