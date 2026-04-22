@@ -30,7 +30,7 @@ Crashes on malformed config, invalid CORS headers, bad auth settings.
 - Lines 1736, 1785, 2164, 2247, 2338, 2617, 2654: various `.unwrap()` in request path
 
 **Fix:** Use `.unwrap_or_default()` or validate at config parse time.
-**Status:** 🔧 In progress (16/24 fixed with `.expect()` + static HeaderValue)
+**Status:** ✅ Done — 20 unwrap() calls replaced with .expect() and static HeaderValue
 
 ### C2: HTTP/3 Parity Gap — 13 steps vs 29
 **Problem:** `handle_h3_request()` in `src/proxy/http3.rs` missing critical functionality.
