@@ -155,7 +155,7 @@ fn empty_response(status: hyper::StatusCode) -> Response<BoxBody<Bytes, hyper::E
                 .map_err(|never| match never {})
                 .boxed(),
         )
-        .unwrap()
+        .expect("Response::builder is infallible for Empty<Bytes> body")
 }
 
 /// Constructs an HTTP 429 Too Many Requests response with a configurable Retry-After header.
@@ -173,7 +173,7 @@ fn rate_limit_response_with_retry(retry_after: u64) -> Response<BoxBody<Bytes, h
                 .map_err(|never| match never {})
                 .boxed(),
         )
-        .unwrap()
+        .expect("Response::builder is infallible for Full<Bytes> body")
 }
 
 /// Backward-compatible wrapper: 429 with Retry-After: 60.
@@ -206,7 +206,7 @@ fn error_response(
                     .map_err(|never| match never {})
                     .boxed(),
             )
-            .unwrap()
+            .expect("Response::builder is infallible for Full<Bytes> body")
     } else {
         let body = Bytes::from(format!("{} {}: {}\n", status.as_u16(), reason, message));
         Response::builder()
@@ -217,7 +217,7 @@ fn error_response(
                     .map_err(|never| match never {})
                     .boxed(),
             )
-            .unwrap()
+            .expect("Response::builder is infallible for Full<Bytes> body")
     }
 }
 
@@ -244,7 +244,7 @@ fn html_response(
                 .map_err(|never| match never {})
                 .boxed(),
         )
-        .unwrap()
+        .expect("Response::builder is infallible for Full<Bytes> body")
 }
 
 /// Decodes a single URL-encoded form component (percent-decoding + `+` to space).
@@ -348,7 +348,7 @@ async fn handle_captcha_verify_request(
                     .map_err(|never| match never {})
                     .boxed(),
             )
-            .unwrap());
+            .expect("Response::builder is infallible for Empty<Bytes> body"));
     }
 
     Ok(html_response(
@@ -946,7 +946,7 @@ async fn handle_http_request(
             return Ok(Response::builder()
                 .status(sc)
                 .body(Full::new(Bytes::from(direct.body)).map_err(|never| match never {}).boxed())
-                .unwrap());
+                .expect("Response::builder is infallible for Full<Bytes> body"));
         }
         if let Some(hdrs) = result.headers {
             for (k, v) in hdrs {
@@ -984,7 +984,7 @@ async fn handle_http_request(
                     return Ok(Response::builder()
                         .status(sc)
                         .body(Full::new(Bytes::from(body)).map_err(|never| match never {}).boxed())
-                        .unwrap());
+                        .expect("Response::builder is infallible for Full<Bytes> body"));
                 }
                 crate::scripting::HookResult::RewritePath(new_path) => {
                     path = new_path;
@@ -1254,8 +1254,7 @@ async fn handle_http_request(
                     resp.headers_mut().insert(
                         hyper::header::WWW_AUTHENTICATE,
                         crate::auth::basic::www_authenticate_header(realm)
-                            .parse()
-                            .unwrap(),
+                            .unwrap_or_else(|_| hyper::header::HeaderValue::from_static("Bearer")),
                     );
                     return Ok(resp);
                 }
@@ -1287,8 +1286,10 @@ async fn handle_http_request(
                             .boxed(),
                     );
                     *resp.status_mut() = status;
-                    resp.headers_mut()
-                        .insert(hyper::header::WWW_AUTHENTICATE, "Bearer".parse().unwrap());
+                    resp.headers_mut().insert(
+                        hyper::header::WWW_AUTHENTICATE,
+                        hyper::header::HeaderValue::from_static("Bearer"),
+                    );
                     return Ok(resp);
                 }
             }
@@ -1326,8 +1327,10 @@ async fn handle_http_request(
                             .boxed(),
                     );
                     *resp.status_mut() = status;
-                    resp.headers_mut()
-                        .insert(hyper::header::WWW_AUTHENTICATE, "Bearer".parse().unwrap());
+                    resp.headers_mut().insert(
+                        hyper::header::WWW_AUTHENTICATE,
+                        hyper::header::HeaderValue::from_static("Bearer"),
+                    );
                     return Ok(resp);
                 }
             }
@@ -1733,7 +1736,7 @@ async fn handle_http_request(
             let mut resp = Response::builder()
                 .status(cached.status)
                 .body(body)
-                .unwrap();
+                .expect("Response::builder is infallible for Full<Bytes> body");
             resp.headers_mut().insert(
                 hyper::header::CONTENT_TYPE,
                 hyper::header::HeaderValue::from_str(&cached.content_type).unwrap_or_else(|_| {
@@ -1782,7 +1785,7 @@ async fn handle_http_request(
                                 .map_err(|never| match never {})
                                 .boxed(),
                         )
-                        .unwrap());
+                        .expect("Response::builder is infallible for Full<Bytes> body"));
                 }
                 crate::scripting::HookResult::SetHeaders(hdrs) => {
                     for (k, v) in hdrs {
@@ -2244,7 +2247,7 @@ async fn handle_http_request(
                     if r.cors_allow_credentials {
                         response.headers_mut().insert(
                             "access-control-allow-credentials",
-                            "true".parse().unwrap(),
+                            hyper::header::HeaderValue::from_static("true"),
                         );
                     }
                 }
@@ -2335,7 +2338,7 @@ async fn handle_http_request(
                         .map_err(|never| match never {})
                         .boxed(),
                 )
-                .unwrap();
+                .expect("Response::builder is infallible for Full<Bytes> body");
 
             // Copy original headers
             for (key, value) in response.headers().iter() {
@@ -2614,7 +2617,7 @@ async fn handle_http2_request(
             return Ok(Response::builder()
                 .status(sc)
                 .body(Full::new(Bytes::from(direct.body)).map_err(|never| match never {}).boxed())
-                .unwrap());
+                .expect("Response::builder is infallible for Full<Bytes> body"));
         }
         if let Some(hdrs) = result.headers {
             for (k, v) in hdrs {
@@ -2651,7 +2654,7 @@ async fn handle_http2_request(
                     return Ok(Response::builder()
                         .status(sc)
                         .body(Full::new(Bytes::from(body)).map_err(|never| match never {}).boxed())
-                        .unwrap());
+                        .expect("Response::builder is infallible for Full<Bytes> body"));
                 }
                 crate::scripting::HookResult::RewritePath(new_path) => {
                     path = new_path;
@@ -3308,7 +3311,7 @@ async fn handle_http2_request(
                                 .map_err(|never| match never {})
                                 .boxed(),
                         )
-                        .unwrap());
+                        .expect("Response::builder is infallible for Full<Bytes> body"));
                 }
                 crate::scripting::HookResult::SetHeaders(hdrs) => {
                     for (k, v) in hdrs {
@@ -3338,7 +3341,7 @@ async fn handle_http2_request(
             let mut resp = Response::builder()
                 .status(cached.status)
                 .body(body)
-                .unwrap();
+                .expect("Response::builder is infallible for Full<Bytes> body");
             resp.headers_mut().insert(
                 hyper::header::CONTENT_TYPE,
                 hyper::header::HeaderValue::from_str(&cached.content_type).unwrap_or_else(|_| {
@@ -3622,7 +3625,7 @@ async fn handle_http2_request(
                     if r.cors_allow_credentials {
                         response.headers_mut().insert(
                             "access-control-allow-credentials",
-                            "true".parse().unwrap(),
+                            hyper::header::HeaderValue::from_static("true"),
                         );
                     }
                 }
@@ -3710,7 +3713,7 @@ async fn handle_http2_request(
                         .map_err(|never| match never {})
                         .boxed(),
                 )
-                .unwrap();
+                .expect("Response::builder is infallible for Full<Bytes> body");
 
             for (key, value) in response.headers().iter() {
                 final_resp.headers_mut().insert(key.clone(), value.clone());
