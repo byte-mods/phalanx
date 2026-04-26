@@ -93,7 +93,9 @@ limitations under the License.
 
 ## What Is Built
 
-Every item below is fully implemented, compiles, and is covered by tests. **934 tests total (708 unit + 226 integration) — all passing.**
+Every item below is fully implemented, compiles, and is covered by tests. **938 tests total (712 unit + 226 integration) — all passing.**
+
+> **2026-04-27 update (later, batch 7):** Two more parity ports for HTTP/3. **URL rewriting** — the same `'rewrite` loop the HTTP/1 path uses now runs in `handle_h3_request` between WAF/cache (which still see the original client-sent path) and route resolution + auth (which see the rewritten path). Honours `Redirect`, `Rewritten{restart_routing: true/false}`, and `NoMatch` exactly as HTTP/1 does. **Wasm `OnResponseHeaders`** — between the backend's response headers being read and the response being sent over H3, the wasm plugin chain runs with a `WasmResponseContext`; returned headers are applied last so plugins can override HSTS or per-route `add_header` (matches HTTP/1's "last writer wins"). 4 new regression-guard tests bring H3 coverage to 34. 938 tests passing. Deferred: gRPC-Web body translation (needs HTTP/2 forwarding), WebTransport, P2 (Arc<str> API redesign).
 
 > **2026-04-27 update (later, batch 6):** HTTP/3 reaches near-full parity with HTTP/1. **OIDC session check** added to the H3 auth chain — `OidcSessionStore` is now threaded all the way through (`supervise_http3_listener` → `start_http3_proxy` → `serve_h3_connection` → `handle_h3_request` → `apply_h3_auth_chain`); the OIDC branch validates the session cookie, optionally enforces the `auth_oidc_issuer` match, and injects `X-Auth-Sub` / `X-Auth-Email` upstream. **W3C trace context** — every H3 request gets a fresh `traceparent` (16-byte trace, 8-byte span, `01` flags); injected on the forwarded request and threaded into the structured access log entry. **gRPC-Web CORS preflight** — `OPTIONS` with `Access-Control-Request-Headers` mentioning `grpc-web` short-circuits before WAF/auth and returns 204 with the standard CORS headers. 8 new tests bring H3 coverage to 30 (auth, trace context shape, preflight detection edge cases). 934 tests passing. Deferred: gRPC-Web body translation over H3 (needs HTTP/2 forwarding semantics), WebTransport (different protocol API).
 
@@ -497,7 +499,7 @@ curl --http3 https://example.com:8443/
 
 **Notes:** HTTP/3 runs entirely in parallel with the TCP listeners. Both protocols share the same upstream pool configuration.
 
-**Pipeline parity with HTTP/1:** The H3 path runs through rate limiting, zone connection limits, CAPTCHA, **gRPC-Web CORS preflight**, WAF (URL + body), GeoIP, response cache (route-level TTL via `proxy_cache_valid_secs`), route matching, **Basic / JWT / OAuth introspection / JWKS / OIDC session / `auth_request` authentication** (with claim and X-Auth-* header injection), sticky sessions, AI-driven backend selection, **W3C trace context (`traceparent`) injection on the forwarded request**, traffic mirroring, PreRoute / PreUpstream / PostUpstream / Log hooks, Wasm `OnRequestHeaders`, **HSTS** header injection, **gzip + brotli response compression** (negotiated against `Accept-Encoding`, brotli preferred), plus per-protocol and per-pool bandwidth tracking and structured access logs (with trace_id). Still HTTP/1+2 only: URL rewriting, gRPC-Web request/response body translation, WebTransport.
+**Pipeline parity with HTTP/1:** The H3 path runs through rate limiting, zone connection limits, CAPTCHA, **gRPC-Web CORS preflight**, WAF (URL + body), GeoIP, response cache (route-level TTL via `proxy_cache_valid_secs`), **URL rewriting** (`Redirect` / `Rewritten` / `NoMatch`), route matching, **Basic / JWT / OAuth introspection / JWKS / OIDC session / `auth_request` authentication** (with claim and X-Auth-* header injection), sticky sessions, AI-driven backend selection, **W3C trace context (`traceparent`) injection on the forwarded request**, traffic mirroring, PreRoute / PreUpstream / PostUpstream / Log hooks, **Wasm `OnRequestHeaders` + `OnResponseHeaders`**, **HSTS** header injection, **gzip + brotli response compression** (negotiated against `Accept-Encoding`, brotli preferred), plus per-protocol and per-pool bandwidth tracking and structured access logs (with trace_id). Still HTTP/1+2 only: gRPC-Web request/response body translation, WebTransport.
 
 **Performance:** The HTTP/3 forwarder reuses a single process-wide `reqwest::Client` (DNS resolver, TLS context, and HTTP/1 connection pool are built once), and only allocates the request mirror copy when a `mirror_pool` is configured.
 
@@ -2506,7 +2508,7 @@ All test scripts live in `scripts/`. No external test framework is required for 
 ### Rust Tests
 
 ```bash
-# All 934 tests (708 unit + 226 integration)
+# All 938 tests (712 unit + 226 integration)
 cargo test
 
 # Only unit tests

@@ -39,7 +39,7 @@ Auth chain, compression, metrics, mirroring, WebSocket, gRPC-Web NOT implemented
 **Status:** 🔧 **Partial** — significant chunks shipped, but the full surface
 (auth chain + compression + gRPC-Web + WebTransport) remains as its own focused PR.
 
-**Already shipped (batches 1-6):**
+**Already shipped (batches 1-7):**
 - Mirroring, hooks, sticky, AI routing, cache, GeoIP check, CAPTCHA, WAF
   (URL + body), zone limits, AccessLogger, BandwidthTracker (per-protocol +
   per-pool), Prometheus `http_requests_total` + `request_duration` histogram,
@@ -61,6 +61,20 @@ Auth chain, compression, metrics, mirroring, WebSocket, gRPC-Web NOT implemented
   collects the full upstream response before sending; streaming-aware
   compression remains a future polish).
 
+**Also shipped (batch 7):**
+- **URL rewriting** — full port of HTTP/1's `'rewrite` loop. Sits after
+  WAF/GeoIP/cache (so those see the original client-sent path) and
+  before route resolution + auth (so the rewritten path drives the rest
+  of the pipeline). Honours `Redirect`, `Rewritten{restart_routing:
+  true}` (continue loop), `Rewritten{restart_routing: false}` (break),
+  and `NoMatch`.
+- **Wasm `OnResponseHeaders`** — between the backend's headers being
+  read and the response being sent over H3, the wasm chain runs with a
+  `WasmResponseContext` (status + headers; body=None matches HTTP/1).
+  Returned headers are applied last so they can override HSTS or
+  per-route `add_header` directives, mirroring HTTP/1's "last writer
+  wins" insertion order.
+
 **Also shipped (batch 6):**
 - **W3C trace context** — every H3 request gets a fresh 16-byte trace +
   8-byte span pair; `traceparent: 00-{trace}-{span}-01` is injected on
@@ -76,9 +90,12 @@ Auth chain, compression, metrics, mirroring, WebSocket, gRPC-Web NOT implemented
 - gRPC-Web request/response **body translation** over HTTP/3 — preflight is
   handled, but the actual body translation (base64 grpc-web-text decode,
   trailer-frame appending) requires HTTP/2 forwarding semantics that the
-  current H3-→HTTP/1 forwarder doesn't have. Needs its own design pass.
+  current H3→HTTP/1 forwarder doesn't have. Needs its own design pass.
 - WebTransport (HTTP/3 native bidi streams) — different protocol API
   entirely, not a port.
+- **P2 (227+ String clones)** — still requires the `HookContext` /
+  `WasmRequestContext` / `AccessLogEntry` API redesign to accept
+  `Arc<str>`. Tracked.
 
 
 

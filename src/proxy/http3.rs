@@ -320,7 +320,7 @@ async fn handle_h3_request(
     bandwidth: Arc<crate::telemetry::bandwidth::BandwidthTracker>,
     oidc_sessions: crate::auth::oidc::OidcSessionStore,
 ) {
-    let path = req.uri().path().to_string();
+    let mut path = req.uri().path().to_string();
     let query = req.uri().query().map(String::from);
     let method = req.method().clone();
     let host = req
@@ -557,7 +557,69 @@ async fn handle_h3_request(
         }
     }
 
-    // ── Route matching — longest-prefix match ──
+    // ── URL rewriting (mirrors HTTP/1 'rewrite loop at proxy/mod.rs:1083) ──
+    // Sits after WAF / GeoIP / cache so those see the original client-sent
+    // path, but before final route resolution + auth so the rewritten path
+    // drives auth, backend selection, hook contexts, and forwarding.
+    'rewrite: loop {
+        // Pick the best-matching route for the *current* path.
+        let mut best_match: Option<&crate::config::RouteConfig> = None;
+        let mut best_len = 0usize;
+        for (r_path, r_cfg) in &app_config.routes {
+            if path.starts_with(r_path.as_str()) && r_path.len() > best_len {
+                best_match = Some(r_cfg);
+                best_len = r_path.len();
+            }
+        }
+        if let Some(r_cfg) = best_match {
+            if !r_cfg.rewrite_rules.is_empty() {
+                let rules = match crate::proxy::rewrite::compile_rules(&r_cfg.rewrite_rules) {
+                    Ok(r) => r,
+                    Err(e) => {
+                        error!("HTTP/3 invalid rewrite rule configuration: {}", e);
+                        send_h3_error(&mut stream, StatusCode::INTERNAL_SERVER_ERROR).await;
+                        return;
+                    }
+                };
+                match crate::proxy::rewrite::apply_rewrites(&rules, &path) {
+                    crate::proxy::rewrite::RewriteResult::Redirect { status, location } => {
+                        debug!("HTTP/3 rewrite redirect {} -> {} ({})", path, location, status);
+                        let location_hv = location
+                            .parse()
+                            .unwrap_or_else(|_| hyper::header::HeaderValue::from_static("/"));
+                        send_h3_response_with_header(
+                            &mut stream,
+                            status,
+                            hyper::header::LOCATION,
+                            location_hv,
+                        )
+                        .await;
+                        return;
+                    }
+                    crate::proxy::rewrite::RewriteResult::Rewritten {
+                        new_uri,
+                        restart_routing: true,
+                    } => {
+                        debug!("HTTP/3 rewrite (last): {} -> {}", path, new_uri);
+                        path = new_uri;
+                        continue 'rewrite;
+                    }
+                    crate::proxy::rewrite::RewriteResult::Rewritten {
+                        new_uri,
+                        restart_routing: false,
+                    } => {
+                        debug!("HTTP/3 rewrite (break): {} -> {}", path, new_uri);
+                        path = new_uri;
+                        break 'rewrite;
+                    }
+                    crate::proxy::rewrite::RewriteResult::NoMatch => {}
+                }
+            }
+        }
+        break 'rewrite;
+    }
+
+    // ── Route matching — longest-prefix match (uses possibly-rewritten path) ──
     let route = {
         let mut best: Option<(String, crate::config::RouteConfig)> = None;
         let mut best_len = 0usize;
@@ -842,6 +904,27 @@ async fn handle_h3_request(
         .unwrap_or("application/octet-stream")
         .to_string();
     let backend_resp_headers = backend_resp.headers().clone();
+
+    // ── Wasm OnResponseHeaders ───────────────────────────────────────────
+    // Mirrors the HTTP/1 path at proxy/mod.rs:2416. Plugins may append /
+    // overwrite response headers (e.g. CSP, custom audit tags). Body is
+    // not exposed at this phase (matches HTTP/1 — body is None).
+    let mut wasm_response_extra_headers: Vec<(String, String)> = Vec::new();
+    if wasm_plugins.plugin_count() > 0 {
+        let wasm_resp_ctx = crate::wasm::WasmResponseContext {
+            status_code: status_u16,
+            headers: backend_resp_headers
+                .iter()
+                .filter_map(|(k, v)| v.to_str().ok().map(|v| (k.to_string(), v.to_string())))
+                .collect(),
+            body: None,
+        };
+        let result = wasm_plugins.execute_response_headers(&wasm_resp_ctx);
+        if let Some(hdrs) = result.headers {
+            wasm_response_extra_headers = hdrs.into_iter().collect();
+        }
+    }
+
     let body_bytes = match backend_resp.bytes().await {
         Ok(b) => b,
         Err(e) => {
@@ -978,6 +1061,18 @@ async fn handle_h3_request(
             hyper::header::HeaderValue::from_str(&format!("max-age={}", max_age))
         {
             response = response.header(hyper::header::STRICT_TRANSPORT_SECURITY, hv);
+        }
+    }
+
+    // Wasm-injected response headers (from OnResponseHeaders phase). Inserted
+    // after HSTS so a plugin can override the HSTS value if it wants to,
+    // matching HTTP/1's "last writer wins" header insertion order.
+    for (k, v) in &wasm_response_extra_headers {
+        if let (Ok(hk), Ok(hv)) = (
+            hyper::header::HeaderName::from_bytes(k.as_bytes()),
+            hyper::header::HeaderValue::from_str(v),
+        ) {
+            response = response.header(hk, hv);
         }
     }
 
@@ -2106,6 +2201,93 @@ mod tests {
             apply_h3_auth_chain(route.as_ref(), &cfg, &h, &hyper::Method::GET, "/p", &store)
                 .await;
         assert!(matches!(out, H3AuthOutcome::Denied { .. }));
+    }
+
+    // ── URL rewrite tests (regression guard for the H3 rewrite loop) ────
+
+    /// The H3 rewrite loop calls `crate::proxy::rewrite::apply_rewrites` with
+    /// rules compiled by `compile_rules`. This test exercises that pair the
+    /// same way `handle_h3_request` does. If the rewrite module's API or the
+    /// `RewriteResult` enum shape ever changes, this catches it before
+    /// regressing the H3 path.
+    #[test]
+    fn test_h3_rewrite_loop_helpers_apply_a_simple_regex() {
+        use crate::proxy::rewrite::{apply_rewrites, compile_rules, RewriteResult};
+        // (pattern, replacement, flag) — `last` means restart routing.
+        let rules =
+            compile_rules(&[("^/old(.*)$".to_string(), "/new$1".to_string(), "last".to_string())])
+                .expect("rule should compile");
+        let outcome = apply_rewrites(&rules, "/old/profile");
+        match outcome {
+            RewriteResult::Rewritten { new_uri, restart_routing } => {
+                assert_eq!(new_uri, "/new/profile");
+                assert!(restart_routing, "`last` flag must request a re-match");
+            }
+            other => panic!("expected Rewritten, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_h3_rewrite_loop_helpers_yield_redirect() {
+        use crate::proxy::rewrite::{apply_rewrites, compile_rules, RewriteResult};
+        let rules = compile_rules(&[(
+            "^/legacy(.*)$".to_string(),
+            "https://new.example.com$1".to_string(),
+            "permanent".to_string(),
+        )])
+        .expect("rule should compile");
+        let outcome = apply_rewrites(&rules, "/legacy/x");
+        match outcome {
+            RewriteResult::Redirect { status, location } => {
+                assert_eq!(status, hyper::StatusCode::MOVED_PERMANENTLY);
+                assert_eq!(location, "https://new.example.com/x");
+            }
+            other => panic!("expected Redirect, got {:?}", other),
+        }
+    }
+
+    /// Rules that don't match leave the path alone — the H3 loop's NoMatch
+    /// branch breaks out without modifying `path`.
+    #[test]
+    fn test_h3_rewrite_loop_no_match_leaves_path_unchanged() {
+        use crate::proxy::rewrite::{apply_rewrites, compile_rules, RewriteResult};
+        let rules = compile_rules(&[(
+            "^/match-me$".to_string(),
+            "/somewhere".to_string(),
+            "break".to_string(),
+        )])
+        .expect("rule should compile");
+        assert!(matches!(
+            apply_rewrites(&rules, "/something-else"),
+            RewriteResult::NoMatch
+        ));
+    }
+
+    // ── Wasm OnResponseHeaders shape test (regression guard) ─────────────
+
+    /// The H3 path constructs a `WasmResponseContext` with `body: None` (matches
+    /// HTTP/1) and feeds it to `execute_response_headers`. If the result type's
+    /// shape changes (e.g. `headers` becomes non-Optional), this catches it.
+    #[test]
+    fn test_h3_wasm_response_ctx_shape_and_default_pipeline() {
+        let ctx = crate::wasm::WasmResponseContext {
+            status_code: 200,
+            headers: vec![("content-type".to_string(), "text/html".to_string())]
+                .into_iter()
+                .collect(),
+            body: None,
+        };
+        // Build a manager with NO plugins — the H3 short-circuits via
+        // `plugin_count() > 0`, but we still verify the manager round-trips
+        // an empty response cleanly so the surrounding code can't panic.
+        let mgr = crate::wasm::WasmPluginManager::new();
+        assert_eq!(mgr.plugin_count(), 0);
+        let result = mgr.execute_response_headers(&ctx);
+        // No plugins → no header overrides — result.headers should be None or empty.
+        assert!(
+            result.headers.as_ref().map(|h| h.is_empty()).unwrap_or(true),
+            "empty plugin chain should not synthesize headers"
+        );
     }
 
     // ── W3C trace context tests ──────────────────────────────────────────
