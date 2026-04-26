@@ -93,7 +93,9 @@ limitations under the License.
 
 ## What Is Built
 
-Every item below is fully implemented, compiles, and is covered by tests. **748 tests total (524 unit + 224 integration) — all passing.**
+Every item below is fully implemented, compiles, and is covered by tests. **908 tests total (682 unit + 226 integration) — all passing.**
+
+> **2026-04-27 update:** HTTP/3 pipeline parity expanded — `AccessLogger` and `BandwidthTracker` (per-protocol `"http3"` and per-pool, in/out bytes, request counter) are now wired into `handle_h3_request`. The HTTP/3 forwarder shares a single process-wide `reqwest::Client` (DNS resolver, TLS context, and HTTP/1 keepalive pool are built once instead of per-request), and the mirror request payload is only cloned when a `mirror_pool` is configured. Added `scripts/smoke_test.py` — an 8-check, stdlib-only end-to-end smoke harness for post-deploy verification.
 
 > **2026-03-30 update:** All Phase 1, Phase 2, and Phase 3 features are now complete. New additions: CAPTCHA bot challenge integration (hCaptcha/Turnstile/reCAPTCHA), SWIM-style gossip protocol for peer-to-peer cluster state, Proxy-Wasm plugin extensibility framework, Kubernetes Ingress & Gateway API controller, and Global Anycast / GSLB with geographic, latency-based, and weighted routing policies.
 
@@ -110,7 +112,7 @@ Every item below is fully implemented, compiles, and is covered by tests. **748 
 | **Routing** | Prefix routing, URL rewrite engine, static files, real client IP extraction (XFF / X-Real-IP / PROXY protocol v1/v2) |
 | **Traffic Shaping** | Traffic mirroring/tee (fully wired), consistent-hash splitting, sticky sessions |
 | **Resilience** | Circuit breaker (3-state, exponential backoff), slow-start ramp (linear weight recovery), active + passive health checks, backend request queue |
-| **Performance** | Zero-copy TCP proxy via Linux `splice(2)`; fallback `copy_bidirectional` on non-Linux; L2 disk cache with stale-while-revalidate |
+| **Performance** | Zero-copy TCP proxy via Linux `splice(2)`; fallback `copy_bidirectional` on non-Linux; L2 disk cache with stale-while-revalidate; HTTP/3 forwarder reuses one process-wide `reqwest::Client` (DNS, TLS, keepalive built once); mirror payload cloned only when a `mirror_pool` is configured |
 | **Dynamic Security** | Keyval-backed runtime IP bans (TTL-based); WAF auto-ban feeds back into keyval; external systems can update ban list without restart |
 | **Observability** | Prometheus metrics, OpenTelemetry OTLP traces with W3C `traceparent` injection, structured access logs, admin dashboard |
 | **Bandwidth Monitoring** | Per-protocol atomic counters (bytes_in, bytes_out, requests, active_connections) for HTTP1/2/3, WebSocket, gRPC, TCP, UDP, WebRTC; sorted utilization snapshots; configurable per-protocol thresholds |
