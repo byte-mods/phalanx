@@ -1,6 +1,7 @@
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use tracing::{debug, info};
 
 pub mod rhai_engine;
@@ -114,6 +115,22 @@ pub struct HookEngine {
     /// Wrapped in RwLock for interior mutability to support SIGHUP reload
     /// (re-registering Rhai hooks without rebuilding the entire engine).
     hooks: RwLock<HashMap<HookPhase, Vec<Hook>>>,
+    /// Lock-free per-phase presence bitmap. Indexed by `phase_index()`.
+    /// Read on every request via `has_hooks()` to skip building a HookContext
+    /// when nothing is registered — turns 4 RwLock reads + HashMap lookups
+    /// per request into 4 relaxed atomic loads.
+    phase_present: [AtomicBool; 4],
+}
+
+/// Maps a `HookPhase` variant to its slot in `phase_present`.
+#[inline]
+fn phase_index(phase: HookPhase) -> usize {
+    match phase {
+        HookPhase::PreRoute => 0,
+        HookPhase::PreUpstream => 1,
+        HookPhase::PostUpstream => 2,
+        HookPhase::Log => 3,
+    }
 }
 
 impl HookEngine {
@@ -121,6 +138,12 @@ impl HookEngine {
     pub fn new() -> Self {
         Self {
             hooks: RwLock::new(HashMap::new()),
+            phase_present: [
+                AtomicBool::new(false),
+                AtomicBool::new(false),
+                AtomicBool::new(false),
+                AtomicBool::new(false),
+            ],
         }
     }
 
@@ -134,6 +157,10 @@ impl HookEngine {
         let phase_hooks = hooks.entry(phase).or_insert_with(Vec::new);
         phase_hooks.push(hook);
         phase_hooks.sort_by_key(|h| h.priority);
+        // Mark this phase as populated. Release pairs with the Acquire load
+        // in has_hooks() so a request-thread that observes `true` is
+        // guaranteed to see the pushed Hook in the map under the read lock.
+        self.phase_present[phase_index(phase)].store(true, Ordering::Release);
     }
 
     /// Executes all hooks for a given phase in priority order, collecting results.
@@ -164,9 +191,13 @@ impl HookEngine {
     }
 
     /// Returns whether any hooks are registered for the given phase.
+    ///
+    /// Hot path: this is called on every request, once per phase. It reads
+    /// a single relaxed-but-acquire atomic — no `RwLock`, no `HashMap` lookup
+    /// — so the common case (no hooks configured) costs ~1 ns instead of
+    /// taking a parking_lot read lock four times per request.
     pub fn has_hooks(&self, phase: HookPhase) -> bool {
-        let hooks = self.hooks.read();
-        hooks.get(&phase).map(|h| !h.is_empty()).unwrap_or(false)
+        self.phase_present[phase_index(phase)].load(Ordering::Acquire)
     }
 
     /// Removes all Rhai hooks (identified by name prefix "rhai:") and re-registers
@@ -176,14 +207,20 @@ impl HookEngine {
     pub fn reload_rhai_script(&self, script_path: &str) {
         match rhai_engine::RhaiHookHandler::from_file(script_path) {
             Ok(handler) => {
-                // Remove existing Rhai hooks
+                // Remove existing Rhai hooks, then recompute the per-phase
+                // presence bits — `retain` may have emptied a phase entirely.
                 {
                     let mut hooks = self.hooks.write();
                     for phase_hooks in hooks.values_mut() {
                         phase_hooks.retain(|h| !h.name.starts_with("rhai:"));
                     }
+                    for (phase, phase_hooks) in hooks.iter() {
+                        self.phase_present[phase_index(*phase)]
+                            .store(!phase_hooks.is_empty(), Ordering::Release);
+                    }
                 }
-                // Register the new Rhai handler for all 4 phases
+                // Register the new Rhai handler for all 4 phases. `register()`
+                // re-sets the corresponding presence bit.
                 let handler = std::sync::Arc::new(handler);
                 for phase in [HookPhase::PreRoute, HookPhase::PreUpstream, HookPhase::PostUpstream, HookPhase::Log] {
                     self.register(Hook {
@@ -498,5 +535,71 @@ mod tests {
 
         assert!(engine.has_hooks(HookPhase::PreRoute));
         assert!(!engine.has_hooks(HookPhase::PreUpstream));
+    }
+
+    /// Validates the atomic phase-present bitmap that backs `has_hooks()`:
+    /// - registration on one phase must not flip another phase's bit
+    /// - all four phases must be independently addressable
+    /// Regression guard for the P6 perf fix (avoids the per-request RwLock).
+    #[test]
+    fn test_has_hooks_atomic_per_phase_isolation() {
+        let engine = HookEngine::new();
+        for p in [
+            HookPhase::PreRoute,
+            HookPhase::PreUpstream,
+            HookPhase::PostUpstream,
+            HookPhase::Log,
+        ] {
+            assert!(!engine.has_hooks(p), "fresh engine should report no hooks");
+        }
+
+        let mut h = HashMap::new();
+        h.insert("k".into(), "v".into());
+        engine.register(Hook {
+            name: "post".into(),
+            phase: HookPhase::PostUpstream,
+            priority: 0,
+            handler: Box::new(HeaderInjectionHook::new(h)),
+        });
+
+        assert!(engine.has_hooks(HookPhase::PostUpstream));
+        // The other three slots must remain false — the bit-array indexing
+        // must not collide.
+        assert!(!engine.has_hooks(HookPhase::PreRoute));
+        assert!(!engine.has_hooks(HookPhase::PreUpstream));
+        assert!(!engine.has_hooks(HookPhase::Log));
+    }
+
+    /// Hot-path correctness: many concurrent readers must all observe the
+    /// post-register state without deadlock or torn reads. This is what the
+    /// per-request `has_hooks()` calls look like at runtime.
+    #[test]
+    fn test_has_hooks_concurrent_readers() {
+        use std::sync::Arc;
+        use std::thread;
+
+        let engine = Arc::new(HookEngine::new());
+        let mut h = HashMap::new();
+        h.insert("k".into(), "v".into());
+        engine.register(Hook {
+            name: "log".into(),
+            phase: HookPhase::Log,
+            priority: 0,
+            handler: Box::new(HeaderInjectionHook::new(h)),
+        });
+
+        let mut handles = Vec::new();
+        for _ in 0..8 {
+            let e = Arc::clone(&engine);
+            handles.push(thread::spawn(move || {
+                for _ in 0..10_000 {
+                    assert!(e.has_hooks(HookPhase::Log));
+                    assert!(!e.has_hooks(HookPhase::PreRoute));
+                }
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
     }
 }

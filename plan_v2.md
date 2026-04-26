@@ -1,6 +1,6 @@
 # Phalanx Gap Fix Plan v2
 
-Last updated: 2026-04-22
+Last updated: 2026-04-27
 
 ## Status Legend
 - ⬜ Not started
@@ -13,8 +13,8 @@ Last updated: 2026-04-22
 ## Audit Summary
 
 **Source:** Full codebase analysis + graphify knowledge graph (1939 nodes, 40 communities)
-**Tests:** 226 tests passing
-**Lines:** ~31,500 lines across 70+ files
+**Tests:** 911 tests passing (685 unit + 226 integration)
+**Lines:** ~34,000 lines across 64 files
 
 ---
 
@@ -110,15 +110,12 @@ Per-key locks cause contention under high throughput.
 **Problem:** `SystemTime::now()` in `src/routing/mod.rs:394-398` for Random LB.
 System call every request = latency jitter.
 
-**Fix:**
-```rust
-// CURRENT (slow):
-let ts = std::time::SystemTime::now().duration_since(UNIX_EPOCH)...
-// FIX:
-use rand::rngs::SmallRng;  // per-thread, no syscall
-```
+**Fix:** Use `rand::random::<u32>()` (thread-local ChaCha RNG, ~3 ns user-space)
+instead of `SystemTime::now().subsec_nanos()`. `rand::rng()` is already a
+dependency, no need for `SmallRng`.
 
-**Status:** ⬜ Not started
+**Status:** ✅ Done (2026-04-27) — `src/routing/mod.rs:393-399`. Regression
+test `test_random_lb_visits_all_backends` checks 4-way distribution.
 
 ### P5: OIDC Session Cleanup O(n) Scan
 **Problem:** `src/auth/oidc.rs` — cleanup iterates all sessions to find expired.
@@ -131,9 +128,14 @@ No TTL index.
 **Problem:** Every request calls `hook_engine.has_hooks(PreRoute)` which does:
 RwLock read + HashMap lookup per phase.
 
-**File:** `src/scripting/mod.rs:123`
-**Fix:** Cache phase count in atomic or use bitflags.
-**Status:** ⬜ Not started
+**File:** `src/scripting/mod.rs:167`
+**Fix:** Added `phase_present: [AtomicBool; 4]` field, indexed by `phase_index()`.
+`register()` and `reload_rhai_script()` update it with Release; `has_hooks()`
+loads with Acquire — no `RwLock`, no `HashMap` lookup on hot path.
+**Status:** ✅ Done (2026-04-27) — regression tests
+`test_has_hooks_atomic_per_phase_isolation` and
+`test_has_hooks_concurrent_readers` (8 threads × 10k iters) cover correctness
+and absence of torn reads.
 
 ---
 
@@ -182,7 +184,15 @@ Phase handling may not match HTTP/1 behavior.
 **Problem:** `src/proxy/http3.rs:612-615` creates a new HTTP client per request.
 Connection pooling completely broken for HTTP/3 — no keepalive reuse.
 
-**Status:** ⬜ Not started
+**Fix:** Process-wide `OnceLock<reqwest::Client>` via `shared_upstream_client()`
+helper. DNS resolver, TLS context, and HTTP/1 keepalive pool are built once
+at first request and reused across all subsequent HTTP/3 → HTTP/1 forwards.
+Mirror payload (req headers + body) is now only cloned when `mirror_pool` is
+configured — eliminates an unconditional allocation in the hot path.
+
+**Status:** ✅ Done (2026-04-27, commit 64c245b) — regression test
+`test_shared_upstream_client_is_singleton` asserts pointer equality across
+calls.
 
 ### C5: ConsistentHash Rebuilds Ring on Every Call
 **Problem:** `src/routing/mod.rs:473-486` rebuilds virtual node ring per request.
@@ -194,7 +204,16 @@ For 4 backends with weight 10 = 6400 virtual nodes sorted per request.
 **Problem:** `src/proxy/mod.rs:4044,4048,4079,4083` can panic on invalid MIME types.
 Serving arbitrary paths with invalid content-type chars causes crash.
 
-**Status:** ⬜ Not started
+**Fix:** All four `HeaderValue::from_str(&mime_type).unwrap()` and
+`HeaderValue::from_str(&file_size.to_string()).unwrap()` calls now use
+`.unwrap_or_else(...)` with safe fallbacks (`application/octet-stream` and
+`"0"`). Audited the rest of `proxy/mod.rs`: the remaining `.unwrap()` sites
+are either inside the `#[cfg(test)]` module or on infallible operations
+(`Response::builder().body()` with `Full<Bytes>`); fixed one additional
+`config-derived realm parse` panic at the WWW-Authenticate header
+construction site (line 2880).
+
+**Status:** ✅ Done (2026-04-27, commits 64c245b + this batch).
 
 ### C7: 503 Responses Panic on Missing Retry-After Header
 **Problem:** `src/proxy/mod.rs:4185` assumes Retry-After header exists.
@@ -212,13 +231,25 @@ Not optimal for in-memory cache with 100K+ ops/sec.
 **Problem:** No `bandwidth.inc_requests()` or `bandwidth.add_out()` calls in H3.
 Metrics will underreport HTTP/3 traffic.
 
-**Status:** ⬜ Not started
+**Fix:** `BandwidthTracker` threaded into `handle_h3_request`.
+`bandwidth.protocol("http3").inc_requests()` is called at request entry,
+`add_in()` after body read, `add_out()` after response body is sent. Mirrored
+to the per-pool counter via `bandwidth.pool(&pool_name)`.
+
+**Status:** ✅ Done (2026-04-27, commit 64c245b). Regression tests
+`test_bandwidth_http3_protocol_counters` and
+`test_bandwidth_pool_counters_isolated_per_pool`.
 
 ### P9: HTTP/3 Missing Structured Access Logging
 **Problem:** No `access_logger.log()` call in H3.
 Access logs missing for all HTTP/3 requests.
 
-**Status:** ⬜ Not started
+**Fix:** `AccessLogger` threaded into `handle_h3_request`. After response is
+sent, `access_logger.log(AccessLogEntry { … })` records timestamp, client IP,
+method, path, status, latency, backend, pool, bytes_sent, referer, user_agent
+— same shape as the HTTP/1 path.
+
+**Status:** ✅ Done (2026-04-27, commit 64c245b).
 
 ### R6: HTTP/3 Missing HSTS Header Injection
 **Problem:** No HSTS injection in H3 handler.

@@ -2873,12 +2873,16 @@ async fn handle_http2_request(
                             .boxed(),
                     );
                     *resp.status_mut() = status;
-                    resp.headers_mut().insert(
-                        hyper::header::WWW_AUTHENTICATE,
-                        crate::auth::basic::www_authenticate_header(realm)
-                            .parse()
-                            .unwrap(),
-                    );
+                    // realm is user-supplied config; parse can fail if it
+                    // contains control bytes. Fall back to a fixed valid
+                    // header instead of panicking.
+                    let www_auth = crate::auth::basic::www_authenticate_header(realm)
+                        .parse()
+                        .unwrap_or_else(|_| {
+                            hyper::header::HeaderValue::from_static("Basic realm=\"protected\"")
+                        });
+                    resp.headers_mut()
+                        .insert(hyper::header::WWW_AUTHENTICATE, www_auth);
                     return Ok(resp);
                 }
             }

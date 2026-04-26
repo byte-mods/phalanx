@@ -93,7 +93,9 @@ limitations under the License.
 
 ## What Is Built
 
-Every item below is fully implemented, compiles, and is covered by tests. **908 tests total (682 unit + 226 integration) — all passing.**
+Every item below is fully implemented, compiles, and is covered by tests. **911 tests total (685 unit + 226 integration) — all passing.**
+
+> **2026-04-27 update (later, batch 2):** Two more bare-metal-class hot-path wins. (1) Random LB algorithm no longer makes a `SystemTime::now()` syscall per backend pick — it now uses the thread-local ChaCha RNG (`rand::random`), turning a ~30 ns vsyscall into a ~3 ns user-space pull. (2) `HookEngine::has_hooks(phase)` is now lock-free: the per-phase populated-bit is held in `[AtomicBool; 4]` so the hot path no longer takes a `parking_lot::RwLock` four times per request when no hooks are configured. Defense-in-depth: removed an additional `.unwrap()` panic site at the WWW-Authenticate header construction path (config-derived realm). 911 tests passing.
 
 > **2026-04-27 update:** HTTP/3 pipeline parity expanded — `AccessLogger` and `BandwidthTracker` (per-protocol `"http3"` and per-pool, in/out bytes, request counter) are now wired into `handle_h3_request`. The HTTP/3 forwarder shares a single process-wide `reqwest::Client` (DNS resolver, TLS context, and HTTP/1 keepalive pool are built once instead of per-request), and the mirror request payload is only cloned when a `mirror_pool` is configured. Added `scripts/smoke_test.py` — an 8-check, stdlib-only end-to-end smoke harness for post-deploy verification.
 
@@ -112,7 +114,7 @@ Every item below is fully implemented, compiles, and is covered by tests. **908 
 | **Routing** | Prefix routing, URL rewrite engine, static files, real client IP extraction (XFF / X-Real-IP / PROXY protocol v1/v2) |
 | **Traffic Shaping** | Traffic mirroring/tee (fully wired), consistent-hash splitting, sticky sessions |
 | **Resilience** | Circuit breaker (3-state, exponential backoff), slow-start ramp (linear weight recovery), active + passive health checks, backend request queue |
-| **Performance** | Zero-copy TCP proxy via Linux `splice(2)`; fallback `copy_bidirectional` on non-Linux; L2 disk cache with stale-while-revalidate; HTTP/3 forwarder reuses one process-wide `reqwest::Client` (DNS, TLS, keepalive built once); mirror payload cloned only when a `mirror_pool` is configured |
+| **Performance** | Zero-copy TCP proxy via Linux `splice(2)`; fallback `copy_bidirectional` on non-Linux; L2 disk cache with stale-while-revalidate; HTTP/3 forwarder reuses one process-wide `reqwest::Client` (DNS, TLS, keepalive built once); mirror payload cloned only when a `mirror_pool` is configured; Random LB uses thread-local ChaCha RNG (no `SystemTime::now()` syscall); `HookEngine::has_hooks(phase)` is lock-free via `[AtomicBool; 4]` |
 | **Dynamic Security** | Keyval-backed runtime IP bans (TTL-based); WAF auto-ban feeds back into keyval; external systems can update ban list without restart |
 | **Observability** | Prometheus metrics, OpenTelemetry OTLP traces with W3C `traceparent` injection, structured access logs, admin dashboard |
 | **Bandwidth Monitoring** | Per-protocol atomic counters (bytes_in, bytes_out, requests, active_connections) for HTTP1/2/3, WebSocket, gRPC, TCP, UDP, WebRTC; sorted utilization snapshots; configurable per-protocol thresholds |
@@ -215,7 +217,7 @@ cargo build --release
 # Debug build
 cargo build
 
-# Run tests (908 total: 682 unit + 226 integration — all passing)
+# Run tests (911 total: 685 unit + 226 integration — all passing)
 cargo test
 
 # Run with default config
@@ -2496,7 +2498,7 @@ All test scripts live in `scripts/`. No external test framework is required for 
 ### Rust Tests
 
 ```bash
-# All 908 tests (682 unit + 226 integration)
+# All 911 tests (685 unit + 226 integration)
 cargo test
 
 # Only unit tests

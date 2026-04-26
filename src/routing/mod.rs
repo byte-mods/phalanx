@@ -388,14 +388,11 @@ impl UpstreamPool {
                 .min_by_key(|b| b.active_connections.load(Ordering::Relaxed)),
 
             // ── Algorithm 4: Random ──────────────────────────────────
-            // Uses sub-second nanosecond entropy for lightweight random selection.
-            // Good enough for load spreading without the overhead of a full RNG.
+            // Uses the thread-local RNG. Avoids the per-request `SystemTime::now()`
+            // syscall (≈30 ns vsyscall on Linux) — `rand::random::<u32>()` is a
+            // user-space ChaCha thread-local pull (~3 ns).
             LoadBalancingAlgorithm::Random => {
-                let ts = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .subsec_nanos();
-                let idx = (ts as usize) % healthy.len();
+                let idx = (rand::random::<u32>() as usize) % healthy.len();
                 Some(Arc::clone(&healthy[idx]))
             }
 
@@ -1198,5 +1195,40 @@ mod tests {
             let backend = pool.get_next_backend(Some(&ip), None).unwrap();
             assert_eq!(backend.config.address, backend1.config.address);
         }
+    }
+
+    /// Distribution check for the Random LB algorithm.
+    ///
+    /// The previous implementation used `SystemTime::now().subsec_nanos()` as
+    /// the entropy source, which under tight loops degenerates to bursts of
+    /// adjacent indices (back-to-back samples often share the same nanosecond
+    /// bucket modulo backend count). The fix uses the thread-local RNG.
+    /// This test guards against any future regression that re-introduces
+    /// a fixed-output entropy source.
+    #[test]
+    fn test_random_lb_visits_all_backends() {
+        let pool_config = UpstreamPoolConfig {
+            algorithm: LoadBalancingAlgorithm::Random,
+            backends: vec![
+                BackendConfig { address: "10.0.0.1:8080".to_string(), ..Default::default() },
+                BackendConfig { address: "10.0.0.2:8080".to_string(), ..Default::default() },
+                BackendConfig { address: "10.0.0.3:8080".to_string(), ..Default::default() },
+                BackendConfig { address: "10.0.0.4:8080".to_string(), ..Default::default() },
+            ],
+            keepalive: 0,
+            srv_discover: None,
+            health_check_interval_secs: 5,
+            health_check_timeout_secs: 3,
+        };
+        let pool = UpstreamPool::new(&pool_config);
+
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..1_000 {
+            let b = pool.get_next_backend(None, None).unwrap();
+            seen.insert(b.config.address.clone());
+        }
+        // 1000 picks across 4 backends — chance of missing one is ≈ 4 * (3/4)^1000,
+        // i.e. astronomically small. If this ever flakes, the RNG is broken.
+        assert_eq!(seen.len(), 4, "Random LB must hit every backend; saw {seen:?}");
     }
 }
