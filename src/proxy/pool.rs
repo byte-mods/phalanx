@@ -13,8 +13,11 @@
 use dashmap::DashMap;
 use std::collections::HashMap;
 use std::collections::VecDeque;
+use std::pin::Pin;
 use std::sync::Arc;
+use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
+use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::TcpStream;
 use tracing::debug;
 
@@ -93,6 +96,16 @@ impl ConnectionPool {
     /// The connection is only kept if pooling is enabled and the per-backend
     /// queue has not yet reached `max_idle`. Drops the connection otherwise.
     pub async fn release(&self, addr: String, conn: TcpStream) {
+        self.release_sync(addr, conn);
+    }
+
+    /// Synchronous release path used from `Drop` (where we cannot `.await`).
+    ///
+    /// All operations are sync since the DashMap conversion in batch 3 —
+    /// `release()` is now an async wrapper that calls this. Splitting them
+    /// keeps the public async API stable for any external caller that was
+    /// already awaiting it.
+    pub fn release_sync(&self, addr: String, conn: TcpStream) {
         if self.max_idle == 0 {
             return; // Pooling disabled — drop immediately.
         }
@@ -106,6 +119,20 @@ impl ConnectionPool {
         // If queue is full, the connection is dropped here (RAII).
     }
 
+    /// Acquire a connection wrapped in a `PooledStream` that automatically
+    /// returns it to the pool on `Drop`. This is the closes the C3 gap from
+    /// `plan_v2.md` — previously the bare `TcpStream` returned by `acquire()`
+    /// got moved into Hyper, which owns it until the connection ends, so
+    /// `release()` was never called and idle queues stayed empty.
+    pub async fn acquire_pooled(self: &Arc<Self>, addr: &str) -> std::io::Result<PooledStream> {
+        let stream = self.acquire(addr).await?;
+        Ok(PooledStream {
+            stream: Some(stream),
+            addr: addr.to_string(),
+            pool: Arc::clone(self),
+        })
+    }
+
     /// Returns a reference to the shared idle map (for metrics / admin API).
     pub async fn idle_counts(&self) -> HashMap<String, usize> {
         self.idle
@@ -114,6 +141,108 @@ impl ConnectionPool {
             .collect()
     }
 
+}
+
+/// RAII wrapper around a pooled `TcpStream`. Implements `AsyncRead` and
+/// `AsyncWrite` by delegating to the inner stream so it's a drop-in
+/// replacement; on `Drop`, calls `pool.release_sync(addr, stream)` so the
+/// connection returns to the per-backend idle queue instead of being closed.
+///
+/// This is the fix for plan_v2's C3: previously `acquire()` returned a bare
+/// `TcpStream` that Hyper consumed; nothing ever called `release()`. Now
+/// Hyper owns a `PooledStream`, and when Hyper drops it (connection idle
+/// timeout, error, or shutdown) the `Drop` impl re-pools the stream.
+///
+/// Uses `Option<TcpStream>` because `Drop::drop` only gives us `&mut self`
+/// but `release_sync` needs to **move** the stream out — `.take()` lets us
+/// do that exactly once.
+pub struct PooledStream {
+    stream: Option<TcpStream>,
+    addr: String,
+    pool: Arc<ConnectionPool>,
+}
+
+impl PooledStream {
+    /// Address this stream connects to. Useful for diagnostics + tests.
+    pub fn addr(&self) -> &str {
+        &self.addr
+    }
+
+    /// Move the inner `TcpStream` out of this wrapper, suppressing the
+    /// auto-release in `Drop`. Used by the proxy on the happy-path
+    /// post-response handler when it wants to make an explicit re-pooling
+    /// decision (e.g. discard the connection because there's leftover
+    /// read-buffer data that would corrupt the next request).
+    ///
+    /// After calling, dropping the wrapper is a no-op.
+    pub fn take_stream(mut self) -> TcpStream {
+        self.stream
+            .take()
+            .expect("PooledStream::take_stream called twice")
+    }
+}
+
+impl AsyncRead for PooledStream {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        let inner = self
+            .get_mut()
+            .stream
+            .as_mut()
+            .expect("PooledStream used after Drop began");
+        Pin::new(inner).poll_read(cx, buf)
+    }
+}
+
+impl AsyncWrite for PooledStream {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        let inner = self
+            .get_mut()
+            .stream
+            .as_mut()
+            .expect("PooledStream used after Drop began");
+        Pin::new(inner).poll_write(cx, buf)
+    }
+    fn poll_flush(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        let inner = self
+            .get_mut()
+            .stream
+            .as_mut()
+            .expect("PooledStream used after Drop began");
+        Pin::new(inner).poll_flush(cx)
+    }
+    fn poll_shutdown(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        let inner = self
+            .get_mut()
+            .stream
+            .as_mut()
+            .expect("PooledStream used after Drop began");
+        Pin::new(inner).poll_shutdown(cx)
+    }
+}
+
+impl Drop for PooledStream {
+    fn drop(&mut self) {
+        if let Some(stream) = self.stream.take() {
+            self.pool.release_sync(std::mem::take(&mut self.addr), stream);
+        }
+    }
+}
+
+impl ConnectionPool {
     /// Background task that periodically removes expired idle connections.
     async fn reaper_loop(
         idle: Arc<DashMap<String, VecDeque<PooledConnection>>>,
@@ -209,5 +338,56 @@ mod tests {
         let counts = pool.idle_counts().await;
         assert_eq!(counts.get(&a1).copied().unwrap_or(0), 1);
         assert_eq!(counts.get(&a2).copied().unwrap_or(0), 1);
+    }
+
+    /// C3 — RAII PooledStream regression guard.
+    /// Acquiring a pooled stream and dropping it must put a connection
+    /// back in the per-backend idle queue without an explicit `release()`
+    /// call. Before the C3 fix, idle counts were always 0 because the
+    /// raw `TcpStream` was consumed by Hyper and `release()` never fired.
+    #[tokio::test]
+    async fn pool_pooled_stream_returns_to_pool_on_drop() {
+        let pool = Arc::new(ConnectionPool::new(4));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        // Background acceptor so connect() succeeds.
+        tokio::spawn(async move { let _ = listener.accept().await; });
+
+        // Drop scope: acquire then drop.
+        {
+            let pooled = pool.acquire_pooled(&addr).await.expect("acquire");
+            assert_eq!(pooled.addr(), addr);
+            // dropping at scope end should re-pool
+        }
+
+        let counts = pool.idle_counts().await;
+        assert_eq!(
+            counts.get(&addr).copied().unwrap_or(0),
+            1,
+            "PooledStream::Drop must re-pool the inner TcpStream"
+        );
+    }
+
+    /// `take_stream` must short-circuit the auto-release: the inner stream
+    /// is moved out and the wrapper drops as a no-op so the per-backend
+    /// queue stays empty.
+    #[tokio::test]
+    async fn pool_pooled_stream_take_skips_release() {
+        let pool = Arc::new(ConnectionPool::new(4));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        tokio::spawn(async move { let _ = listener.accept().await; });
+
+        let pooled = pool.acquire_pooled(&addr).await.expect("acquire");
+        let raw = pooled.take_stream();
+        // raw drops here → underlying TcpStream closed, NOT re-pooled.
+        drop(raw);
+
+        let counts = pool.idle_counts().await;
+        assert_eq!(
+            counts.get(&addr).copied().unwrap_or(0),
+            0,
+            "take_stream() must bypass auto-release"
+        );
     }
 }

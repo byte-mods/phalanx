@@ -1930,11 +1930,15 @@ async fn handle_http_request(
     };
     let pool_ref = Arc::clone(pool_ref);
 
-    // Establish TCP connection to backend with connect timeout + retry loop
+    // Establish TCP connection to backend with connect timeout + retry loop.
+    // Uses `acquire_pooled` so the returned `PooledStream`'s `Drop` puts the
+    // socket back in the per-backend idle queue when Hyper finishes with it
+    // (closes plan_v2 C3 — previously `release()` was never called and idle
+    // queues stayed empty under sustained load).
     let stream = loop {
         let connect_result = tokio::time::timeout(
             connect_timeout,
-            pool_ref.connection_pool.acquire(&current_backend.config.address),
+            pool_ref.connection_pool.acquire_pooled(&current_backend.config.address),
         ).await;
         match connect_result {
             Ok(Ok(s)) => break s,
@@ -2403,14 +2407,21 @@ async fn handle_http_request(
             }
 
             // Return backend socket to keepalive pool when possible.
+            // PooledStream's Drop normally re-pools automatically. The one
+            // exception: if hyper read ahead and `read_buf` isn't empty,
+            // re-pooling would hand the next caller a stream with stale
+            // data — call `take_stream()` to bypass auto-release and
+            // close the socket here.
             match conn.without_shutdown().await {
                 Ok(parts) => {
-                    if parts.read_buf.is_empty() {
-                        pool_ref
-                            .connection_pool
-                            .release(backend_addr.clone(), parts.io.into_inner())
-                            .await;
+                    let pooled = parts.io.into_inner();
+                    if !parts.read_buf.is_empty() {
+                        // Discard explicitly — drop the raw TcpStream
+                        // rather than re-pooling a dirty connection.
+                        let _ = pooled.take_stream();
                     }
+                    // else: `pooled` drops here → Drop calls release_sync.
+                    let _ = backend_addr;
                 }
                 Err(e) => {
                     debug!(

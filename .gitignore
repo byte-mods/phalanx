@@ -5,7 +5,9 @@
 ai_load_balancer.long-type-*.txt
 
 # Knowledge-graph build output (regenerated via /graphify)
-/graphify-out/
+# Match in any directory — earlier runs accidentally created these under
+# src/graphify-out/ because the python script's CWD wasn't always the repo root.
+graphify-out/
 
 # Logs
 /logs/
