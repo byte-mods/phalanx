@@ -93,7 +93,9 @@ limitations under the License.
 
 ## What Is Built
 
-Every item below is fully implemented, compiles, and is covered by tests. **920 tests total (694 unit + 226 integration) — all passing.**
+Every item below is fully implemented, compiles, and is covered by tests. **926 tests total (700 unit + 226 integration) — all passing.**
+
+> **2026-04-27 update (later, batch 5):** HTTP/3 parity continues. **OAuth introspection** (RFC 7662) and **JWKS** (dynamic public-key JWT validation) now run in the H3 auth chain alongside Basic / JWT / `auth_request`. JWKS branch extracted to `apply_h3_jwks` for readability — fetches the key matching the token's `kid` from the JWKS endpoint (cached 5 min in `JwksManager`), validates, injects claim headers. **Response compression** — gzip and brotli now negotiate against the H3 client's `Accept-Encoding`, respect the route/server opt-in flags, skip uncompressible content types and small bodies, and set `Content-Encoding`. Brotli preferred over gzip. 6 new tests bring H3 coverage to 22 (auth + compression). 926 tests passing. Still deferred: OIDC for HTTP/3 (session-store cookie integration), gRPC-Web translation, WebTransport.
 
 > **2026-04-27 update (later, batch 4):** HTTP/3 parity expanded again. **Auth chain partial port** — Basic Auth, JWT Bearer (with claim-header injection on success), and `auth_request` (per-route + global fallback, with X-Auth-* injection) now run in `handle_h3_request` between route resolution and PreUpstream hooks. Extracted to `apply_h3_auth_chain` for unit testability; 7 new tests cover priority ordering (Basic beats JWT), denial WWW-Authenticate values, claim-header injection on JWT pass, and wrong-secret rejection. **R6** — HTTP/3 responses now emit `Strict-Transport-Security` when `hsts_max_age` is configured. **R7** — HTTP/3 cache writes honour `proxy_cache_valid_secs` from the matched route instead of a hardcoded 60 s. Still deferred under C2: OAuth / JWKS / OIDC for HTTP/3 (need session-store / discovery-flow work), gzip / brotli compression (needs streaming port), gRPC-Web translation, WebTransport. 920 tests passing.
 
@@ -493,7 +495,7 @@ curl --http3 https://example.com:8443/
 
 **Notes:** HTTP/3 runs entirely in parallel with the TCP listeners. Both protocols share the same upstream pool configuration.
 
-**Pipeline parity with HTTP/1:** The H3 path runs through rate limiting, zone connection limits, CAPTCHA, WAF (URL + body), GeoIP, response cache (route-level TTL via `proxy_cache_valid_secs`), route matching, **Basic / JWT / `auth_request` authentication** (with claim and X-Auth-* header injection), sticky sessions, AI-driven backend selection, traffic mirroring, PreRoute / PreUpstream / PostUpstream / Log hooks, Wasm `OnRequestHeaders`, **HSTS** header injection, plus per-protocol and per-pool bandwidth tracking and structured access logs. Still HTTP/1+2 only: OAuth / JWKS / OIDC, URL rewriting, gzip/brotli compression, gRPC-Web translation, W3C trace context.
+**Pipeline parity with HTTP/1:** The H3 path runs through rate limiting, zone connection limits, CAPTCHA, WAF (URL + body), GeoIP, response cache (route-level TTL via `proxy_cache_valid_secs`), route matching, **Basic / JWT / OAuth introspection / JWKS / `auth_request` authentication** (with claim and X-Auth-* header injection), sticky sessions, AI-driven backend selection, traffic mirroring, PreRoute / PreUpstream / PostUpstream / Log hooks, Wasm `OnRequestHeaders`, **HSTS** header injection, **gzip + brotli response compression** (negotiated against `Accept-Encoding`, brotli preferred), plus per-protocol and per-pool bandwidth tracking and structured access logs. Still HTTP/1+2 only: OIDC, URL rewriting, gRPC-Web translation, W3C trace context.
 
 **Performance:** The HTTP/3 forwarder reuses a single process-wide `reqwest::Client` (DNS resolver, TLS context, and HTTP/1 connection pool are built once), and only allocates the request mirror copy when a `mirror_pool` is configured.
 
@@ -2502,7 +2504,7 @@ All test scripts live in `scripts/`. No external test framework is required for 
 ### Rust Tests
 
 ```bash
-# All 920 tests (694 unit + 226 integration)
+# All 926 tests (700 unit + 226 integration)
 cargo test
 
 # Only unit tests

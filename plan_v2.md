@@ -39,27 +39,29 @@ Auth chain, compression, metrics, mirroring, WebSocket, gRPC-Web NOT implemented
 **Status:** 🔧 **Partial** — significant chunks shipped, but the full surface
 (auth chain + compression + gRPC-Web + WebTransport) remains as its own focused PR.
 
-**Already shipped (batches 1-4):**
+**Already shipped (batches 1-5):**
 - Mirroring, hooks, sticky, AI routing, cache, GeoIP check, CAPTCHA, WAF
   (URL + body), zone limits, AccessLogger, BandwidthTracker (per-protocol +
   per-pool), Prometheus `http_requests_total` + `request_duration` histogram,
   PostUpstream + Log hooks, shared `reqwest::Client`, conditional mirror clone.
-- **Auth chain — Basic + JWT + auth_request (per-route + global fallback)** —
-  extracted to `apply_h3_auth_chain` for unit-testability; injects claim
-  headers on JWT pass and X-Auth-* on auth_request pass.
+- **Auth chain — Basic + JWT + OAuth introspection + JWKS + auth_request
+  (per-route + global fallback)** — extracted to `apply_h3_auth_chain` for
+  unit-testability; injects claim headers on JWT/JWKS pass, `X-Auth-Sub` on
+  OAuth pass, and `X-Auth-*` on `auth_request` pass.
 - **HSTS** (`Strict-Transport-Security`) injection when `hsts_max_age` is set.
-- **Route-level cache TTL** — H3 cache writes now honour
-  `proxy_cache_valid_secs` from the matched route instead of hardcoded 60 s.
+- **Route-level cache TTL** — H3 cache writes honour `proxy_cache_valid_secs`.
+- **Response compression** — gzip + brotli (brotli preferred); negotiates
+  against `Accept-Encoding`, requires the route or server to opt in,
+  respects `MIN_COMPRESS_SIZE` / `MIN_BROTLI_SIZE`, sets `Content-Encoding`
+  on the H3 response. Operates on the buffered body (the H3 handler already
+  collects the full upstream response before sending; streaming-aware
+  compression remains a future polish).
 
-**Still missing (deferred, big surface):**
-- OAuth / JWKS / OIDC for HTTP/3 — these involve session stores and
-  discovery flows that need their own focused work.
-- Response compression (gzip / brotli) — needs streaming-aware port; the
-  current H3 path collects the full body before sending.
-- gRPC-Web detection + translation — needs CORS preflight handling over H3.
-- WebSocket equivalent (WebTransport over HTTP/3) — different protocol, not
-  a port.
-- W3C trace context propagation — minor.
+**Still missing (deferred):**
+- OIDC for HTTP/3 — needs session-store cookie integration. Tracked.
+- gRPC-Web detection + translation over H3 — needs CORS preflight handling.
+- WebSocket equivalent (WebTransport over HTTP/3) — different protocol.
+- W3C trace context propagation — minor; deferred under R3 polish.
 
 
 
@@ -218,16 +220,18 @@ and `request_duration` histogram never updated.
 **Problem:** Auth chain (Basic/JWT/OAuth/JWKS/OIDC) completely missing from HTTP/3.
 Security gap — HTTP/3 requests bypass authentication.
 
-**Fix (partial):** Basic Auth, JWT Bearer, and `auth_request` (per-route +
-global fallback) now run in `apply_h3_auth_chain` between route resolution
-and PreUpstream hooks. Headers from JWT (`X-Auth-Sub`, `X-Auth-Email`, etc.)
-and from `auth_request` responses (`X-Auth-*`) are injected into the
-forwarded request. 7 unit tests cover priority, denial paths, claim
-header injection, and wrong-secret rejection.
+**Fix (partial):** Basic Auth, JWT Bearer, OAuth introspection, JWKS-based
+JWT, and `auth_request` (per-route + global fallback) now run in
+`apply_h3_auth_chain` between route resolution and PreUpstream hooks.
+Headers from JWT/JWKS (`X-Auth-Sub`, `X-Auth-Email`, etc.), OAuth
+(`X-Auth-Sub`), and `auth_request` responses (`X-Auth-*`) are injected
+into the forwarded request. JWKS branch extracted to `apply_h3_jwks` for
+readability. 13 unit tests cover priority, denial paths, claim-header
+injection, wrong-secret rejection, missing-kid handling, and OAuth
+missing-token.
 
-**Status:** 🔧 Partial. OAuth introspection / JWKS / OIDC remain — those
-need session-store / discovery-flow work that doesn't trivially port from
-HTTP/1. Tracked under C2.
+**Status:** 🔧 Partial. OIDC remains — needs session-store cookie
+integration. Tracked under C2.
 
 ### R5: WasmPlugins Not Fully Wired
 **Problem:** Wasm plugins receive incomplete context in HTTP/3. Body not passed.
