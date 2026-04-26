@@ -93,7 +93,9 @@ limitations under the License.
 
 ## What Is Built
 
-Every item below is fully implemented, compiles, and is covered by tests. **913 tests total (687 unit + 226 integration) — all passing.**
+Every item below is fully implemented, compiles, and is covered by tests. **920 tests total (694 unit + 226 integration) — all passing.**
+
+> **2026-04-27 update (later, batch 4):** HTTP/3 parity expanded again. **Auth chain partial port** — Basic Auth, JWT Bearer (with claim-header injection on success), and `auth_request` (per-route + global fallback, with X-Auth-* injection) now run in `handle_h3_request` between route resolution and PreUpstream hooks. Extracted to `apply_h3_auth_chain` for unit testability; 7 new tests cover priority ordering (Basic beats JWT), denial WWW-Authenticate values, claim-header injection on JWT pass, and wrong-secret rejection. **R6** — HTTP/3 responses now emit `Strict-Transport-Security` when `hsts_max_age` is configured. **R7** — HTTP/3 cache writes honour `proxy_cache_valid_secs` from the matched route instead of a hardcoded 60 s. Still deferred under C2: OAuth / JWKS / OIDC for HTTP/3 (need session-store / discovery-flow work), gzip / brotli compression (needs streaming port), gRPC-Web translation, WebTransport. 920 tests passing.
 
 > **2026-04-27 update (later, batch 3):** Five more bare-metal wins from the plan_v2 audit. **P1** — `get_next_backend()` now uses a stack-allocated `SmallVec<[_; 8]>` populated in a single pass, eliminating 3 per-request `Vec::collect()` allocations (zero heap allocation in the common ≤8-backend case). **C5** — ConsistentHash ring is cached via `ArcSwap<Option<ConsistentHashRing>>` with an FxHash signature of (address, effective_weight); previously rebuilt 6400-entry sorted virtual-node ring per request, now rebuilt only when backends or weights change. **P3** — connection pool switched from `Arc<Mutex<HashMap>>` to `Arc<DashMap>`; releases for different backends no longer serialise on a global lock. **P5** — added background OIDC session sweep (`spawn_session_cleanup` on a 5-min ticker) so abandoned sessions don't accumulate forever; per-request path stays O(1). **P7** — cache `hex_prefix()` swapped from stdlib `DefaultHasher` (SipHash) to `rustc_hash::FxHasher` (~3-4× faster on short keys). 913 tests passing.
 
@@ -491,7 +493,7 @@ curl --http3 https://example.com:8443/
 
 **Notes:** HTTP/3 runs entirely in parallel with the TCP listeners. Both protocols share the same upstream pool configuration.
 
-**Pipeline parity with HTTP/1:** The H3 path runs through rate limiting, zone connection limits, CAPTCHA, WAF (URL + body), GeoIP, response cache, route matching, sticky sessions, AI-driven backend selection, traffic mirroring, PreRoute / PreUpstream / PostUpstream / Log hooks, Wasm `OnRequestHeaders`, plus per-protocol and per-pool bandwidth tracking and structured access logs. Auth (Basic/JWT/OAuth/JWKS/OIDC), URL rewriting, gzip/brotli compression, and W3C trace context propagation are HTTP/1+2 only today and tracked as parity gaps.
+**Pipeline parity with HTTP/1:** The H3 path runs through rate limiting, zone connection limits, CAPTCHA, WAF (URL + body), GeoIP, response cache (route-level TTL via `proxy_cache_valid_secs`), route matching, **Basic / JWT / `auth_request` authentication** (with claim and X-Auth-* header injection), sticky sessions, AI-driven backend selection, traffic mirroring, PreRoute / PreUpstream / PostUpstream / Log hooks, Wasm `OnRequestHeaders`, **HSTS** header injection, plus per-protocol and per-pool bandwidth tracking and structured access logs. Still HTTP/1+2 only: OAuth / JWKS / OIDC, URL rewriting, gzip/brotli compression, gRPC-Web translation, W3C trace context.
 
 **Performance:** The HTTP/3 forwarder reuses a single process-wide `reqwest::Client` (DNS resolver, TLS context, and HTTP/1 connection pool are built once), and only allocates the request mirror copy when a `mirror_pool` is configured.
 
@@ -2500,7 +2502,7 @@ All test scripts live in `scripts/`. No external test framework is required for 
 ### Rust Tests
 
 ```bash
-# All 913 tests (687 unit + 226 integration)
+# All 920 tests (694 unit + 226 integration)
 cargo test
 
 # Only unit tests

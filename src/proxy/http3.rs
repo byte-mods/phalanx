@@ -563,6 +563,38 @@ async fn handle_h3_request(
         .and_then(|(_, r)| r.mirror_pool.clone())
         .or_else(|| app_config.mirror_pool.clone());
 
+    // ── Authentication chain (Basic / JWT / per-route auth_request / global) ──
+    // Extracted to `apply_h3_auth_chain` for unit-testability — see tests
+    // module below for coverage of each branch. Headers it returns are
+    // injected upstream after the geo / X-Geo-* injection block.
+    let injected_auth_headers = match apply_h3_auth_chain(
+        route.as_ref(),
+        &app_config,
+        req.headers(),
+        &method,
+        &path,
+    )
+    .await
+    {
+        H3AuthOutcome::Allowed(hs) => hs,
+        H3AuthOutcome::Denied { status, www_authenticate } => {
+            debug!("HTTP/3 auth denied from {} → {}", ip_str, status);
+            match www_authenticate {
+                Some(v) => {
+                    send_h3_response_with_header(
+                        &mut stream,
+                        status,
+                        hyper::header::WWW_AUTHENTICATE,
+                        v,
+                    )
+                    .await;
+                }
+                None => send_h3_error(&mut stream, status).await,
+            }
+            return;
+        }
+    };
+
     // ── PreUpstream hooks ──
     if hook_engine.has_hooks(HookPhase::PreUpstream) {
         let hook_ctx = HookContext {
@@ -665,6 +697,16 @@ async fn handle_h3_request(
         }
         if let Ok(v) = reqwest::header::HeaderValue::from_str(&geo.country_name) {
             forward_headers.insert(reqwest::header::HeaderName::from_static("x-geo-country"), v);
+        }
+    }
+    // Auth chain may have produced extra headers (JWT claims, X-Auth-* from
+    // the auth_request subrequest). Inject them so the upstream sees them.
+    for (k, v) in &injected_auth_headers {
+        if let (Ok(name), Ok(val)) = (
+            reqwest::header::HeaderName::from_bytes(k.as_bytes()),
+            reqwest::header::HeaderValue::from_str(v),
+        ) {
+            forward_headers.insert(name, val);
         }
     }
 
@@ -777,6 +819,14 @@ async fn handle_h3_request(
 
     // ── Cache GET 200 responses ──
     if method == hyper::Method::GET && status == StatusCode::OK {
+        // Honour the route's `proxy_cache_valid` directive instead of a
+        // hardcoded 60 s. Falls back to 60 s when the route is missing or
+        // the directive is 0.
+        let route_ttl_secs = route
+            .as_ref()
+            .map(|(_, r)| r.proxy_cache_valid_secs)
+            .unwrap_or(0);
+        let max_age_secs = if route_ttl_secs > 0 { route_ttl_secs } else { 60 };
         let cache_key = build_cache_key("GET", host, &path, query.as_deref(), &[]);
         cache
             .insert(
@@ -787,7 +837,7 @@ async fn handle_h3_request(
                     content_type: content_type.clone(),
                     headers: vec![],
                     created_at: std::time::Instant::now(),
-                    max_age: std::time::Duration::from_secs(60),
+                    max_age: std::time::Duration::from_secs(max_age_secs),
                     stale_while_revalidate: std::time::Duration::ZERO,
                     stale_if_error: std::time::Duration::ZERO,
                 },
@@ -836,6 +886,16 @@ async fn handle_h3_request(
 
     if let Some(ref cookie_val) = sticky_cookie {
         response = response.header(hyper::header::SET_COOKIE, cookie_val.as_str());
+    }
+
+    // HSTS header injection — matches HTTP/1 behavior at proxy/mod.rs:2208.
+    // Only emitted when the operator opts in via `hsts_max_age`.
+    if let Some(max_age) = app_config.hsts_max_age {
+        if let Ok(hv) =
+            hyper::header::HeaderValue::from_str(&format!("max-age={}", max_age))
+        {
+            response = response.header(hyper::header::STRICT_TRANSPORT_SECURITY, hv);
+        }
     }
 
     let response = response.body(()).unwrap();
@@ -1061,6 +1121,129 @@ async fn send_h3_error(
     let _ = stream.finish().await;
 }
 
+/// Send a status-only response with one extra header. Used by the auth chain
+/// to attach `WWW-Authenticate` to a 401 so clients know how to reauthenticate.
+async fn send_h3_response_with_header(
+    stream: &mut RequestStream<h3_quinn::BidiStream<Bytes>, Bytes>,
+    status: StatusCode,
+    header_name: hyper::header::HeaderName,
+    header_value: hyper::header::HeaderValue,
+) {
+    let resp = hyper::Response::builder()
+        .status(status)
+        .header(header_name, header_value)
+        .body(())
+        .unwrap();
+    if let Err(e) = stream.send_response(resp).await {
+        debug!("send_h3_response_with_header: failed to send {}: {}", status, e);
+    }
+    let _ = stream.finish().await;
+}
+
+/// Outcome of the HTTP/3 auth chain.
+#[derive(Debug)]
+enum H3AuthOutcome {
+    /// Auth passed (or not configured). Inject these headers upstream.
+    Allowed(Vec<(String, String)>),
+    /// Auth denied. Send `status` to the client; if `www_authenticate` is
+    /// `Some`, attach it as the `WWW-Authenticate` response header.
+    Denied {
+        status: StatusCode,
+        www_authenticate: Option<hyper::header::HeaderValue>,
+    },
+}
+
+/// Runs the HTTP/3 authentication chain in priority order:
+///
+/// 1. Per-route Basic Auth (`auth_basic_realm`)
+/// 2. Per-route JWT Bearer (`auth_jwt_secret`) — injects claim headers on success
+/// 3. Per-route auth_request subrequest (`auth_request_url`) — injects X-Auth-* headers on success
+/// 4. Global auth_request fallback (`app_config.auth_request_url`) — only when no per-route auth is configured
+///
+/// Returns the headers to inject upstream on success, or a denial response.
+/// OAuth/JWKS/OIDC are intentionally **not** ported here — they involve session
+/// stores and discovery flows that need their own focused work; that remains
+/// a tracked C2 gap in `plan_v2.md`.
+async fn apply_h3_auth_chain(
+    route: Option<&(String, crate::config::RouteConfig)>,
+    app_config: &AppConfig,
+    headers: &hyper::HeaderMap,
+    method: &hyper::Method,
+    path: &str,
+) -> H3AuthOutcome {
+    use crate::auth::AuthResult;
+    let mut injected: Vec<(String, String)> = Vec::new();
+
+    if let Some((_, r_config)) = route {
+        // 1. Basic Auth
+        if let Some(ref realm) = r_config.auth_basic_realm {
+            return match crate::auth::basic::check(headers, realm, &r_config.auth_basic_users) {
+                AuthResult::Allowed => H3AuthOutcome::Allowed(injected),
+                AuthResult::Denied(status, _) => {
+                    let www = crate::auth::basic::www_authenticate_header(realm)
+                        .parse()
+                        .unwrap_or_else(|_| {
+                            hyper::header::HeaderValue::from_static("Basic realm=\"protected\"")
+                        });
+                    H3AuthOutcome::Denied { status, www_authenticate: Some(www) }
+                }
+            };
+        }
+        // 2. JWT Bearer
+        if let Some(ref secret) = r_config.auth_jwt_secret {
+            let algo = r_config.auth_jwt_algorithm.as_deref().unwrap_or("HS256");
+            let (result, claims) = crate::auth::jwt::check(headers, secret, algo);
+            return match result {
+                AuthResult::Allowed => {
+                    if let Some(ref c) = claims {
+                        for (k, v) in crate::auth::jwt::claims_to_headers(c) {
+                            injected.push((k, v));
+                        }
+                    }
+                    H3AuthOutcome::Allowed(injected)
+                }
+                AuthResult::Denied(status, _) => H3AuthOutcome::Denied {
+                    status,
+                    www_authenticate: Some(hyper::header::HeaderValue::from_static("Bearer")),
+                },
+            };
+        }
+        // 3. Per-route auth_request
+        if let Some(ref auth_url) = r_config.auth_request_url {
+            let (result, auth_headers) =
+                crate::auth::auth_request::check(headers, auth_url, method.as_str(), path).await;
+            return match result {
+                AuthResult::Allowed => {
+                    injected.extend(auth_headers);
+                    H3AuthOutcome::Allowed(injected)
+                }
+                AuthResult::Denied(status, _) => H3AuthOutcome::Denied {
+                    status,
+                    www_authenticate: None,
+                },
+            };
+        }
+    }
+
+    // 4. Global auth_request fallback (only when no per-route auth was set).
+    if let Some(ref auth_url) = app_config.auth_request_url {
+        let (result, auth_headers) =
+            crate::auth::auth_request::check(headers, auth_url, method.as_str(), path).await;
+        return match result {
+            AuthResult::Allowed => {
+                injected.extend(auth_headers);
+                H3AuthOutcome::Allowed(injected)
+            }
+            AuthResult::Denied(status, _) => H3AuthOutcome::Denied {
+                status,
+                www_authenticate: None,
+            },
+        };
+    }
+
+    H3AuthOutcome::Allowed(injected)
+}
+
 /// Build a `rustls::ServerConfig` for QUIC (TLS 1.3 only, ALPN "h3").
 /// Uses cert/key from config, falls back to self-signed for development.
 fn build_quic_tls_config(app_config: &AppConfig) -> Option<rustls::ServerConfig> {
@@ -1116,9 +1299,14 @@ fn build_quic_tls_config(app_config: &AppConfig) -> Option<rustls::ServerConfig>
 
 #[cfg(test)]
 mod tests {
-    use super::{build_return_to, decode_form_component, parse_urlencoded_form, shared_upstream_client};
-    use crate::config::AppConfig;
+    use super::{
+        apply_h3_auth_chain, build_return_to, decode_form_component, parse_urlencoded_form,
+        shared_upstream_client, H3AuthOutcome,
+    };
+    use crate::config::{AppConfig, RouteConfig};
     use crate::telemetry::bandwidth::BandwidthTracker;
+    use hyper::StatusCode;
+    use std::collections::HashMap;
     use std::sync::atomic::Ordering;
 
     #[test]
@@ -1223,5 +1411,206 @@ mod tests {
         cfg.tls_cert_path = Some("/nonexistent/cert.pem".to_string());
         cfg.tls_key_path = Some("/nonexistent/key.pem".to_string());
         assert!(super::build_quic_tls_config(&cfg).is_none());
+    }
+
+    // ── HTTP/3 auth chain tests (C2 partial) ─────────────────────────────────
+
+    fn empty_route() -> Option<(String, RouteConfig)> {
+        None
+    }
+
+    /// Helper: route with only the field of interest set, everything else default.
+    fn route_with(modify: impl FnOnce(&mut RouteConfig)) -> Option<(String, RouteConfig)> {
+        let mut r = RouteConfig::default();
+        modify(&mut r);
+        Some(("/".to_string(), r))
+    }
+
+    #[tokio::test]
+    async fn test_h3_auth_chain_no_auth_configured_allows() {
+        let cfg = AppConfig::default();
+        let h = hyper::HeaderMap::new();
+        let out = apply_h3_auth_chain(
+            empty_route().as_ref(),
+            &cfg,
+            &h,
+            &hyper::Method::GET,
+            "/anything",
+        )
+        .await;
+        assert!(matches!(out, H3AuthOutcome::Allowed(ref v) if v.is_empty()));
+    }
+
+    #[tokio::test]
+    async fn test_h3_basic_auth_denied_without_credentials_attaches_www_authenticate() {
+        let cfg = AppConfig::default();
+        let route = route_with(|r| {
+            r.auth_basic_realm = Some("MyArea".to_string());
+            r.auth_basic_users = HashMap::new();
+        });
+        let h = hyper::HeaderMap::new();
+        let out =
+            apply_h3_auth_chain(route.as_ref(), &cfg, &h, &hyper::Method::GET, "/p").await;
+        match out {
+            H3AuthOutcome::Denied { status, www_authenticate } => {
+                assert_eq!(status, StatusCode::UNAUTHORIZED);
+                let v = www_authenticate.expect("WWW-Authenticate must be set on Basic 401");
+                assert!(v.to_str().unwrap().contains("Basic realm="));
+                assert!(v.to_str().unwrap().contains("MyArea"));
+            }
+            other => panic!("expected Denied, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_h3_basic_auth_allows_correct_credentials() {
+        // Plaintext password match (constant-time fallback path of basic::check).
+        let cfg = AppConfig::default();
+        let route = route_with(|r| {
+            r.auth_basic_realm = Some("MyArea".to_string());
+            let mut users = HashMap::new();
+            users.insert("alice".to_string(), "wonderland".to_string());
+            r.auth_basic_users = users;
+        });
+        // base64("alice:wonderland") = YWxpY2U6d29uZGVybGFuZA==
+        let mut h = hyper::HeaderMap::new();
+        h.insert(
+            hyper::header::AUTHORIZATION,
+            "Basic YWxpY2U6d29uZGVybGFuZA==".parse().unwrap(),
+        );
+        let out =
+            apply_h3_auth_chain(route.as_ref(), &cfg, &h, &hyper::Method::GET, "/p").await;
+        assert!(
+            matches!(out, H3AuthOutcome::Allowed(ref v) if v.is_empty()),
+            "valid creds should be allowed with no injected headers, got {out:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_h3_jwt_denied_without_bearer_uses_bearer_challenge() {
+        let cfg = AppConfig::default();
+        let route = route_with(|r| {
+            r.auth_jwt_secret = Some("secret".to_string());
+        });
+        let h = hyper::HeaderMap::new();
+        let out =
+            apply_h3_auth_chain(route.as_ref(), &cfg, &h, &hyper::Method::GET, "/p").await;
+        match out {
+            H3AuthOutcome::Denied { status, www_authenticate } => {
+                assert_eq!(status, StatusCode::UNAUTHORIZED);
+                let v = www_authenticate.expect("Bearer challenge expected");
+                assert_eq!(v, "Bearer");
+            }
+            other => panic!("expected Denied, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_h3_jwt_allowed_injects_claim_headers() {
+        // Mint an HS256 token with sub/email; expect those to appear in the
+        // injected header set so they reach the upstream as X-Auth-*.
+        use jsonwebtoken::{Algorithm, EncodingKey, Header, encode};
+        let secret = "h3-jwt-secret";
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let claims = crate::auth::jwt::Claims {
+            sub: Some("user-h3".to_string()),
+            email: Some("h3@example.com".to_string()),
+            exp: Some(now + 3600),
+            iss: None,
+            aud: None,
+        };
+        let token = encode(
+            &Header::new(Algorithm::HS256),
+            &claims,
+            &EncodingKey::from_secret(secret.as_bytes()),
+        )
+        .unwrap();
+
+        let cfg = AppConfig::default();
+        let route = route_with(|r| {
+            r.auth_jwt_secret = Some(secret.to_string());
+            r.auth_jwt_algorithm = Some("HS256".to_string());
+        });
+        let mut h = hyper::HeaderMap::new();
+        h.insert(
+            hyper::header::AUTHORIZATION,
+            format!("Bearer {token}").parse().unwrap(),
+        );
+        let out =
+            apply_h3_auth_chain(route.as_ref(), &cfg, &h, &hyper::Method::GET, "/p").await;
+        let injected = match out {
+            H3AuthOutcome::Allowed(v) => v,
+            other => panic!("expected Allowed, got {:?}", other),
+        };
+        let kvs: HashMap<String, String> = injected.into_iter().collect();
+        assert_eq!(kvs.get("X-Auth-Sub").map(String::as_str), Some("user-h3"));
+        assert_eq!(
+            kvs.get("X-Auth-Email").map(String::as_str),
+            Some("h3@example.com")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_h3_jwt_denied_on_wrong_secret() {
+        use jsonwebtoken::{Algorithm, EncodingKey, Header, encode};
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let claims = crate::auth::jwt::Claims {
+            sub: Some("u".into()),
+            email: None,
+            exp: Some(now + 3600),
+            iss: None,
+            aud: None,
+        };
+        let token = encode(
+            &Header::new(Algorithm::HS256),
+            &claims,
+            &EncodingKey::from_secret(b"signing-secret"),
+        )
+        .unwrap();
+        let cfg = AppConfig::default();
+        let route = route_with(|r| {
+            // Different secret on the verifier side
+            r.auth_jwt_secret = Some("DIFFERENT-secret".into());
+        });
+        let mut h = hyper::HeaderMap::new();
+        h.insert(
+            hyper::header::AUTHORIZATION,
+            format!("Bearer {token}").parse().unwrap(),
+        );
+        let out =
+            apply_h3_auth_chain(route.as_ref(), &cfg, &h, &hyper::Method::GET, "/p").await;
+        assert!(matches!(out, H3AuthOutcome::Denied { .. }));
+    }
+
+    #[tokio::test]
+    async fn test_h3_auth_chain_priority_basic_beats_jwt() {
+        // When BOTH Basic and JWT are configured, Basic runs first.
+        // Bad creds → Basic 401 with Basic realm WWW-Authenticate (NOT Bearer).
+        let cfg = AppConfig::default();
+        let route = route_with(|r| {
+            r.auth_basic_realm = Some("R".into());
+            r.auth_basic_users = HashMap::new();
+            r.auth_jwt_secret = Some("ignored".into());
+        });
+        let h = hyper::HeaderMap::new();
+        let out =
+            apply_h3_auth_chain(route.as_ref(), &cfg, &h, &hyper::Method::GET, "/").await;
+        match out {
+            H3AuthOutcome::Denied { www_authenticate, .. } => {
+                let v = www_authenticate.unwrap();
+                let s = v.to_str().unwrap();
+                assert!(
+                    s.starts_with("Basic"),
+                    "Basic should win priority over JWT, got {s:?}"
+                );
+            }
+            other => panic!("expected Denied, got {:?}", other),
+        }
     }
 }

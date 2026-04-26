@@ -39,16 +39,21 @@ Auth chain, compression, metrics, mirroring, WebSocket, gRPC-Web NOT implemented
 **Status:** 🔧 **Partial** — significant chunks shipped, but the full surface
 (auth chain + compression + gRPC-Web + WebTransport) remains as its own focused PR.
 
-**Already shipped (batches 1+2):**
+**Already shipped (batches 1-4):**
 - Mirroring, hooks, sticky, AI routing, cache, GeoIP check, CAPTCHA, WAF
   (URL + body), zone limits, AccessLogger, BandwidthTracker (per-protocol +
   per-pool), Prometheus `http_requests_total` + `request_duration` histogram,
   PostUpstream + Log hooks, shared `reqwest::Client`, conditional mirror clone.
+- **Auth chain — Basic + JWT + auth_request (per-route + global fallback)** —
+  extracted to `apply_h3_auth_chain` for unit-testability; injects claim
+  headers on JWT pass and X-Auth-* on auth_request pass.
+- **HSTS** (`Strict-Transport-Security`) injection when `hsts_max_age` is set.
+- **Route-level cache TTL** — H3 cache writes now honour
+  `proxy_cache_valid_secs` from the matched route instead of hardcoded 60 s.
 
 **Still missing (deferred, big surface):**
-- Auth chain (Basic / JWT / OAuth / JWKS / OIDC / auth_request) —
-  ~200 lines per method to port from `handle_http_request`. Each needs its
-  own integration test against an HTTP/3 client.
+- OAuth / JWKS / OIDC for HTTP/3 — these involve session stores and
+  discovery flows that need their own focused work.
 - Response compression (gzip / brotli) — needs streaming-aware port; the
   current H3 path collects the full body before sending.
 - gRPC-Web detection + translation — needs CORS preflight handling over H3.
@@ -213,8 +218,16 @@ and `request_duration` histogram never updated.
 **Problem:** Auth chain (Basic/JWT/OAuth/JWKS/OIDC) completely missing from HTTP/3.
 Security gap — HTTP/3 requests bypass authentication.
 
-**File:** `src/proxy/http3.rs:264-450`
-**Status:** ⬜ Not started
+**Fix (partial):** Basic Auth, JWT Bearer, and `auth_request` (per-route +
+global fallback) now run in `apply_h3_auth_chain` between route resolution
+and PreUpstream hooks. Headers from JWT (`X-Auth-Sub`, `X-Auth-Email`, etc.)
+and from `auth_request` responses (`X-Auth-*`) are injected into the
+forwarded request. 7 unit tests cover priority, denial paths, claim
+header injection, and wrong-secret rejection.
+
+**Status:** 🔧 Partial. OAuth introspection / JWKS / OIDC remain — those
+need session-store / discovery-flow work that doesn't trivially port from
+HTTP/1. Tracked under C2.
 
 ### R5: WasmPlugins Not Fully Wired
 **Problem:** Wasm plugins receive incomplete context in HTTP/3. Body not passed.
@@ -318,13 +331,21 @@ method, path, status, latency, backend, pool, bytes_sent, referer, user_agent
 **Problem:** No HSTS injection in H3 handler.
 HTTP security header not applied to HTTP/3 responses.
 
-**Status:** ⬜ Not started
+**Fix:** Inject `Strict-Transport-Security: max-age=N` on every H3 response
+when `app_config.hsts_max_age` is set. Mirrors HTTP/1 behavior at
+`proxy/mod.rs:2208`.
+
+**Status:** ✅ Done (2026-04-27, batch 4) — `src/proxy/http3.rs` response builder.
 
 ### R7: HTTP/3 Hardcodes Cache TTL to 60s
 **Problem:** `src/proxy/http3.rs:750` uses hardcoded 60s TTL.
 Ignores route-level `proxy_cache_valid` configuration.
 
-**Status:** ⬜ Not started
+**Fix:** H3 cache write now reads `route.proxy_cache_valid_secs` and uses it
+as the entry's `max_age`; falls back to 60 s when the route has no
+explicit TTL configured. Same precedence as the HTTP/1 path.
+
+**Status:** ✅ Done (2026-04-27, batch 4) — `src/proxy/http3.rs` cache insert.
 
 ### R8: HTTP/3 Missing gRPC-Web Support
 **Problem:** No `is_grpc_web()` detection or `translate_response()` in H3.
