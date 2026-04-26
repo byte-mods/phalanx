@@ -518,6 +518,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             Arc::clone(&hook_engine),
             Arc::clone(&wasm_plugins),
             Arc::clone(&sticky),
+            Arc::clone(&access_logger),
+            Arc::clone(&bandwidth_tracker),
             shutdown_token.clone(),
         )));
 
@@ -1123,6 +1125,8 @@ async fn supervise_http3_listener(
     hook_engine: Arc<scripting::HookEngine>,
     wasm_plugins: Arc<wasm::WasmPluginManager>,
     sticky: Arc<Option<proxy::sticky::StickySessionManager>>,
+    access_logger: Arc<telemetry::access_log::AccessLogger>,
+    bandwidth: Arc<telemetry::bandwidth::BandwidthTracker>,
     shutdown: CancellationToken,
 ) {
     let start = |bind_addr: String, cfg_snapshot: Arc<config::AppConfig>| {
@@ -1141,6 +1145,8 @@ async fn supervise_http3_listener(
         let hook_engine = Arc::clone(&hook_engine);
         let wasm_plugins = Arc::clone(&wasm_plugins);
         let sticky = Arc::clone(&sticky);
+        let access_logger = Arc::clone(&access_logger);
+        let bandwidth = Arc::clone(&bandwidth);
         let handle = tokio::spawn(async move {
             proxy::http3::start_http3_proxy(
                 &bind_addr,
@@ -1158,6 +1164,8 @@ async fn supervise_http3_listener(
                 hook_engine,
                 wasm_plugins,
                 sticky,
+                access_logger,
+                bandwidth,
                 task_shutdown,
             )
             .await;

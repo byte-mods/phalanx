@@ -30,7 +30,26 @@ use crate::middleware::{AdvancedCache, CacheEntry, build_cache_key};
 use crate::proxy::sticky::StickySessionManager;
 use crate::routing::UpstreamManager;
 use crate::scripting::{HookContext, HookEngine, HookPhase, HookResult};
+use crate::telemetry::access_log::AccessLogEntry;
 use crate::wasm::{WasmPluginManager, WasmRequestContext};
+
+/// Shared upstream HTTP/1.1 client for HTTP/3 forwarding.
+///
+/// Building a `reqwest::Client` is expensive: it instantiates a DNS resolver,
+/// a TLS context, and a connection pool. Doing this per request kills
+/// keep-alive reuse and TLS session resumption. The client is internally
+/// `Arc`-shared, so cloning is cheap.
+fn shared_upstream_client() -> &'static reqwest::Client {
+    static CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
+    CLIENT.get_or_init(|| {
+        reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(30))
+            .pool_idle_timeout(Some(std::time::Duration::from_secs(90)))
+            .pool_max_idle_per_host(64)
+            .build()
+            .unwrap_or_default()
+    })
+}
 
 /// Starts the HTTP/3 QUIC server on the configured UDP bind address.
 pub async fn start_http3_proxy(
@@ -49,6 +68,8 @@ pub async fn start_http3_proxy(
     hook_engine: Arc<HookEngine>,
     wasm_plugins: Arc<WasmPluginManager>,
     sticky: Arc<Option<StickySessionManager>>,
+    access_logger: Arc<crate::telemetry::access_log::AccessLogger>,
+    bandwidth: Arc<crate::telemetry::bandwidth::BandwidthTracker>,
     shutdown: CancellationToken,
 ) {
     let addr: SocketAddr = match bind_addr.parse() {
@@ -106,6 +127,8 @@ pub async fn start_http3_proxy(
                 let hook_c = Arc::clone(&hook_engine);
                 let wasm_c = Arc::clone(&wasm_plugins);
                 let sticky_c = Arc::clone(&sticky);
+                let al_c = Arc::clone(&access_logger);
+                let bw_c = Arc::clone(&bandwidth);
 
                 tokio::spawn(async move {
                     let conn = match incoming.await {
@@ -145,6 +168,8 @@ pub async fn start_http3_proxy(
                         hook_c,
                         wasm_c,
                         sticky_c,
+                        al_c,
+                        bw_c,
                     )
                     .await;
                 });
@@ -176,6 +201,8 @@ async fn serve_h3_connection(
     hook_engine: Arc<HookEngine>,
     wasm_plugins: Arc<WasmPluginManager>,
     sticky: Arc<Option<StickySessionManager>>,
+    access_logger: Arc<crate::telemetry::access_log::AccessLogger>,
+    bandwidth: Arc<crate::telemetry::bandwidth::BandwidthTracker>,
 ) {
     loop {
         // h3 0.0.8: accept() returns Option<RequestResolver<C,B>>
@@ -203,6 +230,8 @@ async fn serve_h3_connection(
                 let hooks = Arc::clone(&hook_engine);
                 let wasm = Arc::clone(&wasm_plugins);
                 let sticky_svc = Arc::clone(&sticky);
+                let al = Arc::clone(&access_logger);
+                let bw = Arc::clone(&bandwidth);
                 tokio::spawn(async move {
                     handle_h3_request(
                         req,
@@ -222,6 +251,8 @@ async fn serve_h3_connection(
                         hooks,
                         wasm,
                         sticky_svc,
+                        al,
+                        bw,
                     )
                     .await;
                 });
@@ -279,6 +310,8 @@ async fn handle_h3_request(
     hook_engine: Arc<HookEngine>,
     wasm_plugins: Arc<WasmPluginManager>,
     sticky: Arc<Option<StickySessionManager>>,
+    access_logger: Arc<crate::telemetry::access_log::AccessLogger>,
+    bandwidth: Arc<crate::telemetry::bandwidth::BandwidthTracker>,
 ) {
     let path = req.uri().path().to_string();
     let query = req.uri().query().map(String::from);
@@ -291,6 +324,8 @@ async fn handle_h3_request(
     let start = std::time::Instant::now();
     let ip = remote_addr.ip();
     let ip_str = ip.to_string();
+    // Bandwidth: per-request count for in-bytes (approx: body so far; headers small)
+    bandwidth.protocol("http3").inc_requests();
 
     debug!("HTTP/3 {} {}", method, path);
 
@@ -609,10 +644,7 @@ async fn handle_h3_request(
         Some(q) if !q.is_empty() => format!("http://{}{}?{}", backend.config.address, path, q),
         _ => format!("http://{}{}", backend.config.address, path),
     };
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(30))
-        .build()
-        .unwrap_or_default();
+    let client = shared_upstream_client();
 
     // Propagate original request headers
     let mut forward_headers = reqwest::header::HeaderMap::new();
@@ -637,9 +669,17 @@ async fn handle_h3_request(
     }
 
     let method_str = method.as_str().to_string();
-    // Save copies for mirroring before consuming the body
-    let mirror_req_headers = req.headers().clone();
-    let mirror_req_body = Bytes::copy_from_slice(&request_body);
+    // Bandwidth: in-bytes (request body)
+    bandwidth.protocol("http3").add_in(request_body.len() as u64);
+    bandwidth.pool(&pool_name).add_in(request_body.len() as u64);
+
+    // Only allocate mirror copies when there's actually a mirror pool configured
+    let mirror_payload = mirror_pool.as_ref().map(|_| {
+        (
+            req.headers().clone(),
+            Bytes::copy_from_slice(&request_body),
+        )
+    });
 
     let mut backend_request = client.request(
         reqwest::Method::from_bytes(method.as_str().as_bytes()).unwrap_or(reqwest::Method::GET),
@@ -756,12 +796,12 @@ async fn handle_h3_request(
     }
 
     // ── Traffic mirroring: fire-and-forget copy to shadow pool ──
-    if let Some(ref mp_name) = mirror_pool {
+    if let (Some(mp_name), Some((mh, mb))) = (mirror_pool.as_ref(), mirror_payload) {
         crate::proxy::mirror::mirror_request(
             &method_str,
             &path,
-            mirror_req_headers,
-            mirror_req_body,
+            mh,
+            mb,
             mp_name.clone(),
             Arc::clone(&upstreams),
         );
@@ -786,6 +826,9 @@ async fn handle_h3_request(
     };
 
     // ── Send HTTP/3 response headers ──
+    // Capture length before moving the body, so we can record bandwidth + log later
+    let body_len = body_bytes.len() as u64;
+
     let mut response = hyper::Response::builder()
         .status(status)
         .header("x-proxy-by", "Phalanx/HTTP3")
@@ -811,6 +854,35 @@ async fn handle_h3_request(
     if let Err(e) = stream.finish().await {
         debug!("HTTP/3 stream finish error: {}", e);
     }
+
+    // ── Bandwidth: out-bytes (response body, both per-protocol and per-pool) ──
+    bandwidth.protocol("http3").add_out(body_len);
+    bandwidth.pool(&pool_name).add_out(body_len);
+
+    let latency_ms = start.elapsed().as_millis() as u64;
+
+    // ── Structured access log ──
+    let user_agent_str = user_agent.unwrap_or("").to_string();
+    let referer = req
+        .headers()
+        .get(hyper::header::REFERER)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_string();
+    access_logger.log(AccessLogEntry {
+        timestamp: crate::proxy::chrono_timestamp(),
+        client_ip: ip_str.clone(),
+        method: method_str.clone(),
+        path: path.clone(),
+        status: status_u16,
+        latency_ms,
+        backend: backend.config.address.clone(),
+        pool: pool_name.clone(),
+        bytes_sent: body_len,
+        referer,
+        user_agent: user_agent_str,
+        trace_id: String::new(),
+    });
 
     // ── Log hooks: post-response auditing ──
     if hook_engine.has_hooks(HookPhase::Log) {
@@ -1044,7 +1116,10 @@ fn build_quic_tls_config(app_config: &AppConfig) -> Option<rustls::ServerConfig>
 
 #[cfg(test)]
 mod tests {
-    use super::{build_return_to, parse_urlencoded_form};
+    use super::{build_return_to, decode_form_component, parse_urlencoded_form, shared_upstream_client};
+    use crate::config::AppConfig;
+    use crate::telemetry::bandwidth::BandwidthTracker;
+    use std::sync::atomic::Ordering;
 
     #[test]
     fn test_build_return_to_includes_query() {
@@ -1063,5 +1138,90 @@ mod tests {
             Some("abc+123")
         );
         assert_eq!(parsed.get("return_to").map(String::as_str), Some("/docs?a=1+2"));
+    }
+
+    #[test]
+    fn test_parse_urlencoded_form_handles_pluses_and_empty() {
+        let parsed = parse_urlencoded_form(b"a=hello+world&b=&c");
+        assert_eq!(parsed.get("a").map(String::as_str), Some("hello world"));
+        assert_eq!(parsed.get("b").map(String::as_str), Some(""));
+        assert_eq!(parsed.get("c").map(String::as_str), Some(""));
+    }
+
+    #[test]
+    fn test_decode_form_component_invalid_percent_passes_through() {
+        // Bare '%' with non-hex follow should be left as-is, not panic
+        assert_eq!(decode_form_component("100%off"), "100%off");
+        assert_eq!(decode_form_component("a%2Gb"), "a%2Gb");
+    }
+
+    #[test]
+    fn test_shared_upstream_client_is_singleton() {
+        // Two calls return the same underlying client (same pointer).
+        let c1 = shared_upstream_client();
+        let c2 = shared_upstream_client();
+        assert!(std::ptr::eq(c1, c2));
+    }
+
+    #[test]
+    fn test_bandwidth_http3_protocol_counters() {
+        // Validates the per-protocol counter shape that `handle_h3_request`
+        // increments. Catches regressions if the "http3" label changes.
+        let tracker = BandwidthTracker::new();
+        let p = tracker.protocol("http3");
+        p.inc_requests();
+        p.add_in(123);
+        p.add_out(456);
+
+        assert_eq!(p.requests.load(Ordering::Relaxed), 1);
+        assert_eq!(p.bytes_in.load(Ordering::Relaxed), 123);
+        assert_eq!(p.bytes_out.load(Ordering::Relaxed), 456);
+
+        // Same label returns the same Arc bucket
+        let p2 = tracker.protocol("http3");
+        assert_eq!(p2.requests.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn test_bandwidth_pool_counters_isolated_per_pool() {
+        let tracker = BandwidthTracker::new();
+        tracker.pool("api").add_out(1000);
+        tracker.pool("static").add_out(50);
+        assert_eq!(tracker.pool("api").bytes_out.load(Ordering::Relaxed), 1000);
+        assert_eq!(tracker.pool("static").bytes_out.load(Ordering::Relaxed), 50);
+    }
+
+    /// Install the rustls process-level CryptoProvider exactly once.
+    /// Required because `build_quic_tls_config` uses the default provider,
+    /// which is installed lazily and panics if no provider has been chosen.
+    fn ensure_crypto_provider() {
+        static INIT: std::sync::Once = std::sync::Once::new();
+        INIT.call_once(|| {
+            let _ = rustls::crypto::ring::default_provider().install_default();
+        });
+    }
+
+    #[test]
+    fn test_build_quic_tls_config_falls_back_to_self_signed() {
+        ensure_crypto_provider();
+        // No cert configured → must produce a self-signed config so dev / docker
+        // don't crash. Regression guard for the dev-mode fallback at
+        // build_quic_tls_config().
+        let cfg = AppConfig::default();
+        let tls = super::build_quic_tls_config(&cfg);
+        assert!(tls.is_some(), "self-signed fallback should always succeed");
+        let tls = tls.unwrap();
+        assert_eq!(tls.alpn_protocols, vec![b"h3".to_vec()]);
+    }
+
+    #[test]
+    fn test_build_quic_tls_config_returns_none_for_missing_files() {
+        ensure_crypto_provider();
+        // If cert paths are configured but unreadable, fallback path is NOT
+        // taken — function returns None so the listener cleanly skips.
+        let mut cfg = AppConfig::default();
+        cfg.tls_cert_path = Some("/nonexistent/cert.pem".to_string());
+        cfg.tls_key_path = Some("/nonexistent/key.pem".to_string());
+        assert!(super::build_quic_tls_config(&cfg).is_none());
     }
 }

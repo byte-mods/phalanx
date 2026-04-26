@@ -1,6 +1,11 @@
 # Build artifacts
 /target/
 /data/
+# rustc spills long generic type names here when building with deep generics
+ai_load_balancer.long-type-*.txt
+
+# Knowledge-graph build output (regenerated via /graphify)
+/graphify-out/
 
 # Logs
 /logs/
@@ -16,3 +21,7 @@
 
 # Node (test helper)
 node_modules/
+
+# Python (test scripts)
+__pycache__/
+*.pyc

@@ -4040,11 +4040,13 @@ async fn serve_static_file<T>(
         let mut resp = empty_response(hyper::StatusCode::OK);
         resp.headers_mut().insert(
             hyper::header::CONTENT_TYPE,
-            hyper::header::HeaderValue::from_str(&mime_type).unwrap(),
+            hyper::header::HeaderValue::from_str(&mime_type)
+                .unwrap_or_else(|_| hyper::header::HeaderValue::from_static("application/octet-stream")),
         );
         resp.headers_mut().insert(
             hyper::header::CONTENT_LENGTH,
-            hyper::header::HeaderValue::from_str(&file_size.to_string()).unwrap(),
+            hyper::header::HeaderValue::from_str(&file_size.to_string())
+                .unwrap_or_else(|_| hyper::header::HeaderValue::from_static("0")),
         );
         return Ok(resp);
     }
@@ -4071,15 +4073,17 @@ async fn serve_static_file<T>(
     let mut response = Response::builder()
         .status(hyper::StatusCode::OK)
         .body(boxed_body)
-        .unwrap();
+        .expect("Response::builder is infallible for StreamBody");
 
     response.headers_mut().insert(
         hyper::header::CONTENT_TYPE,
-        hyper::header::HeaderValue::from_str(&mime_type).unwrap(),
+        hyper::header::HeaderValue::from_str(&mime_type)
+            .unwrap_or_else(|_| hyper::header::HeaderValue::from_static("application/octet-stream")),
     );
     response.headers_mut().insert(
         hyper::header::CONTENT_LENGTH,
-        hyper::header::HeaderValue::from_str(&file_size.to_string()).unwrap(),
+        hyper::header::HeaderValue::from_str(&file_size.to_string())
+            .unwrap_or_else(|_| hyper::header::HeaderValue::from_static("0")),
     );
 
     Ok(response)
