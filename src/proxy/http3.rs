@@ -523,15 +523,23 @@ async fn handle_h3_request(
     if is_h3_extended_connect(&method, req.headers()) {
         let target = h3_extended_connect_protocol(req.headers())
             .unwrap_or_else(|| "<unknown>".to_string());
+        // Status header is now config-aware so operators can distinguish
+        // "feature is disabled" from "feature is enabled but session
+        // protocol not yet implemented" (W1 in plan.md).
+        let status_value = if app_config.webtransport_enabled {
+            "enabled_pending_implementation"
+        } else {
+            "not_implemented"
+        };
         debug!(
-            "HTTP/3 Extended CONNECT from {} for protocol {} — not implemented",
-            ip_str, target
+            "HTTP/3 Extended CONNECT from {} for protocol {} — {}",
+            ip_str, target, status_value
         );
         send_h3_response_with_header(
             &mut stream,
             StatusCode::NOT_IMPLEMENTED,
             hyper::header::HeaderName::from_static("phalanx-webtransport-status"),
-            hyper::header::HeaderValue::from_static("not_implemented"),
+            hyper::header::HeaderValue::from_static(status_value),
         )
         .await;
         return;

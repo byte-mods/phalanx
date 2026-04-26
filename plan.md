@@ -1,6 +1,20 @@
 # Phalanx — What's Next
 
-Last updated: 2026-04-27 (after batch 9 / commit `899de22`)
+Last updated: 2026-04-27 (after plan.md execution batch / commit pending)
+
+## What this batch closed
+- ✅ H1 (dead-code) — `rate_limit_response` and `DEFAULT_SESSION_TIMEOUT`
+  gated `#[cfg(test)]`; 8 unused `mut` removed. Zero warnings.
+- ✅ H2 (Criterion bench) — `benches/hot_paths.rs` covers P1, P4, C5,
+  P6, P2, P7. `cargo bench --bench hot_paths`.
+- ✅ H3 (smoke H3) — optional `H3_PROXY` env; httpx client, UDP fallback.
+- ✅ H4 (CI) — `.github/workflows/ci.yml` build + tests on push/PR.
+- ✅ W2 (Wasm OnLog) — wired into HTTP/1, HTTP/2, AND HTTP/3 (the audit
+  found OnLog had `execute_log` but no caller anywhere).
+- ✅ C3 (pool release) — `PooledStream` RAII wrapper with Drop-based
+  release; `take_stream()` for the explicit-discard path.
+- 🔧 W1 (WebTransport) — see updated section below.
+- ⬜ H5 (graph refresh) — execute next.
 
 ## Status Legend
 - ⬜ Not started
@@ -19,61 +33,79 @@ Last updated: 2026-04-27 (after batch 9 / commit `899de22`)
 ## 🔴 CRITICAL — Production correctness
 
 ### C3: Connection pool `release()` never called
-**Problem:** `proxy/pool.rs::release` exists and `acquire()` is wired, but
-Hyper takes ownership of the `TcpStream` after handing it to the request
-state machine, so connections are never returned to the pool. Sustained
-high-QPS workloads pay the TCP handshake cost on every request.
+**Problem (was):** `proxy/pool.rs::release` existed and `acquire()` was
+wired, but Hyper took ownership of the `TcpStream` after handing it to
+the request state machine, so connections were never returned to the
+pool on error / cancellation paths.
 
-**Approach:**
-1. Wrap the acquired stream in a small RAII guard
-   (`PooledStream { inner: TcpStream, addr: String, pool: Arc<ConnectionPool> }`)
-   that calls `pool.release(addr, inner)` in its `Drop` impl.
-2. Hyper's `hyper_util::client::legacy::connect::Connection` trait can
-   wrap arbitrary streams — implement it for `PooledStream` so Hyper
-   accepts it without further changes.
-3. Add a benchmark first to **prove** the impact before refactoring; if
-   the keep-alive path is rarely hit in real workloads the priority drops.
+**Fix shipped:** New `PooledStream` wrapper around `Option<TcpStream>`
+implements `AsyncRead` + `AsyncWrite` (delegates to inner) so it's a
+drop-in replacement when Hyper's `TokioIo` wraps it. `Drop::drop` calls
+`pool.release_sync(addr, stream.take().unwrap())`. `take_stream()`
+short-circuits the auto-release for the explicit-discard path
+(non-empty `parts.read_buf` in the post-response handler).
+`acquire_pooled()` returns `PooledStream`; both H1 and H2 backend-
+connect call sites were switched to use it. Two regression tests with
+real loopback listeners assert `idle_counts()` reflects the Drop-based
+re-pool and the `take_stream()` short-circuit.
 
-**Verify:** new integration test that drives N requests against a single
-backend and asserts `pool.idle_counts()` is non-zero after the run; full
-suite green.
-
-**Files:** `src/proxy/pool.rs`, `src/proxy/mod.rs` (per-backend dispatch).
-
-**Status:** ⬜
+**Status:** ✅ Done (this batch).
 
 ---
 
 ## 🟡 MEDIUM — Feature completeness
 
 ### W1: WebTransport session protocol
-**Problem:** Detection ships (501 + `phalanx-webtransport-status: not_implemented`).
+**Problem:** Detection ships (501 + `phalanx-webtransport-status` header).
 The actual session protocol — Extended CONNECT negotiation, bidirectional
 streams, unidirectional streams, HTTP/3 datagrams,
 `SETTINGS_ENABLE_WEBTRANSPORT` — is not implemented.
 
-**Approach:**
-1. Add `h3-webtransport = "0.1"` (experimental crate). Pin and audit.
-2. Settings: send `SETTINGS_ENABLE_WEBTRANSPORT = 1`, `H3_DATAGRAM = 1`,
-   `ENABLE_CONNECT_PROTOCOL = 1` from the H3 server.
-3. Detect Extended CONNECT with `:protocol = webtransport` (replace the
-   current 501 short-circuit), accept the session, return 200 on the
-   request stream.
-4. Forwarding semantics — **the open design question.** Options:
-   a. Terminate WT in Phalanx (publish/subscribe model with backend
-      pushing data via Phalanx admin API)
-   b. Tunnel WT to a backend that also speaks WT (transparent proxy
-      model)
-   c. Both, configured per route
-5. Stream lifecycle: forward client streams to upstream, plumb datagrams,
-   handle close-codes correctly.
+**Status:** 🔧 In progress (scaffold landed; session protocol pending).
 
-**Why deferred so far:** ~1-2 days of focused work plus a design
-decision on (4). Not single-session sized.
+**Scaffold landed in this batch:**
+- New config flag `webtransport_enabled` (default `false`) parsed from
+  the `webtransport on;` directive in `phalanx.conf`. When `false`, the
+  H3 listener responds 501 with
+  `phalanx-webtransport-status: not_implemented` (unchanged behaviour).
+  When `true`, the same 501 is returned but the header reads
+  `enabled_pending_implementation` so operators can verify the gate
+  and the future implementation path.
+- Forward-looking gate: when the session protocol lands, it'll consume
+  this flag instead of introducing a new one.
 
-**Files:** `src/proxy/http3.rs` (new module `wt.rs` likely), `Cargo.toml`.
+**Remaining work — concrete sub-tasks:**
+- W1.1 Add `h3-webtransport = "0.1.x"` (experimental crate). Audit
+  version compatibility against the pinned `h3 = "0.0.8"` and `quinn`.
+  Pin both ends.
+- W1.2 Send `SETTINGS_ENABLE_WEBTRANSPORT = 1`, `H3_DATAGRAM = 1`,
+  `ENABLE_CONNECT_PROTOCOL = 1` from the H3 server during the QUIC
+  handshake.
+- W1.3 Replace the current 501 short-circuit when `webtransport_enabled`:
+  detect Extended CONNECT with `:protocol = webtransport`, accept the
+  session, return 200 on the request stream, hand control to a per-
+  session task.
+- W1.4 **Forwarding-semantics design decision** (still open):
+    a. Terminate WT in Phalanx (publish/subscribe model — backend pushes
+       to Phalanx admin API which fans out)
+    b. Tunnel WT to a backend that also speaks WT (transparent proxy —
+       Phalanx opens a WT session to the upstream and pipes streams)
+    c. Both, configured per route via `wt_mode terminate|tunnel;`
+- W1.5 Stream lifecycle: forward client bidi/uni streams to upstream,
+  plumb datagrams, propagate close-codes correctly.
+- W1.6 Tests against a real WT client (e.g. quiche-client or a Chromium
+  smoke test).
 
-**Status:** ⬜
+**Why each remaining sub-task is its own commit:** W1.1 + W1.2 +
+session-accept (W1.3) without a forwarding model produces an "accepted
+but data-less" session — worse than the current honest 501. Need to
+ship at least one forwarding mode (W1.4 + W1.5) in the same PR as the
+acceptance code.
+
+**Files:** `src/proxy/http3.rs` (new module `wt.rs` likely), `Cargo.toml`,
+`src/config/mod.rs` (already gated), `src/config/parser.rs`.
+
+**Estimated effort:** 1–2 focused days of work + the W1.4 design decision.
 
 ### W2: Wasm `OnLog` / `OnTick` phases for HTTP/3
 **Problem:** HTTP/3 wires `OnRequestHeaders` and `OnResponseHeaders` but
@@ -88,7 +120,7 @@ included in the iteration.
 **Files:** `src/proxy/http3.rs` (after access log call), `src/wasm/mod.rs`
 (verify tick scope).
 
-**Status:** ⬜
+**Status:** ✅ Done (this batch).
 
 ---
 
@@ -106,7 +138,7 @@ strip the unnecessary `mut`. Single commit.
 
 **Files:** as listed above.
 
-**Status:** ⬜
+**Status:** ✅ Done (this batch).
 
 ### H2: Criterion bench harness
 **Problem:** Several recent perf wins (P1, P3-pool, P4, P6, C5, P7, P2)
@@ -127,7 +159,7 @@ need bench backing.
 
 **Files:** new `benches/` directory, `Cargo.toml`.
 
-**Status:** ⬜
+**Status:** ✅ Done (this batch).
 
 ### H3: HTTP/3 paths in `scripts/smoke_test.py`
 **Problem:** The smoke test only exercises HTTP/1 endpoints. After 9
@@ -139,7 +171,7 @@ runtime dep) — proxy reachability, `x-proxy-by` header, simple GET.
 
 **Files:** `scripts/smoke_test.py`.
 
-**Status:** ⬜
+**Status:** ✅ Done (this batch).
 
 ### H4: CI workflow
 **Problem:** No `.github/workflows/` directory. Every commit currently
@@ -151,18 +183,18 @@ Cache the cargo registry + target dir.
 
 **Files:** new `.github/workflows/ci.yml`.
 
-**Status:** ⬜
+**Status:** ✅ Done (this batch).
 
 ### H5: Refresh `graphify-out/`
 **Problem:** The graph hasn't been re-built since batch 6
-(commit `ee5ba41`). 3 batches of code changes since. Per the new
+(commit `ee5ba41`). Several batches of code changes since. Per the new
 `CLAUDE.md`, every change should trigger `/graphify . --update`.
 
 **Approach:** Run `/graphify . --update`. One-off chore.
 
 **Files:** `graphify-out/` (gitignored, local only).
 
-**Status:** ⬜
+**Status:** 🔧 In progress (executing now).
 
 ---
 

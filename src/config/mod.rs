@@ -399,6 +399,19 @@ pub struct AppConfig {
     pub cache_disk_path: Option<String>,
     /// Enable Brotli compression (in addition to gzip). Default: false.
     pub brotli_enabled: bool,
+    /// Allow HTTP/3 WebTransport sessions (RFC 9220). Default: false.
+    ///
+    /// When false, the H3 listener responds 501 with
+    /// `phalanx-webtransport-status: not_implemented` to any Extended
+    /// CONNECT request — operators see attempted WT in logs but no
+    /// session machinery runs. When true, the H3 listener will (in a
+    /// future implementation) negotiate `SETTINGS_ENABLE_WEBTRANSPORT`
+    /// and accept `:protocol = webtransport` CONNECT requests.
+    ///
+    /// The flag is a forward-looking gate; the actual WT session
+    /// protocol implementation lives in the W1 task in `plan.md`.
+    #[serde(default)]
+    pub webtransport_enabled: bool,
     /// auth_request subrequest URL (per-route override is also possible).
     pub auth_request_url: Option<String>,
     /// Mirror/shadow upstream pool name for traffic tee.
@@ -656,6 +669,7 @@ impl Default for AppConfig {
             geo_deny_countries: Vec::new(),
             cache_disk_path: None,
             brotli_enabled: false,
+            webtransport_enabled: false,
             auth_request_url: None,
             mirror_pool: None,
             proxy_proto_v2: false,
@@ -813,6 +827,9 @@ pub fn try_load_config(
                 }
                 if let Some(v) = server.directives.get("brotli") {
                     app_cfg.brotli_enabled = v == "on" || v == "true";
+                }
+                if let Some(v) = server.directives.get("webtransport") {
+                    app_cfg.webtransport_enabled = v == "on" || v == "true";
                 }
                 if let Some(v) = server.directives.get("auth_request") {
                     app_cfg.auth_request_url = Some(v.clone());
