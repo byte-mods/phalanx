@@ -79,6 +79,7 @@ limitations under the License.
 7. [Testing Guide](#testing-guide)
    - [Rust Tests](#rust-tests)
    - [Start Test Backends](#start-test-backends)
+   - [Python Smoke Test](#python-smoke-test)
    - [Python API Test Suite](#python-api-test-suite)
    - [Load Testing](#load-testing)
    - [Browser Test Pages](#browser-test-pages)
@@ -163,6 +164,8 @@ The following modules are **fully implemented** but not yet integrated into the 
 | **OIDC Auth** | ✅ **Wired** | `OidcSessionStore` passed to `handle_http_request`; session cookie validation runs for routes with `auth_oidc_issuer` + `auth_oidc_cookie_name` |
 | **JWKS Manager** | ✅ **Wired** | `JwksManager` used in JWT validation path for routes with `auth_jwks_uri`; RS256/ES256 public keys fetched and cached from JWKS endpoint |
 | **HTTP/3 AI/Cache** | ✅ **Wired** | AI engine passed to `get_next_backend(None, Some(ai_engine))`; `update_score()` called with latency after each request; GET 200 responses stored in cache; cache hit returns early with `X-Cache: HIT` |
+| **HTTP/3 Access Log + Bandwidth** | ✅ **Wired** | `AccessLogger.log()` called after response with full `AccessLogEntry` (timestamp, client IP, method, path, status, latency, backend, pool, bytes sent, referer, UA); `BandwidthTracker.protocol("http3")` and `.pool(name)` increment requests, in-bytes, and out-bytes |
+| **HTTP/3 Shared Upstream Client** | ✅ **Wired** | Forwarder uses one process-wide `OnceLock<reqwest::Client>` instead of building per request; DNS resolver, TLS context, and HTTP/1 keepalive pool are constructed once. Mirror request body is only cloned when a `mirror_pool` is configured |
 
 ### Phase 2 — Distributed Scale
 
@@ -210,7 +213,7 @@ cargo build --release
 # Debug build
 cargo build
 
-# Run tests (630 total: 406 unit + 224 integration — all passing)
+# Run tests (908 total: 682 unit + 226 integration — all passing)
 cargo test
 
 # Run with default config
@@ -481,6 +484,10 @@ curl --http3 https://example.com:8443/
 ```
 
 **Notes:** HTTP/3 runs entirely in parallel with the TCP listeners. Both protocols share the same upstream pool configuration.
+
+**Pipeline parity with HTTP/1:** The H3 path runs through rate limiting, zone connection limits, CAPTCHA, WAF (URL + body), GeoIP, response cache, route matching, sticky sessions, AI-driven backend selection, traffic mirroring, PreRoute / PreUpstream / PostUpstream / Log hooks, Wasm `OnRequestHeaders`, plus per-protocol and per-pool bandwidth tracking and structured access logs. Auth (Basic/JWT/OAuth/JWKS/OIDC), URL rewriting, gzip/brotli compression, and W3C trace context propagation are HTTP/1+2 only today and tracked as parity gaps.
+
+**Performance:** The HTTP/3 forwarder reuses a single process-wide `reqwest::Client` (DNS resolver, TLS context, and HTTP/1 connection pool are built once), and only allocates the request mirror copy when a `mirror_pool` is configured.
 
 ---
 
@@ -2487,7 +2494,7 @@ All test scripts live in `scripts/`. No external test framework is required for 
 ### Rust Tests
 
 ```bash
-# All 748 tests (524 unit + 224 integration)
+# All 908 tests (682 unit + 226 integration)
 cargo test
 
 # Only unit tests
@@ -2527,6 +2534,27 @@ Special paths on each backend:
 | `/error` | Always returns HTTP 500 |
 | `/notfound` | Always returns HTTP 404 |
 | `/*` | Echoes method, path, headers, body as JSON |
+
+---
+
+### Python Smoke Test
+
+**Requirements:** none — uses only the Python 3 standard library.
+
+A fast, dependency-free end-to-end gate suitable for post-deploy verification or CI smoke checks. Hits the proxy, the admin API, and verifies a per-request bandwidth counter actually moves.
+
+```bash
+# Defaults: proxy on :18080, admin on :9099
+python3 scripts/smoke_test.py
+
+# Custom endpoints + tighter latency budget (ms) for the proxied GET / response
+PROXY=http://127.0.0.1:18080 ADMIN=http://127.0.0.1:9099 \
+  LATENCY_BUDGET_MS=50 python3 scripts/smoke_test.py
+```
+
+**Checks performed:** proxy reachability, `x-proxy-by` identity header, single-request latency under budget, admin `/health`, admin `/metrics` is Prometheus-formatted, admin `/api/stats` returns JSON, bandwidth counters increment after generating traffic, unknown paths return a 4xx (not a crash).
+
+Exit code is `0` on success, non-zero on the first failed check; one `[PASS]` / `[FAIL]` line is printed per check for easy `grep`-ing in CI.
 
 ---
 
