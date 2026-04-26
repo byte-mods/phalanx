@@ -1334,6 +1334,35 @@ async fn handle_h3_request(
         trace_id: trace_id.clone(),
     });
 
+    // ── Wasm OnLog: post-response auditing for plugins ──
+    // Mirrors what HTTP/1 / HTTP/2 will need too — execute_log() existed in
+    // wasm/mod.rs but was never wired into any handler before this batch.
+    // Skipped when no plugins are registered (count check is a relaxed atomic).
+    if wasm_plugins.plugin_count() > 0 {
+        let req_ctx = WasmRequestContext {
+            method: method_str.clone(),
+            path: path.clone(),
+            query: query.clone(),
+            headers: req
+                .headers()
+                .iter()
+                .filter_map(|(k, v)| v.to_str().ok().map(|v| (k.to_string(), v.to_string())))
+                .collect(),
+            body: None,
+            client_ip: ip_str.clone(),
+            protocol: "h3".to_string(),
+        };
+        let resp_ctx = crate::wasm::WasmResponseContext {
+            status_code: status_u16,
+            headers: backend_resp_headers
+                .iter()
+                .filter_map(|(k, v)| v.to_str().ok().map(|v| (k.to_string(), v.to_string())))
+                .collect(),
+            body: None,
+        };
+        let _ = wasm_plugins.execute_log(&req_ctx, &resp_ctx);
+    }
+
     // ── Log hooks: post-response auditing ──
     if hook_engine.has_hooks(HookPhase::Log) {
         let log_ctx = HookContext {

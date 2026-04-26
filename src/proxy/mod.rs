@@ -177,6 +177,8 @@ fn rate_limit_response_with_retry(retry_after: u64) -> Response<BoxBody<Bytes, h
 }
 
 /// Backward-compatible wrapper: 429 with Retry-After: 60.
+/// Used by tests; production code constructs the response inline.
+#[cfg(test)]
 fn rate_limit_response() -> Response<BoxBody<Bytes, hyper::Error>> {
     rate_limit_response_with_retry(60)
 }
@@ -2469,6 +2471,30 @@ async fn handle_http_request(
                 trace_id: req_trace_id.clone(),
             });
 
+            // Wasm OnLog phase — exists in wasm/mod.rs but was never wired
+            // before this batch. Skipped when no plugins are registered.
+            if wasm_plugins.plugin_count() > 0 {
+                let req_ctx = crate::wasm::WasmRequestContext {
+                    method: method_str.clone(),
+                    path: path.clone(),
+                    query: None,
+                    headers: Default::default(),
+                    body: None,
+                    client_ip: ip_str.clone(),
+                    protocol: "http1".to_string(),
+                };
+                let resp_ctx = crate::wasm::WasmResponseContext {
+                    status_code,
+                    headers: final_resp
+                        .headers()
+                        .iter()
+                        .filter_map(|(k, v)| v.to_str().ok().map(|v| (k.to_string(), v.to_string())))
+                        .collect(),
+                    body: None,
+                };
+                let _ = wasm_plugins.execute_log(&req_ctx, &resp_ctx);
+            }
+
             // Log hook: post-response auditing (fire-and-forget, non-blocking)
             if hook_engine.has_hooks(crate::scripting::HookPhase::Log) {
                 let log_ctx = crate::scripting::HookContext {
@@ -3836,6 +3862,29 @@ async fn handle_http2_request(
                 user_agent: String::new(),
                 trace_id: req_trace_id.clone(),
             });
+
+            // Wasm OnLog phase (parity with HTTP/1).
+            if wasm_plugins.plugin_count() > 0 {
+                let req_ctx = crate::wasm::WasmRequestContext {
+                    method: method_str.clone(),
+                    path: path.clone(),
+                    query: None,
+                    headers: Default::default(),
+                    body: None,
+                    client_ip: ip_str.clone(),
+                    protocol: if is_grpc { "grpc" } else { "http2" }.to_string(),
+                };
+                let resp_ctx = crate::wasm::WasmResponseContext {
+                    status_code,
+                    headers: final_resp
+                        .headers()
+                        .iter()
+                        .filter_map(|(k, v)| v.to_str().ok().map(|v| (k.to_string(), v.to_string())))
+                        .collect(),
+                    body: None,
+                };
+                let _ = wasm_plugins.execute_log(&req_ctx, &resp_ctx);
+            }
 
             // Log hook (parity with HTTP/1)
             if hook_engine.has_hooks(crate::scripting::HookPhase::Log) {

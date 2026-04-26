@@ -23,7 +23,9 @@ use crate::routing::UpstreamManager;
 const UDP_BUF_SIZE: usize = 65535;
 
 /// Default duration after which an idle client session is garbage-collected.
-/// Overridden by `udp_session_timeout_secs` in config.
+/// Overridden by `udp_session_timeout_secs` in config; only referenced from
+/// tests today (production reads the per-config value directly).
+#[cfg(test)]
 const DEFAULT_SESSION_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// Tracks a single client's UDP session: which backend it talks to and its

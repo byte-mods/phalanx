@@ -280,7 +280,7 @@ mod geo_tests {
 
     #[test]
     fn test_geo_db_lookup_hit() {
-        let mut db = GeoIpDatabase::new();
+        let db = GeoIpDatabase::new();
         db.add_entry("1.2.3.0/24", "DE", "Germany");
         let result = db.lookup(&"1.2.3.100".parse().unwrap());
         assert!(result.is_some());
@@ -289,7 +289,7 @@ mod geo_tests {
 
     #[test]
     fn test_geo_db_lookup_miss() {
-        let mut db = GeoIpDatabase::new();
+        let db = GeoIpDatabase::new();
         db.add_entry("1.2.3.0/24", "DE", "Germany");
         let result = db.lookup(&"9.9.9.9".parse().unwrap());
         assert!(result.is_none());
@@ -1352,7 +1352,7 @@ mod hook_engine_phase_tests {
 
     #[test]
     fn test_pre_route_hook_fires_for_pre_route_only() {
-        let mut engine = HookEngine::new();
+        let engine = HookEngine::new();
         engine.register(Hook {
             name: "pr".to_string(),
             phase: HookPhase::PreRoute,
@@ -1368,7 +1368,7 @@ mod hook_engine_phase_tests {
 
     #[test]
     fn test_pre_upstream_phase_separate_from_pre_route() {
-        let mut engine = HookEngine::new();
+        let engine = HookEngine::new();
         engine.register(Hook {
             name: "pre_route".to_string(),
             phase: HookPhase::PreRoute,
@@ -1393,7 +1393,7 @@ mod hook_engine_phase_tests {
 
     #[test]
     fn test_log_phase_executes_independently() {
-        let mut engine = HookEngine::new();
+        let engine = HookEngine::new();
         engine.register(Hook {
             name: "logger".to_string(),
             phase: HookPhase::Log,
@@ -1408,7 +1408,7 @@ mod hook_engine_phase_tests {
 
     #[test]
     fn test_respond_hook_short_circuits_remaining_hooks() {
-        let mut engine = HookEngine::new();
+        let engine = HookEngine::new();
         engine.register(Hook {
             name: "block".to_string(),
             phase: HookPhase::PreRoute,
@@ -1429,7 +1429,7 @@ mod hook_engine_phase_tests {
 
     #[test]
     fn test_has_hooks_per_phase_granularity() {
-        let mut engine = HookEngine::new();
+        let engine = HookEngine::new();
         assert!(!engine.has_hooks(HookPhase::PreRoute));
         assert!(!engine.has_hooks(HookPhase::PreUpstream));
         assert!(!engine.has_hooks(HookPhase::PostUpstream));
@@ -1448,7 +1448,7 @@ mod hook_engine_phase_tests {
 
     #[test]
     fn test_multiple_hooks_same_phase_run_in_priority_order() {
-        let mut engine = HookEngine::new();
+        let engine = HookEngine::new();
         engine.register(Hook {
             name: "third".to_string(),
             phase: HookPhase::PreUpstream,

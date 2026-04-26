@@ -78,3 +78,9 @@ sha1 = "0.10"
 sha2 = "0.10"
 wasmtime = "29"
 webrtc = "0.17.1"
+
+# Microbenchmarks for the perf-critical hot paths shipped during the
+# 9-batch bare-metal pass. Run with `cargo bench --bench hot_paths`.
+[[bench]]
+name = "hot_paths"
+harness = false
