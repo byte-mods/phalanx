@@ -70,6 +70,7 @@ pub async fn start_http3_proxy(
     sticky: Arc<Option<StickySessionManager>>,
     access_logger: Arc<crate::telemetry::access_log::AccessLogger>,
     bandwidth: Arc<crate::telemetry::bandwidth::BandwidthTracker>,
+    oidc_sessions: crate::auth::oidc::OidcSessionStore,
     shutdown: CancellationToken,
 ) {
     let addr: SocketAddr = match bind_addr.parse() {
@@ -129,6 +130,7 @@ pub async fn start_http3_proxy(
                 let sticky_c = Arc::clone(&sticky);
                 let al_c = Arc::clone(&access_logger);
                 let bw_c = Arc::clone(&bandwidth);
+                let oidc_c = Arc::clone(&oidc_sessions);
 
                 tokio::spawn(async move {
                     let conn = match incoming.await {
@@ -170,6 +172,7 @@ pub async fn start_http3_proxy(
                         sticky_c,
                         al_c,
                         bw_c,
+                        oidc_c,
                     )
                     .await;
                 });
@@ -203,6 +206,7 @@ async fn serve_h3_connection(
     sticky: Arc<Option<StickySessionManager>>,
     access_logger: Arc<crate::telemetry::access_log::AccessLogger>,
     bandwidth: Arc<crate::telemetry::bandwidth::BandwidthTracker>,
+    oidc_sessions: crate::auth::oidc::OidcSessionStore,
 ) {
     loop {
         // h3 0.0.8: accept() returns Option<RequestResolver<C,B>>
@@ -232,6 +236,7 @@ async fn serve_h3_connection(
                 let sticky_svc = Arc::clone(&sticky);
                 let al = Arc::clone(&access_logger);
                 let bw = Arc::clone(&bandwidth);
+                let oidc = Arc::clone(&oidc_sessions);
                 tokio::spawn(async move {
                     handle_h3_request(
                         req,
@@ -253,6 +258,7 @@ async fn serve_h3_connection(
                         sticky_svc,
                         al,
                         bw,
+                        oidc,
                     )
                     .await;
                 });
@@ -312,6 +318,7 @@ async fn handle_h3_request(
     sticky: Arc<Option<StickySessionManager>>,
     access_logger: Arc<crate::telemetry::access_log::AccessLogger>,
     bandwidth: Arc<crate::telemetry::bandwidth::BandwidthTracker>,
+    oidc_sessions: crate::auth::oidc::OidcSessionStore,
 ) {
     let path = req.uri().path().to_string();
     let query = req.uri().query().map(String::from);
@@ -326,6 +333,13 @@ async fn handle_h3_request(
     let ip_str = ip.to_string();
     // Bandwidth: per-request count for in-bytes (approx: body so far; headers small)
     bandwidth.protocol("http3").inc_requests();
+
+    // ── W3C Trace Context (traceparent) ─────────────────────────────────────
+    // Generate per-request trace_id + span_id so distributed traces span the
+    // proxy boundary. Mirrors HTTP/1 at proxy/mod.rs:1865 — uses the same
+    // 16-byte trace / 8-byte span hex shape so backends with W3C support
+    // (jaeger / datadog / tempo) automatically continue the trace.
+    let (trace_id, span_id) = h3_generate_trace_ids();
 
     debug!("HTTP/3 {} {}", method, path);
 
@@ -368,6 +382,15 @@ async fn handle_h3_request(
             captcha_manager,
         )
         .await;
+        return;
+    }
+
+    // ── gRPC-Web CORS preflight (browser sends OPTIONS before grpc-web POST) ──
+    // Short-circuits before WAF / auth / route resolution because preflights
+    // are protocol-level, not application-level. Same response shape as
+    // `grpc_web::cors_preflight_response()` for HTTP/1.
+    if is_h3_grpc_web_preflight(&method, req.headers()) {
+        send_h3_grpc_web_preflight(&mut stream).await;
         return;
     }
 
@@ -573,6 +596,7 @@ async fn handle_h3_request(
         req.headers(),
         &method,
         &path,
+        &oidc_sessions,
     )
     .await
     {
@@ -708,6 +732,16 @@ async fn handle_h3_request(
         ) {
             forward_headers.insert(name, val);
         }
+    }
+    // W3C traceparent — `00-{trace_id}-{span_id}-01` (sampled). Backends
+    // with W3C support continue the trace started here.
+    if let Ok(traceparent) =
+        reqwest::header::HeaderValue::from_str(&format!("00-{}-{}-01", trace_id, span_id))
+    {
+        forward_headers.insert(
+            reqwest::header::HeaderName::from_static("traceparent"),
+            traceparent,
+        );
     }
 
     let method_str = method.as_str().to_string();
@@ -990,7 +1024,7 @@ async fn handle_h3_request(
         bytes_sent: body_len,
         referer,
         user_agent: user_agent_str,
-        trace_id: String::new(),
+        trace_id: trace_id.clone(),
     });
 
     // ── Log hooks: post-response auditing ──
@@ -1219,6 +1253,7 @@ async fn apply_h3_auth_chain(
     headers: &hyper::HeaderMap,
     method: &hyper::Method,
     path: &str,
+    oidc_sessions: &crate::auth::oidc::OidcSessionStore,
 ) -> H3AuthOutcome {
     use crate::auth::AuthResult;
     let mut injected: Vec<(String, String)> = Vec::new();
@@ -1297,7 +1332,42 @@ async fn apply_h3_auth_chain(
             });
             return apply_h3_jwks(jwks_uri, mgr.as_ref(), headers, &mut injected).await;
         }
-        // 5. Per-route auth_request
+        // 5. OIDC session check
+        // Reads the session cookie named in `auth_oidc_cookie_name`, looks
+        // up the server-side OidcSessionStore, validates expiry, and on
+        // success injects X-Auth-Sub / X-Auth-Email upstream. Mirrors
+        // HTTP/1 at proxy/mod.rs:1407-1457. The OIDC RP login flow itself
+        // (auth-code redirect, token exchange) is not handled here; admin
+        // endpoints establish the session, this branch only validates it.
+        if let Some(ref cookie_name) = r_config.auth_oidc_cookie_name {
+            let (result, session) =
+                crate::auth::oidc::check_session(headers, cookie_name, oidc_sessions);
+            return match result {
+                AuthResult::Allowed => {
+                    if let Some(s) = session {
+                        // Issuer mismatch — reject even if the session is fresh
+                        if let Some(ref issuer) = r_config.auth_oidc_issuer {
+                            if !crate::auth::oidc::session_matches_issuer(&s, issuer) {
+                                return H3AuthOutcome::Denied {
+                                    status: StatusCode::UNAUTHORIZED,
+                                    www_authenticate: None,
+                                };
+                            }
+                        }
+                        injected.push(("X-Auth-Sub".to_string(), s.sub));
+                        if let Some(email) = s.email {
+                            injected.push(("X-Auth-Email".to_string(), email));
+                        }
+                    }
+                    H3AuthOutcome::Allowed(injected)
+                }
+                AuthResult::Denied(status, _) => H3AuthOutcome::Denied {
+                    status,
+                    www_authenticate: None,
+                },
+            };
+        }
+        // 6. Per-route auth_request
         if let Some(ref auth_url) = r_config.auth_request_url {
             let (result, auth_headers) =
                 crate::auth::auth_request::check(headers, auth_url, method.as_str(), path).await;
@@ -1415,6 +1485,59 @@ async fn apply_h3_jwks(
     }
 }
 
+/// Generates a (trace_id, span_id) pair for one HTTP/3 request.
+/// 16-byte trace, 8-byte span, hex-encoded — matches the HTTP/1 helper at
+/// `proxy/mod.rs:3871` and the W3C Trace Context spec.
+fn h3_generate_trace_ids() -> (String, String) {
+    use rand::RngExt;
+    let mut trace = [0u8; 16];
+    let mut span = [0u8; 8];
+    let mut rng = rand::rng();
+    rng.fill(&mut trace);
+    rng.fill(&mut span);
+    let trace_id: String = trace.iter().map(|b| format!("{:02x}", b)).collect();
+    let span_id: String = span.iter().map(|b| format!("{:02x}", b)).collect();
+    (trace_id, span_id)
+}
+
+/// Detects a gRPC-Web CORS preflight request: an `OPTIONS` whose
+/// `Access-Control-Request-Headers` mentions `grpc-web` (case-insensitive).
+/// Browsers send these before issuing the actual `POST application/grpc-web`
+/// gRPC call. We answer 204 with the standard CORS response so the call
+/// is allowed without round-tripping to the upstream.
+fn is_h3_grpc_web_preflight(method: &hyper::Method, headers: &hyper::HeaderMap) -> bool {
+    if method != hyper::Method::OPTIONS {
+        return false;
+    }
+    headers
+        .get(hyper::header::ACCESS_CONTROL_REQUEST_HEADERS)
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_ascii_lowercase().contains("grpc-web"))
+        .unwrap_or(false)
+}
+
+/// CORS preflight response for gRPC-Web over HTTP/3. Mirrors the headers
+/// emitted by `grpc_web::cors_preflight_response` for HTTP/1.
+async fn send_h3_grpc_web_preflight(
+    stream: &mut RequestStream<h3_quinn::BidiStream<Bytes>, Bytes>,
+) {
+    let resp = hyper::Response::builder()
+        .status(StatusCode::NO_CONTENT)
+        .header(hyper::header::ACCESS_CONTROL_ALLOW_ORIGIN, "*")
+        .header(hyper::header::ACCESS_CONTROL_ALLOW_METHODS, "POST, OPTIONS")
+        .header(
+            hyper::header::ACCESS_CONTROL_ALLOW_HEADERS,
+            "content-type,x-grpc-web,x-user-agent,grpc-timeout",
+        )
+        .header(hyper::header::ACCESS_CONTROL_MAX_AGE, "86400")
+        .body(())
+        .unwrap();
+    if let Err(e) = stream.send_response(resp).await {
+        debug!("send_h3_grpc_web_preflight: failed: {}", e);
+    }
+    let _ = stream.finish().await;
+}
+
 /// Build a `rustls::ServerConfig` for QUIC (TLS 1.3 only, ALPN "h3").
 /// Uses cert/key from config, falls back to self-signed for development.
 fn build_quic_tls_config(app_config: &AppConfig) -> Option<rustls::ServerConfig> {
@@ -1471,8 +1594,8 @@ fn build_quic_tls_config(app_config: &AppConfig) -> Option<rustls::ServerConfig>
 #[cfg(test)]
 mod tests {
     use super::{
-        apply_h3_auth_chain, build_return_to, decode_form_component, parse_urlencoded_form,
-        shared_upstream_client, H3AuthOutcome,
+        apply_h3_auth_chain, build_return_to, decode_form_component, h3_generate_trace_ids,
+        is_h3_grpc_web_preflight, parse_urlencoded_form, shared_upstream_client, H3AuthOutcome,
     };
     use crate::config::{AppConfig, RouteConfig};
     use crate::telemetry::bandwidth::BandwidthTracker;
@@ -1597,6 +1720,12 @@ mod tests {
         Some(("/".to_string(), r))
     }
 
+    /// Per-test empty OIDC store. Each test gets its own to avoid cross-test
+    /// pollution; the store is just an `Arc<DashMap>` so this is cheap.
+    fn empty_oidc_store() -> crate::auth::oidc::OidcSessionStore {
+        crate::auth::oidc::new_session_store()
+    }
+
     #[tokio::test]
     async fn test_h3_auth_chain_no_auth_configured_allows() {
         let cfg = AppConfig::default();
@@ -1607,6 +1736,7 @@ mod tests {
             &h,
             &hyper::Method::GET,
             "/anything",
+            &empty_oidc_store(),
         )
         .await;
         assert!(matches!(out, H3AuthOutcome::Allowed(ref v) if v.is_empty()));
@@ -1621,7 +1751,7 @@ mod tests {
         });
         let h = hyper::HeaderMap::new();
         let out =
-            apply_h3_auth_chain(route.as_ref(), &cfg, &h, &hyper::Method::GET, "/p").await;
+            apply_h3_auth_chain(route.as_ref(), &cfg, &h, &hyper::Method::GET, "/p", &empty_oidc_store()).await;
         match out {
             H3AuthOutcome::Denied { status, www_authenticate } => {
                 assert_eq!(status, StatusCode::UNAUTHORIZED);
@@ -1650,7 +1780,7 @@ mod tests {
             "Basic YWxpY2U6d29uZGVybGFuZA==".parse().unwrap(),
         );
         let out =
-            apply_h3_auth_chain(route.as_ref(), &cfg, &h, &hyper::Method::GET, "/p").await;
+            apply_h3_auth_chain(route.as_ref(), &cfg, &h, &hyper::Method::GET, "/p", &empty_oidc_store()).await;
         assert!(
             matches!(out, H3AuthOutcome::Allowed(ref v) if v.is_empty()),
             "valid creds should be allowed with no injected headers, got {out:?}"
@@ -1665,7 +1795,7 @@ mod tests {
         });
         let h = hyper::HeaderMap::new();
         let out =
-            apply_h3_auth_chain(route.as_ref(), &cfg, &h, &hyper::Method::GET, "/p").await;
+            apply_h3_auth_chain(route.as_ref(), &cfg, &h, &hyper::Method::GET, "/p", &empty_oidc_store()).await;
         match out {
             H3AuthOutcome::Denied { status, www_authenticate } => {
                 assert_eq!(status, StatusCode::UNAUTHORIZED);
@@ -1711,7 +1841,7 @@ mod tests {
             format!("Bearer {token}").parse().unwrap(),
         );
         let out =
-            apply_h3_auth_chain(route.as_ref(), &cfg, &h, &hyper::Method::GET, "/p").await;
+            apply_h3_auth_chain(route.as_ref(), &cfg, &h, &hyper::Method::GET, "/p", &empty_oidc_store()).await;
         let injected = match out {
             H3AuthOutcome::Allowed(v) => v,
             other => panic!("expected Allowed, got {:?}", other),
@@ -1755,7 +1885,7 @@ mod tests {
             format!("Bearer {token}").parse().unwrap(),
         );
         let out =
-            apply_h3_auth_chain(route.as_ref(), &cfg, &h, &hyper::Method::GET, "/p").await;
+            apply_h3_auth_chain(route.as_ref(), &cfg, &h, &hyper::Method::GET, "/p", &empty_oidc_store()).await;
         assert!(matches!(out, H3AuthOutcome::Denied { .. }));
     }
 
@@ -1769,7 +1899,7 @@ mod tests {
         });
         let h = hyper::HeaderMap::new();
         let out =
-            apply_h3_auth_chain(route.as_ref(), &cfg, &h, &hyper::Method::GET, "/p").await;
+            apply_h3_auth_chain(route.as_ref(), &cfg, &h, &hyper::Method::GET, "/p", &empty_oidc_store()).await;
         match out {
             H3AuthOutcome::Denied { status, www_authenticate } => {
                 assert_eq!(status, StatusCode::UNAUTHORIZED);
@@ -1814,7 +1944,7 @@ mod tests {
             format!("Bearer {token}").parse().unwrap(),
         );
         let out =
-            apply_h3_auth_chain(route.as_ref(), &cfg, &h, &hyper::Method::GET, "/p").await;
+            apply_h3_auth_chain(route.as_ref(), &cfg, &h, &hyper::Method::GET, "/p", &empty_oidc_store()).await;
         assert!(matches!(out, H3AuthOutcome::Denied { .. }));
     }
 
@@ -1833,7 +1963,7 @@ mod tests {
         });
         let h = hyper::HeaderMap::new();
         let out =
-            apply_h3_auth_chain(route.as_ref(), &cfg, &h, &hyper::Method::GET, "/p").await;
+            apply_h3_auth_chain(route.as_ref(), &cfg, &h, &hyper::Method::GET, "/p", &empty_oidc_store()).await;
         match out {
             H3AuthOutcome::Denied { status, www_authenticate } => {
                 assert_eq!(status, StatusCode::UNAUTHORIZED);
@@ -1877,6 +2007,167 @@ mod tests {
         assert!(crate::middleware::brotli::MIN_BROTLI_SIZE > 0);
     }
 
+    // ── OIDC tests ───────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_h3_oidc_denied_without_session_cookie() {
+        let cfg = AppConfig::default();
+        let route = route_with(|r| {
+            r.auth_oidc_cookie_name = Some("PHALANX_SESSION".into());
+        });
+        let h = hyper::HeaderMap::new();
+        let store = empty_oidc_store();
+        let out =
+            apply_h3_auth_chain(route.as_ref(), &cfg, &h, &hyper::Method::GET, "/p", &store)
+                .await;
+        assert!(matches!(out, H3AuthOutcome::Denied { .. }));
+    }
+
+    #[tokio::test]
+    async fn test_h3_oidc_allows_with_valid_session_and_injects_headers() {
+        // Plant a fresh session in the store, then verify the auth chain
+        // returns Allowed and includes X-Auth-Sub / X-Auth-Email.
+        let cfg = AppConfig::default();
+        let route = route_with(|r| {
+            r.auth_oidc_cookie_name = Some("PHALANX_SESSION".into());
+        });
+        let store = empty_oidc_store();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let session_id = "test-sid-allow".to_string();
+        store.insert(
+            session_id.clone(),
+            crate::auth::oidc::OidcSession {
+                sub: "u123".to_string(),
+                email: Some("u@example.com".to_string()),
+                issuer: Some("https://idp.example.com".to_string()),
+                access_token: "fake-access-token".to_string(),
+                refresh_token: None,
+                created_at: now,
+                expires_in: 3600,
+            },
+        );
+
+        let mut h = hyper::HeaderMap::new();
+        h.insert(
+            hyper::header::COOKIE,
+            format!("PHALANX_SESSION={session_id}").parse().unwrap(),
+        );
+        let out =
+            apply_h3_auth_chain(route.as_ref(), &cfg, &h, &hyper::Method::GET, "/p", &store)
+                .await;
+        let injected = match out {
+            H3AuthOutcome::Allowed(v) => v,
+            other => panic!("expected Allowed, got {:?}", other),
+        };
+        let kv: HashMap<String, String> = injected.into_iter().collect();
+        assert_eq!(kv.get("X-Auth-Sub").map(String::as_str), Some("u123"));
+        assert_eq!(
+            kv.get("X-Auth-Email").map(String::as_str),
+            Some("u@example.com")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_h3_oidc_rejects_issuer_mismatch() {
+        // Session is from issuer A, route requires issuer B → Denied.
+        let cfg = AppConfig::default();
+        let route = route_with(|r| {
+            r.auth_oidc_cookie_name = Some("PHALANX_SESSION".into());
+            r.auth_oidc_issuer = Some("https://expected.example.com".into());
+        });
+        let store = empty_oidc_store();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let session_id = "test-sid-mismatch".to_string();
+        store.insert(
+            session_id.clone(),
+            crate::auth::oidc::OidcSession {
+                sub: "u".to_string(),
+                email: None,
+                issuer: Some("https://OTHER.example.com".to_string()),
+                access_token: "fake".to_string(),
+                refresh_token: None,
+                created_at: now,
+                expires_in: 3600,
+            },
+        );
+
+        let mut h = hyper::HeaderMap::new();
+        h.insert(
+            hyper::header::COOKIE,
+            format!("PHALANX_SESSION={session_id}").parse().unwrap(),
+        );
+        let out =
+            apply_h3_auth_chain(route.as_ref(), &cfg, &h, &hyper::Method::GET, "/p", &store)
+                .await;
+        assert!(matches!(out, H3AuthOutcome::Denied { .. }));
+    }
+
+    // ── W3C trace context tests ──────────────────────────────────────────
+
+    #[test]
+    fn test_h3_trace_ids_have_correct_shape() {
+        // Each call must yield a fresh, well-formed pair.
+        let (trace_a, span_a) = h3_generate_trace_ids();
+        let (trace_b, span_b) = h3_generate_trace_ids();
+
+        // Hex-encoded 16 bytes = 32 chars; 8 bytes = 16 chars.
+        assert_eq!(trace_a.len(), 32);
+        assert_eq!(span_a.len(), 16);
+        assert!(trace_a.chars().all(|c| c.is_ascii_hexdigit()));
+        assert!(span_a.chars().all(|c| c.is_ascii_hexdigit()));
+
+        // Two consecutive calls must produce different IDs (chance of
+        // collision is 2^-128 / 2^-64).
+        assert_ne!(trace_a, trace_b);
+        assert_ne!(span_a, span_b);
+    }
+
+    // ── gRPC-Web preflight tests ─────────────────────────────────────────
+
+    #[test]
+    fn test_h3_grpc_web_preflight_detects_browser_request() {
+        let mut h = hyper::HeaderMap::new();
+        h.insert(
+            hyper::header::ACCESS_CONTROL_REQUEST_HEADERS,
+            "x-grpc-web,content-type".parse().unwrap(),
+        );
+        assert!(is_h3_grpc_web_preflight(&hyper::Method::OPTIONS, &h));
+    }
+
+    #[test]
+    fn test_h3_grpc_web_preflight_case_insensitive() {
+        let mut h = hyper::HeaderMap::new();
+        h.insert(
+            hyper::header::ACCESS_CONTROL_REQUEST_HEADERS,
+            "X-Grpc-Web".parse().unwrap(),
+        );
+        assert!(is_h3_grpc_web_preflight(&hyper::Method::OPTIONS, &h));
+    }
+
+    #[test]
+    fn test_h3_grpc_web_preflight_rejects_non_options() {
+        // Same header present, but POST method — must NOT trigger preflight.
+        let mut h = hyper::HeaderMap::new();
+        h.insert(
+            hyper::header::ACCESS_CONTROL_REQUEST_HEADERS,
+            "x-grpc-web".parse().unwrap(),
+        );
+        assert!(!is_h3_grpc_web_preflight(&hyper::Method::POST, &h));
+    }
+
+    #[test]
+    fn test_h3_grpc_web_preflight_rejects_options_without_request_headers() {
+        // Plain OPTIONS without ACR-Headers — not a grpc-web preflight.
+        let h = hyper::HeaderMap::new();
+        assert!(!is_h3_grpc_web_preflight(&hyper::Method::OPTIONS, &h));
+    }
+
     #[tokio::test]
     async fn test_h3_auth_chain_priority_basic_beats_jwt() {
         // When BOTH Basic and JWT are configured, Basic runs first.
@@ -1889,7 +2180,7 @@ mod tests {
         });
         let h = hyper::HeaderMap::new();
         let out =
-            apply_h3_auth_chain(route.as_ref(), &cfg, &h, &hyper::Method::GET, "/").await;
+            apply_h3_auth_chain(route.as_ref(), &cfg, &h, &hyper::Method::GET, "/", &empty_oidc_store()).await;
         match out {
             H3AuthOutcome::Denied { www_authenticate, .. } => {
                 let v = www_authenticate.unwrap();

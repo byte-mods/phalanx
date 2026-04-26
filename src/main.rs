@@ -528,6 +528,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             Arc::clone(&sticky),
             Arc::clone(&access_logger),
             Arc::clone(&bandwidth_tracker),
+            Arc::clone(&oidc_sessions),
             shutdown_token.clone(),
         )));
 
@@ -1135,6 +1136,7 @@ async fn supervise_http3_listener(
     sticky: Arc<Option<proxy::sticky::StickySessionManager>>,
     access_logger: Arc<telemetry::access_log::AccessLogger>,
     bandwidth: Arc<telemetry::bandwidth::BandwidthTracker>,
+    oidc_sessions: auth::oidc::OidcSessionStore,
     shutdown: CancellationToken,
 ) {
     let start = |bind_addr: String, cfg_snapshot: Arc<config::AppConfig>| {
@@ -1155,6 +1157,7 @@ async fn supervise_http3_listener(
         let sticky = Arc::clone(&sticky);
         let access_logger = Arc::clone(&access_logger);
         let bandwidth = Arc::clone(&bandwidth);
+        let oidc_sessions = Arc::clone(&oidc_sessions);
         let handle = tokio::spawn(async move {
             proxy::http3::start_http3_proxy(
                 &bind_addr,
@@ -1174,6 +1177,7 @@ async fn supervise_http3_listener(
                 sticky,
                 access_logger,
                 bandwidth,
+                oidc_sessions,
                 task_shutdown,
             )
             .await;

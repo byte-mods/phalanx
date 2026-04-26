@@ -39,15 +39,19 @@ Auth chain, compression, metrics, mirroring, WebSocket, gRPC-Web NOT implemented
 **Status:** 🔧 **Partial** — significant chunks shipped, but the full surface
 (auth chain + compression + gRPC-Web + WebTransport) remains as its own focused PR.
 
-**Already shipped (batches 1-5):**
+**Already shipped (batches 1-6):**
 - Mirroring, hooks, sticky, AI routing, cache, GeoIP check, CAPTCHA, WAF
   (URL + body), zone limits, AccessLogger, BandwidthTracker (per-protocol +
   per-pool), Prometheus `http_requests_total` + `request_duration` histogram,
   PostUpstream + Log hooks, shared `reqwest::Client`, conditional mirror clone.
-- **Auth chain — Basic + JWT + OAuth introspection + JWKS + auth_request
-  (per-route + global fallback)** — extracted to `apply_h3_auth_chain` for
-  unit-testability; injects claim headers on JWT/JWKS pass, `X-Auth-Sub` on
-  OAuth pass, and `X-Auth-*` on `auth_request` pass.
+- **Auth chain — Basic + JWT + OAuth introspection + JWKS + OIDC session
+  + auth_request (per-route + global fallback)** — extracted to
+  `apply_h3_auth_chain` for unit-testability; injects claim headers on
+  JWT/JWKS pass, `X-Auth-Sub` on OAuth pass, `X-Auth-Sub` + `X-Auth-Email`
+  on OIDC pass (with optional issuer-match check), and `X-Auth-*` on
+  `auth_request` pass. `OidcSessionStore` threaded through
+  `supervise_http3_listener` → `start_http3_proxy` → `serve_h3_connection`
+  → `handle_h3_request` → `apply_h3_auth_chain`.
 - **HSTS** (`Strict-Transport-Security`) injection when `hsts_max_age` is set.
 - **Route-level cache TTL** — H3 cache writes honour `proxy_cache_valid_secs`.
 - **Response compression** — gzip + brotli (brotli preferred); negotiates
@@ -57,11 +61,24 @@ Auth chain, compression, metrics, mirroring, WebSocket, gRPC-Web NOT implemented
   collects the full upstream response before sending; streaming-aware
   compression remains a future polish).
 
+**Also shipped (batch 6):**
+- **W3C trace context** — every H3 request gets a fresh 16-byte trace +
+  8-byte span pair; `traceparent: 00-{trace}-{span}-01` is injected on
+  the forwarded request and the trace_id is included in the structured
+  access log entry. Backends with W3C support continue the trace.
+- **gRPC-Web CORS preflight** — `OPTIONS` requests whose
+  `Access-Control-Request-Headers` mention `grpc-web` (case-insensitive)
+  short-circuit before WAF/auth/route resolution and return 204 with the
+  standard CORS response. Allows browser gRPC-Web clients to call upstreams
+  through HTTP/3 without per-call upstream round-trips.
+
 **Still missing (deferred):**
-- OIDC for HTTP/3 — needs session-store cookie integration. Tracked.
-- gRPC-Web detection + translation over H3 — needs CORS preflight handling.
-- WebSocket equivalent (WebTransport over HTTP/3) — different protocol.
-- W3C trace context propagation — minor; deferred under R3 polish.
+- gRPC-Web request/response **body translation** over HTTP/3 — preflight is
+  handled, but the actual body translation (base64 grpc-web-text decode,
+  trailer-frame appending) requires HTTP/2 forwarding semantics that the
+  current H3-→HTTP/1 forwarder doesn't have. Needs its own design pass.
+- WebTransport (HTTP/3 native bidi streams) — different protocol API
+  entirely, not a port.
 
 
 
