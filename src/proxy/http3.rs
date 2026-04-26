@@ -51,6 +51,108 @@ fn shared_upstream_client() -> &'static reqwest::Client {
     })
 }
 
+/// Upstream client for **gRPC** forwarding.
+///
+/// gRPC requires HTTP/2 framing for trailers (`grpc-status`/`grpc-message`).
+/// `http2_prior_knowledge()` makes reqwest send the HTTP/2 connection
+/// preface immediately instead of probing via ALPN — appropriate because
+/// the upstream pool entry for a gRPC backend is expected to speak H2.
+/// Falls back to the plain HTTP/1 client if construction fails (defensive).
+fn shared_grpc_upstream_client() -> &'static reqwest::Client {
+    static CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
+    CLIENT.get_or_init(|| {
+        reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(30))
+            .pool_idle_timeout(Some(std::time::Duration::from_secs(90)))
+            .pool_max_idle_per_host(64)
+            .http2_prior_knowledge()
+            .build()
+            .unwrap_or_else(|_| reqwest::Client::new())
+    })
+}
+
+/// True if the request looks like a gRPC-Web call (any subtype).
+fn is_h3_grpc_web(headers: &hyper::HeaderMap) -> bool {
+    headers
+        .get(hyper::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .map(|ct| ct.starts_with("application/grpc-web"))
+        .unwrap_or(false)
+}
+
+/// True if the request specifically uses the base64 text encoding
+/// (`application/grpc-web-text` or `application/grpc-web-text+proto`),
+/// in which case the body is base64-encoded protobuf instead of raw bytes.
+fn is_h3_grpc_web_text(headers: &hyper::HeaderMap) -> bool {
+    headers
+        .get(hyper::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .map(|ct| ct.starts_with("application/grpc-web-text"))
+        .unwrap_or(false)
+}
+
+/// Translates a gRPC-Web request body into raw gRPC framed bytes.
+/// For `grpc-web-text`, base64-decodes the payload; for binary
+/// (`grpc-web` / `grpc-web+proto`), returns the bytes unchanged.
+/// Returns `None` if base64 decoding fails — caller should reject with 400.
+fn translate_h3_grpc_web_request_body(body: &Bytes, is_text: bool) -> Option<Bytes> {
+    if !is_text {
+        return Some(body.clone());
+    }
+    use base64::Engine;
+    base64::engine::general_purpose::STANDARD
+        .decode(body.as_ref())
+        .ok()
+        .map(Bytes::from)
+}
+
+/// Builds a gRPC-Web trailer frame from the upstream response headers.
+///
+/// The gRPC-Web wire format appends a frame to the body: a flag byte
+/// (`0x80`) + 4-byte big-endian length + the trailer text (CRLF-separated
+/// `name: value` lines). We take `grpc-status` and `grpc-message` from
+/// the upstream response headers (reqwest surfaces HTTP/2 trailers as
+/// headers when the response is fully read), which is the common case.
+fn build_h3_grpc_web_trailer_frame(headers: &reqwest::header::HeaderMap) -> Vec<u8> {
+    let mut text = String::new();
+    if let Some(s) = headers.get("grpc-status").and_then(|v| v.to_str().ok()) {
+        text.push_str(&format!("grpc-status: {}\r\n", s));
+    }
+    if let Some(s) = headers.get("grpc-message").and_then(|v| v.to_str().ok()) {
+        text.push_str(&format!("grpc-message: {}\r\n", s));
+    }
+    if text.is_empty() {
+        // Default to OK if upstream didn't set a status header
+        text.push_str("grpc-status: 0\r\n");
+    }
+    let bytes = text.as_bytes();
+    let mut frame = Vec::with_capacity(5 + bytes.len());
+    frame.push(0x80);
+    frame.extend_from_slice(&(bytes.len() as u32).to_be_bytes());
+    frame.extend_from_slice(bytes);
+    frame
+}
+
+/// Assembles the final gRPC-Web response body: upstream gRPC bytes +
+/// trailer frame, base64-encoded if the client used the text encoding.
+fn build_h3_grpc_web_response_body(
+    upstream_body: &[u8],
+    upstream_headers: &reqwest::header::HeaderMap,
+    use_text: bool,
+) -> Bytes {
+    let trailer = build_h3_grpc_web_trailer_frame(upstream_headers);
+    let mut combined = Vec::with_capacity(upstream_body.len() + trailer.len());
+    combined.extend_from_slice(upstream_body);
+    combined.extend_from_slice(&trailer);
+    if use_text {
+        use base64::Engine;
+        let encoded = base64::engine::general_purpose::STANDARD.encode(&combined);
+        Bytes::from(encoded.into_bytes())
+    } else {
+        Bytes::from(combined)
+    }
+}
+
 /// Starts the HTTP/3 QUIC server on the configured UDP bind address.
 pub async fn start_http3_proxy(
     bind_addr: &str,
@@ -340,6 +442,13 @@ async fn handle_h3_request(
     // 16-byte trace / 8-byte span hex shape so backends with W3C support
     // (jaeger / datadog / tempo) automatically continue the trace.
     let (trace_id, span_id) = h3_generate_trace_ids();
+
+    // ── gRPC-Web detection ─────────────────────────────────────────────────
+    // Captured early from the *original* request so the value isn't lost
+    // when we later mutate forward_headers. Two flags so we can distinguish
+    // text (base64) vs binary at both request-decode and response-encode time.
+    let req_is_grpc_web = is_h3_grpc_web(req.headers());
+    let req_is_grpc_web_text = is_h3_grpc_web_text(req.headers());
 
     debug!("HTTP/3 {} {}", method, path);
 
@@ -762,7 +871,14 @@ async fn handle_h3_request(
         Some(q) if !q.is_empty() => format!("http://{}{}?{}", backend.config.address, path, q),
         _ => format!("http://{}{}", backend.config.address, path),
     };
-    let client = shared_upstream_client();
+    // gRPC-Web requests need HTTP/2 forwarding so trailers carry through.
+    // All other H3 requests stay on the HTTP/1 keepalive client (faster,
+    // wider compatibility).
+    let client = if req_is_grpc_web {
+        shared_grpc_upstream_client()
+    } else {
+        shared_upstream_client()
+    };
 
     // Propagate original request headers
     let mut forward_headers = reqwest::header::HeaderMap::new();
@@ -773,6 +889,24 @@ async fn handle_h3_request(
         ) {
             forward_headers.insert(name, val);
         }
+    }
+    // gRPC-Web → gRPC translation on the request side: rewrite Content-Type
+    // to plain `application/grpc(+proto)` and require trailers from the
+    // upstream so `grpc-status` / `grpc-message` reach us.
+    if req_is_grpc_web {
+        let new_ct = if req_is_grpc_web_text {
+            "application/grpc+proto"
+        } else {
+            "application/grpc"
+        };
+        forward_headers.insert(
+            reqwest::header::CONTENT_TYPE,
+            reqwest::header::HeaderValue::from_static(new_ct),
+        );
+        forward_headers.insert(
+            reqwest::header::TE,
+            reqwest::header::HeaderValue::from_static("trailers"),
+        );
     }
     if let Some(geo) = geo_result.as_ref() {
         if let Ok(v) = reqwest::header::HeaderValue::from_str(&geo.country_code) {
@@ -819,13 +953,28 @@ async fn handle_h3_request(
         )
     });
 
+    // gRPC-Web body translation: text variant carries base64-encoded
+    // protobuf — decode before forwarding upstream.
+    let outgoing_body = if req_is_grpc_web {
+        match translate_h3_grpc_web_request_body(&request_body, req_is_grpc_web_text) {
+            Some(b) => b,
+            None => {
+                debug!("HTTP/3 grpc-web-text body base64 decode failed from {}", ip_str);
+                send_h3_error(&mut stream, StatusCode::BAD_REQUEST).await;
+                return;
+            }
+        }
+    } else {
+        request_body
+    };
+
     let mut backend_request = client.request(
         reqwest::Method::from_bytes(method.as_str().as_bytes()).unwrap_or(reqwest::Method::GET),
         &backend_url,
     );
     backend_request = backend_request
         .headers(forward_headers)
-        .body(request_body);
+        .body(outgoing_body);
 
     let backend_resp = match backend_request.send().await {
         Ok(r) => r,
@@ -925,13 +1074,34 @@ async fn handle_h3_request(
         }
     }
 
-    let body_bytes = match backend_resp.bytes().await {
+    let raw_backend_body = match backend_resp.bytes().await {
         Ok(b) => b,
         Err(e) => {
             error!("Failed to read HTTP/3 backend body: {}", e);
             send_h3_error(&mut stream, StatusCode::BAD_GATEWAY).await;
             return;
         }
+    };
+
+    // gRPC-Web → gRPC-Web response translation: append a length-prefixed
+    // trailer frame built from the upstream's `grpc-status`/`grpc-message`
+    // headers, then base64-encode the whole thing if the client used the
+    // text variant. Also override the content_type that we'll emit so the
+    // client sees the correct grpc-web subtype.
+    let (body_bytes, content_type) = if req_is_grpc_web {
+        let translated = build_h3_grpc_web_response_body(
+            &raw_backend_body,
+            &backend_resp_headers,
+            req_is_grpc_web_text,
+        );
+        let new_ct = if req_is_grpc_web_text {
+            "application/grpc-web-text+proto".to_string()
+        } else {
+            "application/grpc-web+proto".to_string()
+        };
+        (translated, new_ct)
+    } else {
+        (raw_backend_body, content_type)
     };
 
     // ── Cache GET 200 responses ──
@@ -1689,9 +1859,13 @@ fn build_quic_tls_config(app_config: &AppConfig) -> Option<rustls::ServerConfig>
 #[cfg(test)]
 mod tests {
     use super::{
-        apply_h3_auth_chain, build_return_to, decode_form_component, h3_generate_trace_ids,
-        is_h3_grpc_web_preflight, parse_urlencoded_form, shared_upstream_client, H3AuthOutcome,
+        apply_h3_auth_chain, build_h3_grpc_web_response_body, build_h3_grpc_web_trailer_frame,
+        build_return_to, decode_form_component, h3_generate_trace_ids, is_h3_grpc_web,
+        is_h3_grpc_web_preflight, is_h3_grpc_web_text, parse_urlencoded_form,
+        shared_grpc_upstream_client, shared_upstream_client, translate_h3_grpc_web_request_body,
+        H3AuthOutcome,
     };
+    use bytes::Bytes;
     use crate::config::{AppConfig, RouteConfig};
     use crate::telemetry::bandwidth::BandwidthTracker;
     use hyper::StatusCode;
@@ -2201,6 +2375,137 @@ mod tests {
             apply_h3_auth_chain(route.as_ref(), &cfg, &h, &hyper::Method::GET, "/p", &store)
                 .await;
         assert!(matches!(out, H3AuthOutcome::Denied { .. }));
+    }
+
+    // ── gRPC-Web body translation tests ─────────────────────────────────
+
+    #[test]
+    fn test_h3_grpc_web_detects_binary_subtype() {
+        let mut h = hyper::HeaderMap::new();
+        h.insert(
+            hyper::header::CONTENT_TYPE,
+            "application/grpc-web+proto".parse().unwrap(),
+        );
+        assert!(is_h3_grpc_web(&h));
+        assert!(!is_h3_grpc_web_text(&h));
+    }
+
+    #[test]
+    fn test_h3_grpc_web_detects_text_subtype() {
+        let mut h = hyper::HeaderMap::new();
+        h.insert(
+            hyper::header::CONTENT_TYPE,
+            "application/grpc-web-text".parse().unwrap(),
+        );
+        assert!(is_h3_grpc_web(&h));
+        assert!(is_h3_grpc_web_text(&h));
+    }
+
+    #[test]
+    fn test_h3_grpc_web_does_not_match_plain_grpc() {
+        // `application/grpc` (no -web suffix) is plain gRPC over HTTP/2,
+        // not gRPC-Web. The detector must reject it so we don't try to
+        // base64-decode a binary protobuf body.
+        let mut h = hyper::HeaderMap::new();
+        h.insert(
+            hyper::header::CONTENT_TYPE,
+            "application/grpc".parse().unwrap(),
+        );
+        assert!(!is_h3_grpc_web(&h));
+        assert!(!is_h3_grpc_web_text(&h));
+    }
+
+    #[test]
+    fn test_h3_grpc_web_request_body_passthrough_for_binary() {
+        // Binary subtype: body is forwarded as-is (no base64 decode).
+        let raw = Bytes::from_static(&[0x00, 0x01, 0x02, 0x03]);
+        let out = translate_h3_grpc_web_request_body(&raw, false).expect("binary always succeeds");
+        assert_eq!(out.as_ref(), &[0x00, 0x01, 0x02, 0x03]);
+    }
+
+    #[test]
+    fn test_h3_grpc_web_request_body_decodes_text() {
+        // base64("hello") = "aGVsbG8="
+        let encoded = Bytes::from_static(b"aGVsbG8=");
+        let out =
+            translate_h3_grpc_web_request_body(&encoded, true).expect("valid base64 decodes");
+        assert_eq!(out.as_ref(), b"hello");
+    }
+
+    #[test]
+    fn test_h3_grpc_web_request_body_rejects_invalid_base64() {
+        // `!@#$` is not a valid base64 alphabet — must signal failure so the
+        // caller returns 400 instead of forwarding garbage.
+        let bad = Bytes::from_static(b"!@#$");
+        assert!(translate_h3_grpc_web_request_body(&bad, true).is_none());
+    }
+
+    #[test]
+    fn test_h3_grpc_web_trailer_frame_uses_status_and_message() {
+        let mut h = reqwest::header::HeaderMap::new();
+        h.insert("grpc-status", "0".parse().unwrap());
+        h.insert("grpc-message", "OK".parse().unwrap());
+        let frame = build_h3_grpc_web_trailer_frame(&h);
+        // Frame layout: 0x80 | 4 bytes length BE | trailer text
+        assert_eq!(frame[0], 0x80, "must start with the trailer flag byte");
+        let len = u32::from_be_bytes([frame[1], frame[2], frame[3], frame[4]]) as usize;
+        assert_eq!(len, frame.len() - 5);
+        let trailer_text = std::str::from_utf8(&frame[5..]).unwrap();
+        assert!(trailer_text.contains("grpc-status: 0"));
+        assert!(trailer_text.contains("grpc-message: OK"));
+        assert!(trailer_text.ends_with("\r\n"));
+    }
+
+    #[test]
+    fn test_h3_grpc_web_trailer_frame_defaults_to_status_zero() {
+        // Upstream emitted no grpc-status header — we must default to 0
+        // (OK) so a gRPC-Web client doesn't crash on a missing trailer.
+        let h = reqwest::header::HeaderMap::new();
+        let frame = build_h3_grpc_web_trailer_frame(&h);
+        let trailer_text = std::str::from_utf8(&frame[5..]).unwrap();
+        assert_eq!(trailer_text, "grpc-status: 0\r\n");
+    }
+
+    #[test]
+    fn test_h3_grpc_web_response_body_appends_trailer_frame() {
+        let upstream_body = b"\x00\x00\x00\x00\x05hello"; // 5-byte length-prefix + payload
+        let mut h = reqwest::header::HeaderMap::new();
+        h.insert("grpc-status", "0".parse().unwrap());
+        let out = build_h3_grpc_web_response_body(upstream_body, &h, false);
+        // First N bytes are the original body, then the 0x80 flag marks the trailer frame
+        assert_eq!(&out[..upstream_body.len()], upstream_body);
+        assert_eq!(out[upstream_body.len()], 0x80);
+    }
+
+    #[test]
+    fn test_h3_grpc_web_response_body_text_mode_is_base64() {
+        let upstream_body = b"abc";
+        let h = reqwest::header::HeaderMap::new();
+        let out = build_h3_grpc_web_response_body(upstream_body, &h, true);
+        // text mode → base64 ASCII; only valid base64 chars
+        assert!(out
+            .iter()
+            .all(|b| b.is_ascii_alphanumeric() || *b == b'+' || *b == b'/' || *b == b'='));
+        // Round-trip: decoding it should reproduce the binary form
+        use base64::Engine;
+        let decoded = base64::engine::general_purpose::STANDARD
+            .decode(&out)
+            .expect("text-mode output must be valid base64");
+        let binary_form = build_h3_grpc_web_response_body(upstream_body, &h, false);
+        assert_eq!(decoded, binary_form.as_ref());
+    }
+
+    /// Sanity: the gRPC client and the regular HTTP/1 client are *different*
+    /// instances. Catches accidental fallthrough where a future refactor
+    /// makes both helpers return the same singleton.
+    #[test]
+    fn test_h3_grpc_client_is_separate_from_default_client() {
+        let regular = shared_upstream_client();
+        let grpc = shared_grpc_upstream_client();
+        assert!(
+            !std::ptr::eq(regular, grpc),
+            "gRPC forwarder must be its own HTTP/2 client"
+        );
     }
 
     // ── URL rewrite tests (regression guard for the H3 rewrite loop) ────

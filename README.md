@@ -93,7 +93,9 @@ limitations under the License.
 
 ## What Is Built
 
-Every item below is fully implemented, compiles, and is covered by tests. **938 tests total (712 unit + 226 integration) — all passing.**
+Every item below is fully implemented, compiles, and is covered by tests. **949 tests total (723 unit + 226 integration) — all passing.**
+
+> **2026-04-27 update (later, batch 8):** Full **gRPC-Web body translation over HTTP/3**. A separate `shared_grpc_upstream_client()` is built with `http2_prior_knowledge()` so the upstream sees real HTTP/2 framing (required for `grpc-status` / `grpc-message` trailers); the regular HTTP/1 client is still used for everything else. On the request side, `grpc-web-text` bodies are base64-decoded, `Content-Type` is rewritten to `application/grpc(+proto)`, and `TE: trailers` is added. On the response side, an upstream-bytes + length-prefixed-trailer-frame body is assembled (`0x80 | u32_be_len | "grpc-status: …\r\n…"`), built from the upstream's `grpc-status`/`grpc-message` headers (defaulting to status 0); base64-encoded if the client used the text variant; outgoing `Content-Type` rewritten back to `application/grpc-web(+proto)` or `application/grpc-web-text+proto`. The existing compression `is_compressible` whitelist already excludes `application/grpc-web*`, so gzip/brotli naturally skips gRPC responses (correct — double-compressing gRPC framing breaks clients). 11 new unit tests cover detection, base64 round-trip, trailer-frame layout, default-status fallback, and that the gRPC client is a separate singleton. 949 tests passing. **Only WebTransport and P2 (Arc<str> redesign) remain on the deferred list.**
 
 > **2026-04-27 update (later, batch 7):** Two more parity ports for HTTP/3. **URL rewriting** — the same `'rewrite` loop the HTTP/1 path uses now runs in `handle_h3_request` between WAF/cache (which still see the original client-sent path) and route resolution + auth (which see the rewritten path). Honours `Redirect`, `Rewritten{restart_routing: true/false}`, and `NoMatch` exactly as HTTP/1 does. **Wasm `OnResponseHeaders`** — between the backend's response headers being read and the response being sent over H3, the wasm plugin chain runs with a `WasmResponseContext`; returned headers are applied last so plugins can override HSTS or per-route `add_header` (matches HTTP/1's "last writer wins"). 4 new regression-guard tests bring H3 coverage to 34. 938 tests passing. Deferred: gRPC-Web body translation (needs HTTP/2 forwarding), WebTransport, P2 (Arc<str> API redesign).
 
@@ -499,7 +501,7 @@ curl --http3 https://example.com:8443/
 
 **Notes:** HTTP/3 runs entirely in parallel with the TCP listeners. Both protocols share the same upstream pool configuration.
 
-**Pipeline parity with HTTP/1:** The H3 path runs through rate limiting, zone connection limits, CAPTCHA, **gRPC-Web CORS preflight**, WAF (URL + body), GeoIP, response cache (route-level TTL via `proxy_cache_valid_secs`), **URL rewriting** (`Redirect` / `Rewritten` / `NoMatch`), route matching, **Basic / JWT / OAuth introspection / JWKS / OIDC session / `auth_request` authentication** (with claim and X-Auth-* header injection), sticky sessions, AI-driven backend selection, **W3C trace context (`traceparent`) injection on the forwarded request**, traffic mirroring, PreRoute / PreUpstream / PostUpstream / Log hooks, **Wasm `OnRequestHeaders` + `OnResponseHeaders`**, **HSTS** header injection, **gzip + brotli response compression** (negotiated against `Accept-Encoding`, brotli preferred), plus per-protocol and per-pool bandwidth tracking and structured access logs (with trace_id). Still HTTP/1+2 only: gRPC-Web request/response body translation, WebTransport.
+**Pipeline parity with HTTP/1:** The H3 path runs through rate limiting, zone connection limits, CAPTCHA, **gRPC-Web CORS preflight + body translation** (HTTP/2 forwarding via a dedicated client, base64 decode/encode for the text variant, length-prefixed trailer frame from upstream `grpc-status`/`grpc-message`), WAF (URL + body), GeoIP, response cache (route-level TTL via `proxy_cache_valid_secs`), **URL rewriting** (`Redirect` / `Rewritten` / `NoMatch`), route matching, **Basic / JWT / OAuth introspection / JWKS / OIDC session / `auth_request` authentication** (with claim and X-Auth-* header injection), sticky sessions, AI-driven backend selection, **W3C trace context (`traceparent`) injection on the forwarded request**, traffic mirroring, PreRoute / PreUpstream / PostUpstream / Log hooks, **Wasm `OnRequestHeaders` + `OnResponseHeaders`**, **HSTS** header injection, **gzip + brotli response compression** (negotiated against `Accept-Encoding`, brotli preferred, automatically skipped for gRPC), plus per-protocol and per-pool bandwidth tracking and structured access logs (with trace_id). The only remaining HTTP/1+2-only feature is WebTransport (a different HTTP/3 protocol entirely, not a port).
 
 **Performance:** The HTTP/3 forwarder reuses a single process-wide `reqwest::Client` (DNS resolver, TLS context, and HTTP/1 connection pool are built once), and only allocates the request mirror copy when a `mirror_pool` is configured.
 
@@ -2508,7 +2510,7 @@ All test scripts live in `scripts/`. No external test framework is required for 
 ### Rust Tests
 
 ```bash
-# All 938 tests (712 unit + 226 integration)
+# All 949 tests (723 unit + 226 integration)
 cargo test
 
 # Only unit tests

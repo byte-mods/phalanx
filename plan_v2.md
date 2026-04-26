@@ -39,7 +39,7 @@ Auth chain, compression, metrics, mirroring, WebSocket, gRPC-Web NOT implemented
 **Status:** 🔧 **Partial** — significant chunks shipped, but the full surface
 (auth chain + compression + gRPC-Web + WebTransport) remains as its own focused PR.
 
-**Already shipped (batches 1-7):**
+**Already shipped (batches 1-8):**
 - Mirroring, hooks, sticky, AI routing, cache, GeoIP check, CAPTCHA, WAF
   (URL + body), zone limits, AccessLogger, BandwidthTracker (per-protocol +
   per-pool), Prometheus `http_requests_total` + `request_duration` histogram,
@@ -60,6 +60,26 @@ Auth chain, compression, metrics, mirroring, WebSocket, gRPC-Web NOT implemented
   on the H3 response. Operates on the buffered body (the H3 handler already
   collects the full upstream response before sending; streaming-aware
   compression remains a future polish).
+
+**Also shipped (batch 8):**
+- **gRPC-Web body translation** — separate `shared_grpc_upstream_client()`
+  built with `http2_prior_knowledge()` so the upstream sees real HTTP/2
+  framing (required for `grpc-status` / `grpc-message` trailers).
+  Detection via `is_h3_grpc_web` / `is_h3_grpc_web_text` (mirrors
+  `grpc_web::is_grpc_web` for `hyper::HeaderMap`). Request body:
+  base64-decoded if `grpc-web-text`, then `Content-Type` rewritten to
+  `application/grpc(+proto)` and `TE: trailers` added before forwarding.
+  Response body: assembled by `build_h3_grpc_web_response_body` —
+  upstream gRPC bytes plus a length-prefixed trailer frame
+  (`0x80 | u32_be_len | "grpc-status: N\r\n[grpc-message: …\r\n]"`)
+  built from the upstream's `grpc-status` / `grpc-message` headers,
+  defaulting to status 0; base64-encoded if the client used the text
+  variant. Outgoing `Content-Type` is rewritten back to
+  `application/grpc-web(+proto)` or `application/grpc-web-text+proto`
+  so the browser client sees the right subtype. Existing
+  `is_compressible` already returns false for `application/grpc-web*`,
+  so the gzip/brotli path naturally skips gRPC responses (correct —
+  gRPC has its own framing and double-compressing breaks clients).
 
 **Also shipped (batch 7):**
 - **URL rewriting** — full port of HTTP/1's `'rewrite` loop. Sits after
@@ -87,12 +107,9 @@ Auth chain, compression, metrics, mirroring, WebSocket, gRPC-Web NOT implemented
   through HTTP/3 without per-call upstream round-trips.
 
 **Still missing (deferred):**
-- gRPC-Web request/response **body translation** over HTTP/3 — preflight is
-  handled, but the actual body translation (base64 grpc-web-text decode,
-  trailer-frame appending) requires HTTP/2 forwarding semantics that the
-  current H3→HTTP/1 forwarder doesn't have. Needs its own design pass.
 - WebTransport (HTTP/3 native bidi streams) — different protocol API
-  entirely, not a port.
+  entirely, not a port. Would need a separate listener path that opens
+  bidi streams instead of unary HTTP-over-QUIC.
 - **P2 (227+ String clones)** — still requires the `HookContext` /
   `WasmRequestContext` / `AccessLogEntry` API redesign to accept
   `Arc<str>`. Tracked.
