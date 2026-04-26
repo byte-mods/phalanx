@@ -273,12 +273,16 @@ impl AdvancedCache {
     }
 }
 
-/// Generates a deterministic 16-hex-char filename from a cache key using
-/// the standard library's `DefaultHasher`. This avoids filesystem issues
-/// with special characters in cache keys.
+/// Generates a deterministic 16-hex-char filename from a cache key.
+///
+/// Uses `rustc_hash::FxHasher` (the hash function rustc itself uses) instead
+/// of the stdlib `DefaultHasher` (SipHash). FxHash is ~3-4× faster on the
+/// short-string keys typical of HTTP cache keys, with no DoS-resistance
+/// concern here because the key is server-constructed (`METHOD:HOST:PATH:…`)
+/// and never directly attacker-controlled.
 fn hex_prefix(key: &str) -> String {
     use std::hash::{Hash, Hasher};
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    let mut hasher = rustc_hash::FxHasher::default();
     key.hash(&mut hasher);
     format!("{:016x}", hasher.finish())
 }

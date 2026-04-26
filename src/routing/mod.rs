@@ -18,6 +18,7 @@
 //!   backends between UP/DOWN and advance the circuit breaker state machine.
 
 use arc_swap::ArcSwap;
+use smallvec::SmallVec;
 use dashmap::DashMap;
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -257,6 +258,25 @@ pub struct UpstreamPool {
     pub connection_pool: Arc<crate::proxy::pool::ConnectionPool>,
     /// Notification channel for queue-based waiting when all backends are at max_conns.
     queue_notify: Arc<tokio::sync::Notify>,
+    /// Cached ConsistentHash ring. Built lazily on first ConsistentHash request,
+    /// reused across subsequent requests, and rebuilt only when the
+    /// (address, effective_weight) signature of healthy backends changes.
+    /// Replaces the previous per-request rebuild that hashed and sorted
+    /// `weight × 160` virtual nodes (~640 entries for a typical 4-backend pool).
+    consistent_hash_ring: ArcSwap<Option<ConsistentHashRing>>,
+}
+
+/// Cached virtual-node ring for the ConsistentHash LB algorithm.
+struct ConsistentHashRing {
+    /// FxHash signature of the (sorted address, effective_weight) tuples used
+    /// to build this ring. A request comparing its current signature to this
+    /// value gets an O(n) cache validity check; if equal, the ring is reused
+    /// as-is. If different, the ring is rebuilt and stored.
+    signature: u64,
+    /// Sorted `(virtual_node_hash, backend)` entries on the u64 ring.
+    /// Backends are held by `Arc` so the ring stays valid even if a backend
+    /// is removed from the pool between rebuild and request.
+    entries: Vec<(u64, Arc<BackendNode>)>,
 }
 
 impl UpstreamPool {
@@ -274,6 +294,7 @@ impl UpstreamPool {
             round_robin_index: AtomicUsize::new(0),
             connection_pool: Arc::new(crate::proxy::pool::ConnectionPool::new(config.keepalive)),
             queue_notify: Arc::new(tokio::sync::Notify::new()),
+            consistent_hash_ring: ArcSwap::from_pointee(None),
         }
     }
 
@@ -322,42 +343,37 @@ impl UpstreamPool {
     ) -> Option<Arc<BackendNode>> {
         let current_backends = self.backends.load();
 
-        // Split into primary and backup backends
-        let healthy_primary: Vec<Arc<BackendNode>> = current_backends
-            .iter()
-            .filter(|b| b.is_healthy.load(Ordering::Acquire) && !b.config.backup)
-            .cloned()
-            .collect();
-
-        let healthy = if healthy_primary.is_empty() {
-            // Fallback to backup backends
-            let backup: Vec<Arc<BackendNode>> = current_backends
-                .iter()
-                .filter(|b| b.is_healthy.load(Ordering::Acquire) && b.config.backup)
-                .cloned()
-                .collect();
-            if backup.is_empty() {
-                return None;
+        // Single-pass partition into primary-and-available + backup-and-available.
+        // Stack-allocated SmallVec keeps the entire selection allocation-free in the
+        // common case (≤ 8 backends per pool); only spills to the heap for very
+        // wide pools. Replaces the previous 3 sequential `Vec::collect()` calls
+        // (one per filter), which heap-allocated 3× per request.
+        let mut primary: SmallVec<[Arc<BackendNode>; 8]> = SmallVec::new();
+        let mut backup: SmallVec<[Arc<BackendNode>; 8]> = SmallVec::new();
+        for b in current_backends.iter() {
+            // Combined health + circuit-breaker + capacity filter
+            if !b.is_healthy.load(Ordering::Acquire) || !b.is_circuit_closed() {
+                continue;
             }
+            if b.config.max_conns != 0
+                && b.active_connections.load(Ordering::Relaxed) >= b.config.max_conns as usize
+            {
+                continue;
+            }
+            if b.config.backup {
+                backup.push(Arc::clone(b));
+            } else {
+                primary.push(Arc::clone(b));
+            }
+        }
+
+        let healthy: SmallVec<[Arc<BackendNode>; 8]> = if !primary.is_empty() {
+            primary
+        } else if !backup.is_empty() {
             backup
         } else {
-            healthy_primary
-        };
-
-        // Filter by max_conns (skip backends at capacity) and circuit breaker state
-        let available: Vec<Arc<BackendNode>> = healthy
-            .into_iter()
-            .filter(|b| {
-                (b.config.max_conns == 0
-                    || b.active_connections.load(Ordering::Relaxed) < b.config.max_conns as usize)
-                    && b.is_circuit_closed()
-            })
-            .collect();
-
-        if available.is_empty() {
             return None;
-        }
-        let healthy = available;
+        };
 
         match self.algorithm {
             // ── Algorithm 1: AI Predictive ────────────────────────────
@@ -458,7 +474,7 @@ impl UpstreamPool {
 
                 // Hash the client IP (or fall back to random ts if unknown)
                 let key_hash: u64 = {
-                    let mut h = std::collections::hash_map::DefaultHasher::new();
+                    let mut h = rustc_hash::FxHasher::default();
                     if let Some(ip) = client_ip {
                         ip.hash(&mut h);
                     } else {
@@ -467,33 +483,75 @@ impl UpstreamPool {
                     h.finish()
                 };
 
-                // Build a sorted virtual-node ring from backend addresses.
-                // Each backend gets `weight * 160` virtual nodes spaced around a
-                // u64 ring, matching NGINX's default for better key distribution.
-                let virtual_nodes_per_backend = 160u32;
-                let mut ring: Vec<(u64, usize)> = Vec::new();
-                for (idx, backend) in healthy.iter().enumerate() {
-                    let w = backend.effective_weight().max(1);
-                    let slots = virtual_nodes_per_backend * w;
-                    for slot in 0..slots {
-                        let mut h = std::collections::hash_map::DefaultHasher::new();
-                        format!("{}#{}", backend.config.address, slot).hash(&mut h);
-                        ring.push((h.finish(), idx));
-                    }
-                }
-                ring.sort_unstable_by_key(|(hash, _)| *hash);
-
-                if ring.is_empty() {
-                    return None;
-                }
-
-                // Binary search for the first ring position >= key_hash (wrap-around)
-                let target_idx = match ring.binary_search_by_key(&key_hash, |(h, _)| *h) {
-                    Ok(i) | Err(i) => i % ring.len(),
+                let ring = self.get_or_build_consistent_hash_ring(&healthy);
+                let entries = match ring.as_ref() {
+                    Some(r) if !r.entries.is_empty() => &r.entries,
+                    _ => return None,
                 };
-                Some(Arc::clone(&healthy[ring[target_idx].1]))
+                let target_idx = match entries.binary_search_by_key(&key_hash, |(h, _)| *h) {
+                    Ok(i) | Err(i) => i % entries.len(),
+                };
+                Some(Arc::clone(&entries[target_idx].1))
             }
         }
+    }
+
+    /// Returns a cached `ConsistentHashRing` for the given healthy set, rebuilding
+    /// only when the (address, effective_weight) signature has changed.
+    ///
+    /// The signature check is O(n) where n is the number of healthy backends —
+    /// the ring rebuild is O(n × 160 × log) and roughly two orders of magnitude
+    /// more expensive at typical pool sizes, so amortising across many requests
+    /// is a meaningful win.
+    fn get_or_build_consistent_hash_ring(
+        &self,
+        healthy: &[Arc<BackendNode>],
+    ) -> Arc<Option<ConsistentHashRing>> {
+        use std::hash::{Hash, Hasher};
+
+        // Cheap signature: hash the (address, effective_weight) tuples in
+        // address-sorted order so reordering of `healthy` doesn't invalidate.
+        // Sort indices instead of cloning addresses.
+        let mut order: SmallVec<[usize; 8]> = (0..healthy.len()).collect();
+        order.sort_unstable_by(|&a, &b| {
+            healthy[a].config.address.cmp(&healthy[b].config.address)
+        });
+        let sig: u64 = {
+            let mut h = rustc_hash::FxHasher::default();
+            for &i in &order {
+                healthy[i].config.address.hash(&mut h);
+                healthy[i].effective_weight().hash(&mut h);
+            }
+            h.finish()
+        };
+
+        let cached = self.consistent_hash_ring.load();
+        if let Some(ring) = cached.as_ref() {
+            if ring.signature == sig {
+                return Arc::clone(&cached);
+            }
+        }
+
+        // Cache miss → rebuild. Each backend gets `effective_weight × 160`
+        // virtual nodes spaced around a u64 ring (matches NGINX default).
+        let virtual_nodes_per_backend = 160u32;
+        let mut entries: Vec<(u64, Arc<BackendNode>)> =
+            Vec::with_capacity(healthy.len() * virtual_nodes_per_backend as usize);
+        for backend in healthy.iter() {
+            let w = backend.effective_weight().max(1);
+            let slots = virtual_nodes_per_backend * w;
+            for slot in 0..slots {
+                let mut h = rustc_hash::FxHasher::default();
+                backend.config.address.hash(&mut h);
+                slot.hash(&mut h);
+                entries.push((h.finish(), Arc::clone(backend)));
+            }
+        }
+        entries.sort_unstable_by_key(|(hash, _)| *hash);
+        let new_ring = ConsistentHashRing { signature: sig, entries };
+        self.consistent_hash_ring.store(Arc::new(Some(new_ring)));
+        // Re-load to return the just-stored value with the right Arc identity.
+        self.consistent_hash_ring.load_full()
     }
 
     /// Selects a backend with queue-based waiting when all backends are at max_conns.
@@ -1195,6 +1253,43 @@ mod tests {
             let backend = pool.get_next_backend(Some(&ip), None).unwrap();
             assert_eq!(backend.config.address, backend1.config.address);
         }
+    }
+
+    /// Validates the C5 fix: the ConsistentHash ring is built once and reused
+    /// across calls when the (address, weight) signature is unchanged. We can't
+    /// easily measure "no allocation" in a unit test, so we assert pointer
+    /// equality on the cached `Arc<Option<ConsistentHashRing>>` — if the cache
+    /// works, the second call returns the same Arc instance.
+    #[test]
+    fn test_consistent_hash_ring_is_cached_across_calls() {
+        let pool_config = UpstreamPoolConfig {
+            algorithm: LoadBalancingAlgorithm::ConsistentHash,
+            backends: vec![
+                BackendConfig { address: "10.0.0.1:8080".to_string(), ..Default::default() },
+                BackendConfig { address: "10.0.0.2:8080".to_string(), ..Default::default() },
+                BackendConfig { address: "10.0.0.3:8080".to_string(), ..Default::default() },
+            ],
+            keepalive: 0,
+            srv_discover: None,
+            health_check_interval_secs: 5,
+            health_check_timeout_secs: 3,
+        };
+        let pool = UpstreamPool::new(&pool_config);
+        let ip: std::net::IpAddr = "10.10.10.10".parse().unwrap();
+
+        // First call: ring is built and stored
+        let _ = pool.get_next_backend(Some(&ip), None).unwrap();
+        let ring1 = pool.consistent_hash_ring.load_full();
+
+        // Second call: ring must be reused (same Arc pointer)
+        let _ = pool.get_next_backend(Some(&ip), None).unwrap();
+        let ring2 = pool.consistent_hash_ring.load_full();
+
+        assert!(
+            Arc::ptr_eq(&ring1, &ring2),
+            "ConsistentHash ring should be reused across calls when backends are unchanged"
+        );
+        assert!(ring1.is_some(), "ring should be populated after first call");
     }
 
     /// Distribution check for the Random LB algorithm.

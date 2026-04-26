@@ -49,7 +49,9 @@ rcgen = "0.14.7"
 regex = "1.12.3"
 reqwest = { version = "0.12", features = ["json"] }
 rocksdb = "0.24.0"
+rustc-hash = "2.1"
 rustls = "0.23.36"
+smallvec = "1.15"
 rustls-pemfile = "2.2.0"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.149"

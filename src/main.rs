@@ -352,6 +352,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         // OIDC session store (shared across all connections)
         let oidc_sessions = auth::oidc::new_session_store();
+        // Background sweep prevents abandoned sessions from accumulating.
+        // Per-request `check_session` already prunes on access, but unaccessed
+        // sessions need this safety net to keep memory bounded.
+        auth::oidc::spawn_session_cleanup(
+            Arc::clone(&oidc_sessions),
+            300, // every 5 min
+            shutdown_token.clone(),
+        );
 
         // ClusterState: shared KV across Phalanx nodes via Redis or etcd.
         // Enables distributed rate limiting, sticky sessions, and leader election.

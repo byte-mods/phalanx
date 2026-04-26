@@ -97,6 +97,53 @@ pub fn new_session_store() -> OidcSessionStore {
     Arc::new(DashMap::new())
 }
 
+/// Returns the number of expired sessions removed in one sweep.
+///
+/// Per-request expiry checks (`check_session`) prune lazily on access, so
+/// sessions that are accessed regularly never accumulate. But a session that
+/// is never re-accessed (user closes the tab) sits in the DashMap forever.
+/// This sweep removes those, keeping memory bounded.
+///
+/// `DashMap::retain` acquires per-shard write locks briefly. Run from a
+/// dedicated low-frequency task — 5 min is a sensible default.
+pub fn sweep_expired_sessions(store: &OidcSessionStore) -> usize {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let before = store.len();
+    store.retain(|_, sess| now <= sess.created_at + sess.expires_in);
+    before.saturating_sub(store.len())
+}
+
+/// Spawns a Tokio task that calls `sweep_expired_sessions` on a fixed
+/// interval until `shutdown` fires. Returns immediately.
+pub fn spawn_session_cleanup(
+    store: OidcSessionStore,
+    interval_secs: u64,
+    shutdown: tokio_util::sync::CancellationToken,
+) {
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(std::time::Duration::from_secs(interval_secs));
+        // Skip the immediate first tick — no point sweeping an empty store at startup.
+        ticker.tick().await;
+        loop {
+            tokio::select! {
+                _ = ticker.tick() => {
+                    let removed = sweep_expired_sessions(&store);
+                    if removed > 0 {
+                        tracing::debug!(removed, "OIDC session sweep");
+                    }
+                }
+                _ = shutdown.cancelled() => {
+                    tracing::debug!("OIDC session cleanup task shutting down");
+                    return;
+                }
+            }
+        }
+    });
+}
+
 /// Fetches the OIDC discovery document from the issuer.
 pub async fn discover(issuer_url: &str) -> Result<OidcDiscovery, String> {
     let url = format!(

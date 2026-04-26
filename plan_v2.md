@@ -36,6 +36,28 @@ Crashes on malformed config, invalid CORS headers, bad auth settings.
 **Problem:** `handle_h3_request()` in `src/proxy/http3.rs` missing critical functionality.
 Auth chain, compression, metrics, mirroring, WebSocket, gRPC-Web NOT implemented.
 
+**Status:** 🔧 **Partial** — significant chunks shipped, but the full surface
+(auth chain + compression + gRPC-Web + WebTransport) remains as its own focused PR.
+
+**Already shipped (batches 1+2):**
+- Mirroring, hooks, sticky, AI routing, cache, GeoIP check, CAPTCHA, WAF
+  (URL + body), zone limits, AccessLogger, BandwidthTracker (per-protocol +
+  per-pool), Prometheus `http_requests_total` + `request_duration` histogram,
+  PostUpstream + Log hooks, shared `reqwest::Client`, conditional mirror clone.
+
+**Still missing (deferred, big surface):**
+- Auth chain (Basic / JWT / OAuth / JWKS / OIDC / auth_request) —
+  ~200 lines per method to port from `handle_http_request`. Each needs its
+  own integration test against an HTTP/3 client.
+- Response compression (gzip / brotli) — needs streaming-aware port; the
+  current H3 path collects the full body before sending.
+- gRPC-Web detection + translation — needs CORS preflight handling over H3.
+- WebSocket equivalent (WebTransport over HTTP/3) — different protocol, not
+  a port.
+- W3C trace context propagation — minor.
+
+
+
 **Missing from HTTP/3 pipeline:**
 | Step | HTTP/1 | HTTP/3 | File:Line |
 |------|--------|--------|-----------|
@@ -70,41 +92,56 @@ Hyper takes ownership of TcpStream. Connections never returned to pool.
 **Problem:** 3 `Vec::clone().collect()` calls per backend selection.
 Heap allocations on hot path (~10µs overhead per request).
 
-**File:** `src/routing/mod.rs:326-360`
-```rust
-// CURRENT (slow):
-let healthy_primary: Vec<Arc<BackendNode>> = current_backends.iter().filter(...).cloned().collect();
-let backup: Vec<...> = current_backends.iter().filter(...).cloned().collect();
-let available: Vec<...> = healthy.into_iter().filter(...).collect();
+**Fix:** Replaced 3 sequential `Vec::collect()` filters with a single-pass
+partition into stack-allocated `SmallVec<[Arc<BackendNode>; 8]>`. Most
+deployments have ≤8 backends per pool, so the entire selection is
+zero-heap-allocation in the common case.
 
-// FIX: Iterate in-place, avoid cloning
-```
-
-**Fix:** Use stack-allocated array or smallvec, filter in single pass.
-**Status:** ⬜ Not started
+**Status:** ✅ Done (2026-04-27, batch 3) — `src/routing/mod.rs:325-353`.
 
 ### P2: String Cloning on Hot Path
 **Problem:** 227+ `.to_string()` / `.to_owned()` calls per request in proxy handler.
 GC pressure, latency spikes.
 
-**Key offenders:**
-- Line 882: `path.to_string()` — path is already &str
-- Line 895: `ip_str = real_ip.to_string()` — IP already available
-- Lines 936, 974, 1768: `.filter_map(...to_string())` on headers
+**Status:** ⏸ **Deferred** — needs API redesign, not a drive-by fix.
 
-**Fix:** Use `Cow<'_, str>` or `&str` references where possible.
-**Status:** ⬜ Not started
+**Why deferred:** Most of the clones are at boundaries where the consumer
+type owns a `String` (`HookContext.path: String`, `AccessLogEntry.method: String`,
+`WasmRequestContext.client_ip: String`, etc.). Replacing them requires
+either:
+1. Changing those struct fields to `Arc<str>` (a transitive API change
+   across the `HookHandler` trait, `WasmPlugin` trait, and access log
+   serialisation), or
+2. Threading `Cow<'a, str>` through with explicit lifetimes (also
+   transitive, with significant friction at `Arc::clone` / cross-task boundaries).
+
+A correct version would require microbenchmarks to confirm the
+allocation reduction beats the added Arc atomic overhead (`Arc::clone`
+is cheap but not free), and likely a new `RequestSnapshot` struct that
+owns one set of strings shared across all per-phase contexts.
+
+This is a focused refactor PR's worth of work, not a single-commit fix.
 
 ### P3: Mutex Contention in Cache and Pool
 **Problem:** `tokio::sync::Mutex` in `src/middleware/cache.rs:25` and `src/proxy/pool.rs:18`.
 Per-key locks cause contention under high throughput.
 
-**Files:**
-- `src/middleware/cache.rs:25` — per-key thundering herd mutex
-- `src/proxy/pool.rs:18` — connection pool mutex per backend
+**Fix (pool):** Replaced `Arc<Mutex<HashMap<String, VecDeque>>>` with
+`Arc<DashMap<String, VecDeque>>`. Operations on different backend addresses
+now run in parallel (per-shard lock instead of one global lock). The reaper
+loop also iterates per-shard. Regression test
+`pool_per_backend_isolation_via_dashmap` verifies independent backends can be
+released without serialising.
 
-**Fix:** Replace with atomic spin-wait or DashMap's internal locking.
-**Status:** ⬜ Not started
+**Status (pool):** ✅ Done (2026-04-27, batch 3).
+
+**Status (cache per-key Mutex):** ⏸ Kept as-is — the per-key
+`tokio::sync::Mutex` is the **singleflight** pattern (only one request
+fetches from upstream on cache miss; others wait for the result). That
+serialisation is intentional and correct. Removing it would amplify
+upstream load on cache miss. The lock-map's unbounded growth (entries
+never removed) is a separate concern — a dedicated cleanup is a follow-up
+that doesn't change the lock pattern itself.
 
 ### P4: Random Algorithm Uses SystemTime Syscall
 **Problem:** `SystemTime::now()` in `src/routing/mod.rs:394-398` for Random LB.
@@ -118,11 +155,21 @@ dependency, no need for `SmallRng`.
 test `test_random_lb_visits_all_backends` checks 4-way distribution.
 
 ### P5: OIDC Session Cleanup O(n) Scan
-**Problem:** `src/auth/oidc.rs` — cleanup iterates all sessions to find expired.
-No TTL index.
+**Original premise:** plan_v2 v1 said `oidc.rs` had a per-request O(n)
+cleanup scan. Re-audit shows that was inaccurate — `check_session()`
+prunes expired sessions O(1) on access (`sessions.remove(...)` at the
+single matching key). There was NO scan loop.
 
-**Fix:** Use `IndexMap` with expiration ordering, or timer wheel.
-**Status:** ⬜ Not started
+**Real underlying issue:** sessions that are never re-accessed (user
+closes the tab) accumulate forever in the `DashMap`. Memory leak, not
+latency.
+
+**Fix:** Added `sweep_expired_sessions()` (`DashMap::retain` over the
+single store) and `spawn_session_cleanup()` (Tokio task on a 5-min ticker,
+respecting the shutdown token). Wired from `main.rs` after
+`new_session_store()`. Per-request path remains O(1).
+
+**Status:** ✅ Done (2026-04-27, batch 3) — `src/auth/oidc.rs:100-148`.
 
 ### P6: HookEngine.has_hooks() Lock + Scan
 **Problem:** Every request calls `hook_engine.has_hooks(PreRoute)` which does:
@@ -198,7 +245,17 @@ calls.
 **Problem:** `src/routing/mod.rs:473-486` rebuilds virtual node ring per request.
 For 4 backends with weight 10 = 6400 virtual nodes sorted per request.
 
-**Status:** ⬜ Not started
+**Fix:** Added `consistent_hash_ring: ArcSwap<Option<ConsistentHashRing>>` on
+`UpstreamPool`. `get_or_build_consistent_hash_ring()` computes a cheap O(n)
+FxHash signature of the (sorted address, effective_weight) tuples; if the
+signature matches the cached ring, the existing ring is reused as-is. Only
+rebuilds when backends are added/removed or `effective_weight()` changes
+(slow-start ramp completion). Hashing inside the ring itself also switched
+from `DefaultHasher` (SipHash) to `FxHasher` for ~3-4× faster construction.
+
+**Status:** ✅ Done (2026-04-27, batch 3) — `src/routing/mod.rs:455-540`.
+Regression test `test_consistent_hash_ring_is_cached_across_calls` asserts
+pointer equality on the cached `Arc` across consecutive calls.
 
 ### C6: Static File `.unwrap()` on MIME Header Parsing
 **Problem:** `src/proxy/mod.rs:4044,4048,4079,4083` can panic on invalid MIME types.
@@ -225,7 +282,13 @@ Backend 503 without header = panic.
 **Problem:** `src/middleware/cache.rs:280` uses `DefaultHasher` (SipHash).
 Not optimal for in-memory cache with 100K+ ops/sec.
 
-**Status:** ⬜ Not started
+**Fix:** Swapped `std::hash::DefaultHasher` for `rustc_hash::FxHasher` (the
+hash function rustc itself uses). FxHash is ~3-4× faster on the short-string
+keys typical of HTTP cache keys. No DoS-resistance concern: cache keys are
+server-constructed (`METHOD:HOST:PATH:…`), never directly attacker-controlled.
+Added `rustc-hash = "2.1"` as a direct dep (was already transitively present).
+
+**Status:** ✅ Done (2026-04-27, batch 3) — `src/middleware/cache.rs:276-289`.
 
 ### P8: HTTP/3 Missing Bandwidth Tracking
 **Problem:** No `bandwidth.inc_requests()` or `bandwidth.add_out()` calls in H3.

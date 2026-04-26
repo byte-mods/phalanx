@@ -93,7 +93,9 @@ limitations under the License.
 
 ## What Is Built
 
-Every item below is fully implemented, compiles, and is covered by tests. **911 tests total (685 unit + 226 integration) — all passing.**
+Every item below is fully implemented, compiles, and is covered by tests. **913 tests total (687 unit + 226 integration) — all passing.**
+
+> **2026-04-27 update (later, batch 3):** Five more bare-metal wins from the plan_v2 audit. **P1** — `get_next_backend()` now uses a stack-allocated `SmallVec<[_; 8]>` populated in a single pass, eliminating 3 per-request `Vec::collect()` allocations (zero heap allocation in the common ≤8-backend case). **C5** — ConsistentHash ring is cached via `ArcSwap<Option<ConsistentHashRing>>` with an FxHash signature of (address, effective_weight); previously rebuilt 6400-entry sorted virtual-node ring per request, now rebuilt only when backends or weights change. **P3** — connection pool switched from `Arc<Mutex<HashMap>>` to `Arc<DashMap>`; releases for different backends no longer serialise on a global lock. **P5** — added background OIDC session sweep (`spawn_session_cleanup` on a 5-min ticker) so abandoned sessions don't accumulate forever; per-request path stays O(1). **P7** — cache `hex_prefix()` swapped from stdlib `DefaultHasher` (SipHash) to `rustc_hash::FxHasher` (~3-4× faster on short keys). 913 tests passing.
 
 > **2026-04-27 update (later, batch 2):** Two more bare-metal-class hot-path wins. (1) Random LB algorithm no longer makes a `SystemTime::now()` syscall per backend pick — it now uses the thread-local ChaCha RNG (`rand::random`), turning a ~30 ns vsyscall into a ~3 ns user-space pull. (2) `HookEngine::has_hooks(phase)` is now lock-free: the per-phase populated-bit is held in `[AtomicBool; 4]` so the hot path no longer takes a `parking_lot::RwLock` four times per request when no hooks are configured. Defense-in-depth: removed an additional `.unwrap()` panic site at the WWW-Authenticate header construction path (config-derived realm). 911 tests passing.
 
@@ -114,7 +116,7 @@ Every item below is fully implemented, compiles, and is covered by tests. **911 
 | **Routing** | Prefix routing, URL rewrite engine, static files, real client IP extraction (XFF / X-Real-IP / PROXY protocol v1/v2) |
 | **Traffic Shaping** | Traffic mirroring/tee (fully wired), consistent-hash splitting, sticky sessions |
 | **Resilience** | Circuit breaker (3-state, exponential backoff), slow-start ramp (linear weight recovery), active + passive health checks, backend request queue |
-| **Performance** | Zero-copy TCP proxy via Linux `splice(2)`; fallback `copy_bidirectional` on non-Linux; L2 disk cache with stale-while-revalidate; HTTP/3 forwarder reuses one process-wide `reqwest::Client` (DNS, TLS, keepalive built once); mirror payload cloned only when a `mirror_pool` is configured; Random LB uses thread-local ChaCha RNG (no `SystemTime::now()` syscall); `HookEngine::has_hooks(phase)` is lock-free via `[AtomicBool; 4]` |
+| **Performance** | Zero-copy TCP proxy via Linux `splice(2)`; fallback `copy_bidirectional` on non-Linux; L2 disk cache with stale-while-revalidate; HTTP/3 forwarder reuses one process-wide `reqwest::Client` (DNS, TLS, keepalive built once); mirror payload cloned only when a `mirror_pool` is configured; Random LB uses thread-local ChaCha RNG (no `SystemTime::now()` syscall); `HookEngine::has_hooks(phase)` is lock-free via `[AtomicBool; 4]`; `get_next_backend()` uses stack-allocated `SmallVec<[_; 8]>` (zero heap in common case); ConsistentHash ring cached via `ArcSwap` with FxHash signature (rebuilds only on backend change); connection pool sharded via `DashMap` (per-backend operations parallel); cache `hex_prefix()` uses `FxHasher` not SipHash |
 | **Dynamic Security** | Keyval-backed runtime IP bans (TTL-based); WAF auto-ban feeds back into keyval; external systems can update ban list without restart |
 | **Observability** | Prometheus metrics, OpenTelemetry OTLP traces with W3C `traceparent` injection, structured access logs, admin dashboard |
 | **Bandwidth Monitoring** | Per-protocol atomic counters (bytes_in, bytes_out, requests, active_connections) for HTTP1/2/3, WebSocket, gRPC, TCP, UDP, WebRTC; sorted utilization snapshots; configurable per-protocol thresholds |
@@ -2498,7 +2500,7 @@ All test scripts live in `scripts/`. No external test framework is required for 
 ### Rust Tests
 
 ```bash
-# All 911 tests (685 unit + 226 integration)
+# All 913 tests (687 unit + 226 integration)
 cargo test
 
 # Only unit tests
