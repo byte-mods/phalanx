@@ -39,7 +39,7 @@ Auth chain, compression, metrics, mirroring, WebSocket, gRPC-Web NOT implemented
 **Status:** 🔧 **Partial** — significant chunks shipped, but the full surface
 (auth chain + compression + gRPC-Web + WebTransport) remains as its own focused PR.
 
-**Already shipped (batches 1-8):**
+**Already shipped (batches 1-9):**
 - Mirroring, hooks, sticky, AI routing, cache, GeoIP check, CAPTCHA, WAF
   (URL + body), zone limits, AccessLogger, BandwidthTracker (per-protocol +
   per-pool), Prometheus `http_requests_total` + `request_duration` histogram,
@@ -60,6 +60,19 @@ Auth chain, compression, metrics, mirroring, WebSocket, gRPC-Web NOT implemented
   on the H3 response. Operates on the buffered body (the H3 handler already
   collects the full upstream response before sending; streaming-aware
   compression remains a future polish).
+
+**Also shipped (batch 9):**
+- **WebTransport detection** — `is_h3_extended_connect` recognises any
+  HTTP/3 CONNECT request (and clients that signal via the
+  `sec-webtransport-http3-draft02` header); responds with 501 plus a
+  `phalanx-webtransport-status: not_implemented` header. Operators can
+  see attempted WT usage in their logs and clients can distinguish
+  "feature not implemented" from "URL not found". The actual
+  WebTransport session protocol (bidirectional streams, datagrams,
+  `SETTINGS_ENABLE_WEBTRANSPORT` negotiation) is **not** implemented —
+  that needs the experimental `h3-webtransport` crate plus a
+  forwarding-semantics design (proxy WT-streams to a WT-speaking
+  upstream is itself a design question).
 
 **Also shipped (batch 8):**
 - **gRPC-Web body translation** — separate `shared_grpc_upstream_client()`
@@ -107,12 +120,12 @@ Auth chain, compression, metrics, mirroring, WebSocket, gRPC-Web NOT implemented
   through HTTP/3 without per-call upstream round-trips.
 
 **Still missing (deferred):**
-- WebTransport (HTTP/3 native bidi streams) — different protocol API
-  entirely, not a port. Would need a separate listener path that opens
-  bidi streams instead of unary HTTP-over-QUIC.
-- **P2 (227+ String clones)** — still requires the `HookContext` /
-  `WasmRequestContext` / `AccessLogEntry` API redesign to accept
-  `Arc<str>`. Tracked.
+- **WebTransport session protocol** — detection is shipped (501 with
+  `phalanx-webtransport-status: not_implemented`); the actual session
+  protocol (bidi streams, datagrams, SETTINGS negotiation) needs the
+  experimental `h3-webtransport` crate plus a forwarding-semantics
+  design. Operators get visibility today; full implementation is a
+  separate focused PR.
 
 
 
@@ -161,24 +174,38 @@ zero-heap-allocation in the common case.
 **Problem:** 227+ `.to_string()` / `.to_owned()` calls per request in proxy handler.
 GC pressure, latency spikes.
 
-**Status:** ⏸ **Deferred** — needs API redesign, not a drive-by fix.
+**Fix (HookContext slice):** `HookContext.{client_ip,method,path}` are now
+`Arc<str>` and `query` is `Option<Arc<str>>`. Each handler builds the
+Arcs **once per request** (`ip_arc`, `method_arc`, `final_path_arc`) and
+`Arc::clone` (atomic increment, no heap allocation) at every per-phase
+HookContext construction site instead of String-cloning per phase.
+PreRoute keeps a separate path Arc because it fires *before* the rewrite
+loop and must see the original client-sent path.
 
-**Why deferred:** Most of the clones are at boundaries where the consumer
-type owns a `String` (`HookContext.path: String`, `AccessLogEntry.method: String`,
-`WasmRequestContext.client_ip: String`, etc.). Replacing them requires
-either:
-1. Changing those struct fields to `Arc<str>` (a transitive API change
-   across the `HookHandler` trait, `WasmPlugin` trait, and access log
-   serialisation), or
-2. Threading `Cow<'a, str>` through with explicit lifetimes (also
-   transitive, with significant friction at `Arc::clone` / cross-task boundaries).
+`IpAccessHook` was switched from `Vec<String>::contains(&Arc<str>)` to
+`iter().any(|s| s == &str_deref)` so the IP set lookup still compiles
+without forcing an allocation.
 
-A correct version would require microbenchmarks to confirm the
-allocation reduction beats the added Arc atomic overhead (`Arc::clone`
-is cheap but not free), and likely a new `RequestSnapshot` struct that
-owns one set of strings shared across all per-phase contexts.
+`RhaiHookHandler` converts to `String` at the Rhai scope boundary
+(`scope.push("uri", ctx.path.to_string())`) — Rhai's `Scope::push`
+stores the concrete type and method dispatch on `Arc<str>` doesn't pick
+up `String`/`str`'s `starts_with`/`contains`, so the conversion is
+required for script semantics. Allocation only paid when scripts are
+configured (~1 alloc per Rhai-fired phase, vs. previously every phase).
 
-This is a focused refactor PR's worth of work, not a single-commit fix.
+**Savings on the hot path** (per request, when hooks are configured):
+12 `String` allocations → 5 `Arc::from(&str)` allocations + 12 atomic
+increments. ~58% fewer heap allocations across the per-phase contexts.
+
+**Status:** ✅ Done (2026-04-27, batch 9) — `src/scripting/mod.rs`,
+`src/scripting/rhai_engine.rs`, `src/proxy/mod.rs`, `src/proxy/http3.rs`.
+
+**Still String, deliberately:** `WasmRequestContext` and `AccessLogEntry`
+keep their `String` fields. Wasm is a serialisation/ABI boundary
+(plugins receive owned data), and `AccessLogEntry` is `serde::Serialize`
+to a structured log writer. Both are downstream of the per-request
+phase allocation, so the additional optimisation gain is small and the
+API ripple cost would be high.
 
 ### P3: Mutex Contention in Cache and Pool
 **Problem:** `tokio::sync::Mutex` in `src/middleware/cache.rs:25` and `src/proxy/pool.rs:18`.

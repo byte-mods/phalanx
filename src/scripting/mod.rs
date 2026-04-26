@@ -1,6 +1,7 @@
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use tracing::{debug, info};
 
@@ -35,16 +36,25 @@ pub enum HookPhase {
 /// This struct is populated by the proxy pipeline and passed to every hook
 /// handler. Pre-upstream hooks see request data; post-upstream hooks also
 /// see the response status and headers.
+///
+/// Performance: the high-frequency request fields (`client_ip`, `method`,
+/// `path`, `query`) are `Arc<str>` so the proxy can build them **once** per
+/// request and `Arc::clone` (atomic increment, no heap allocation) into
+/// each per-phase context. Previously these were owned `String`s, which
+/// meant every phase that fired re-allocated all four. The `headers` and
+/// `response_headers` maps stay `HashMap<String, String>` because they're
+/// per-phase data (request headers vs response headers) and there's no
+/// cross-phase sharing to amortize.
 #[derive(Debug, Clone)]
 pub struct HookContext {
     /// Client's IP address (after real-IP extraction).
-    pub client_ip: String,
+    pub client_ip: Arc<str>,
     /// HTTP method (e.g. "GET", "POST").
-    pub method: String,
+    pub method: Arc<str>,
     /// Request URI path (e.g. "/api/users").
-    pub path: String,
+    pub path: Arc<str>,
     /// Optional query string (without the leading `?`).
-    pub query: Option<String>,
+    pub query: Option<Arc<str>>,
     /// Request headers as a flat key-value map.
     pub headers: HashMap<String, String>,
     /// Response status code (only populated in PostUpstream and Log phases).
@@ -344,8 +354,12 @@ impl IpAccessHook {
 
 impl HookHandler for IpAccessHook {
     fn execute(&self, ctx: &HookContext) -> HookResult {
+        // `ctx.client_ip` is `Arc<str>`; `denied_ips`/`allowed_ips` are
+        // `Vec<String>`. Compare via `&str` deref so we don't have to
+        // convert types just to call `Vec::contains`.
+        let ip: &str = &ctx.client_ip;
         // Step 1: Check denylist first (deny takes precedence over allow)
-        if self.denied_ips.contains(&ctx.client_ip) {
+        if self.denied_ips.iter().any(|s| s == ip) {
             return HookResult::Respond {
                 status: 403,
                 body: "Forbidden".to_string(),
@@ -353,7 +367,7 @@ impl HookHandler for IpAccessHook {
             };
         }
         // Step 2: If an allowlist exists, the client must be on it
-        if !self.allowed_ips.is_empty() && !self.allowed_ips.contains(&ctx.client_ip) {
+        if !self.allowed_ips.is_empty() && !self.allowed_ips.iter().any(|s| s == ip) {
             return HookResult::Respond {
                 status: 403,
                 body: "Forbidden".to_string(),
@@ -371,9 +385,9 @@ mod tests {
 
     fn hook_ctx() -> HookContext {
         HookContext {
-            client_ip: "1.2.3.4".to_string(),
-            method: "GET".to_string(),
-            path: "/".to_string(),
+            client_ip: "1.2.3.4".into(),
+            method: "GET".into(),
+            path: "/".into(),
             query: None,
             headers: HashMap::new(),
             status: None,

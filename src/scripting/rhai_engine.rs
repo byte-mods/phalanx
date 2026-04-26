@@ -117,10 +117,16 @@ impl RhaiEngine {
 
         let mut scope = Scope::new();
 
-        // Populate the scope with request context variables
-        scope.push("uri", ctx.path.clone());
-        scope.push("method", ctx.method.clone());
-        scope.push("client_ip", ctx.client_ip.clone());
+        // Populate the scope with request context variables.
+        // Rhai's `Scope::push` stores values by their concrete type and does
+        // NOT auto-convert `Arc<str>` into a Rhai string for method dispatch
+        // (`starts_with`, `contains`, etc. are defined on `str`/`String`,
+        // not `Arc<str>`). Convert at this boundary so scripts can use the
+        // standard string API. The conversion is one allocation per Rhai
+        // invocation — only paid when scripts are configured.
+        scope.push("uri", ctx.path.to_string());
+        scope.push("method", ctx.method.to_string());
+        scope.push("client_ip", ctx.client_ip.to_string());
         scope.push("status", ctx.status.map(|s| s as i64).unwrap_or(0i64));
 
         // Convert headers HashMap<String, String> → rhai::Map
@@ -308,9 +314,9 @@ mod tests {
 
     fn ctx() -> HookContext {
         HookContext {
-            client_ip: "10.0.0.1".to_string(),
-            method: "GET".to_string(),
-            path: "/api/test".to_string(),
+            client_ip: "10.0.0.1".into(),
+            method: "GET".into(),
+            path: "/api/test".into(),
             query: None,
             headers: HashMap::new(),
             status: None,
@@ -387,7 +393,7 @@ mod tests {
             }
         "#;
         let mut c = ctx();
-        c.path = "/old/api".to_string();
+        c.path = "/old/api".into();
         let handler = RhaiHookHandler::from_str(script);
         match handler.execute(&c) {
             HookResult::RewritePath(p) => assert_eq!(p, "/new"),

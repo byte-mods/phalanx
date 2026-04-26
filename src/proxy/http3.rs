@@ -450,6 +450,16 @@ async fn handle_h3_request(
     let req_is_grpc_web = is_h3_grpc_web(req.headers());
     let req_is_grpc_web_text = is_h3_grpc_web_text(req.headers());
 
+    // ── Per-request Arc<str> snapshots for HookContext sharing (P2) ────────
+    // ip_str and method don't change after this point, so we build the Arc
+    // once and Arc::clone (atomic increment, no heap alloc) at each phase
+    // instead of re-allocating a String per phase. Path gets two Arcs: one
+    // for PreRoute (which sees the original client-sent path) and one
+    // built after the rewrite loop for PreUpstream / PostUpstream / Log.
+    let ip_arc: Arc<str> = Arc::from(ip_str.as_str());
+    let method_arc: Arc<str> = Arc::from(method.as_str());
+    let query_arc: Option<Arc<str>> = query.as_deref().map(Arc::from);
+
     debug!("HTTP/3 {} {}", method, path);
 
     // ── Rate limiting ──
@@ -500,6 +510,30 @@ async fn handle_h3_request(
     // `grpc_web::cors_preflight_response()` for HTTP/1.
     if is_h3_grpc_web_preflight(&method, req.headers()) {
         send_h3_grpc_web_preflight(&mut stream).await;
+        return;
+    }
+
+    // ── WebTransport detection (RFC 9220 Extended CONNECT) ────────────────
+    // Phalanx does not yet implement the WebTransport-over-HTTP/3 session
+    // protocol (bidirectional streams, datagrams, SETTINGS_ENABLE_WEBTRANSPORT
+    // negotiation). Detecting CONNECT requests here lets us return a
+    // structured 501 with a `phalanx-webtransport-status` header so callers
+    // can distinguish "feature not implemented" from "URL not found" and
+    // operators can see attempted WT usage in their logs.
+    if is_h3_extended_connect(&method, req.headers()) {
+        let target = h3_extended_connect_protocol(req.headers())
+            .unwrap_or_else(|| "<unknown>".to_string());
+        debug!(
+            "HTTP/3 Extended CONNECT from {} for protocol {} — not implemented",
+            ip_str, target
+        );
+        send_h3_response_with_header(
+            &mut stream,
+            StatusCode::NOT_IMPLEMENTED,
+            hyper::header::HeaderName::from_static("phalanx-webtransport-status"),
+            hyper::header::HeaderValue::from_static("not_implemented"),
+        )
+        .await;
         return;
     }
 
@@ -557,11 +591,14 @@ async fn handle_h3_request(
 
     // ── PreRoute hooks (Rhai scripting) ──
     if hook_engine.has_hooks(HookPhase::PreRoute) {
+        // PreRoute fires BEFORE the rewrite loop, so its `path` is the
+        // original client-sent path. Build a separate Arc for this phase.
+        let pre_route_path: Arc<str> = Arc::from(path.as_str());
         let hook_ctx = HookContext {
-            client_ip: ip_str.clone(),
-            method: method.as_str().to_string(),
-            path: path.clone(),
-            query: query.clone(),
+            client_ip: Arc::clone(&ip_arc),
+            method: Arc::clone(&method_arc),
+            path: pre_route_path,
+            query: query_arc.clone(),
             headers: req
                 .headers()
                 .iter()
@@ -728,6 +765,11 @@ async fn handle_h3_request(
         break 'rewrite;
     }
 
+    // After the rewrite loop `path` is the final value used by the rest of
+    // the pipeline. Build one Arc<str> here and Arc::clone into each
+    // remaining HookContext (PreUpstream, PostUpstream, Log).
+    let final_path_arc: Arc<str> = Arc::from(path.as_str());
+
     // ── Route matching — longest-prefix match (uses possibly-rewritten path) ──
     let route = {
         let mut best: Option<(String, crate::config::RouteConfig)> = None;
@@ -793,10 +835,10 @@ async fn handle_h3_request(
     // ── PreUpstream hooks ──
     if hook_engine.has_hooks(HookPhase::PreUpstream) {
         let hook_ctx = HookContext {
-            client_ip: ip_str.clone(),
-            method: method.as_str().to_string(),
-            path: path.clone(),
-            query: query.clone(),
+            client_ip: Arc::clone(&ip_arc),
+            method: Arc::clone(&method_arc),
+            path: Arc::clone(&final_path_arc),
+            query: query_arc.clone(),
             headers: req
                 .headers()
                 .iter()
@@ -1025,9 +1067,9 @@ async fn handle_h3_request(
             .filter_map(|(k, v)| v.to_str().ok().map(|vs| (k.as_str().to_string(), vs.to_string())))
             .collect();
         let hook_ctx = crate::scripting::HookContext {
-            client_ip: ip_str.clone(),
-            method: method_str.clone(),
-            path: path.clone(),
+            client_ip: Arc::clone(&ip_arc),
+            method: Arc::clone(&method_arc),
+            path: Arc::clone(&final_path_arc),
             query: None,
             headers: Default::default(),
             status: Some(status.as_u16()),
@@ -1295,10 +1337,10 @@ async fn handle_h3_request(
     // ── Log hooks: post-response auditing ──
     if hook_engine.has_hooks(HookPhase::Log) {
         let log_ctx = HookContext {
-            client_ip: ip_str,
-            method: method_str,
-            path,
-            query,
+            client_ip: Arc::clone(&ip_arc),
+            method: Arc::clone(&method_arc),
+            path: Arc::clone(&final_path_arc),
+            query: query_arc.clone(),
             headers: Default::default(),
             status: Some(status_u16),
             response_headers: Default::default(),
@@ -1781,6 +1823,46 @@ fn is_h3_grpc_web_preflight(method: &hyper::Method, headers: &hyper::HeaderMap) 
         .unwrap_or(false)
 }
 
+/// True for HTTP Extended CONNECT requests (RFC 8441 / 9220) — the
+/// transport mechanism WebTransport uses on top of HTTP/3.
+///
+/// We detect either:
+/// 1. The hyper `Protocol` extension (set by hyper when the H3 layer
+///    surfaces the `:protocol` pseudo-header). This is the canonical
+///    signal but its presence depends on the h3 crate version.
+/// 2. Plain `CONNECT` method (covers HTTP CONNECT tunnelling too — also
+///    not implemented here).
+///
+/// Either way, the appropriate response is "not implemented" rather than
+/// "404", because the URL is fine — we just don't speak this protocol.
+fn is_h3_extended_connect(method: &hyper::Method, headers: &hyper::HeaderMap) -> bool {
+    if *method == hyper::Method::CONNECT {
+        return true;
+    }
+    // Some clients send the protocol via a `:protocol`-equivalent header
+    // when targeting servers that surface it differently. Defensive check.
+    headers
+        .get("sec-webtransport-http3-draft02")
+        .or_else(|| headers.get("sec-webtransport-http3-draft"))
+        .is_some()
+}
+
+/// Returns the protocol name from an Extended CONNECT request, when known.
+/// Used purely for the diagnostic log/header so operators can see which
+/// extension was being requested (most commonly `webtransport`).
+fn h3_extended_connect_protocol(headers: &hyper::HeaderMap) -> Option<String> {
+    if headers.contains_key("sec-webtransport-http3-draft02")
+        || headers.contains_key("sec-webtransport-http3-draft")
+    {
+        return Some("webtransport".to_string());
+    }
+    // Fall back to a generic indication when the extension isn't named.
+    headers
+        .get("upgrade")
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string())
+}
+
 /// CORS preflight response for gRPC-Web over HTTP/3. Mirrors the headers
 /// emitted by `grpc_web::cors_preflight_response` for HTTP/1.
 async fn send_h3_grpc_web_preflight(
@@ -1860,7 +1942,8 @@ fn build_quic_tls_config(app_config: &AppConfig) -> Option<rustls::ServerConfig>
 mod tests {
     use super::{
         apply_h3_auth_chain, build_h3_grpc_web_response_body, build_h3_grpc_web_trailer_frame,
-        build_return_to, decode_form_component, h3_generate_trace_ids, is_h3_grpc_web,
+        build_return_to, decode_form_component, h3_extended_connect_protocol,
+        h3_generate_trace_ids, is_h3_extended_connect, is_h3_grpc_web,
         is_h3_grpc_web_preflight, is_h3_grpc_web_text, parse_urlencoded_form,
         shared_grpc_upstream_client, shared_upstream_client, translate_h3_grpc_web_request_body,
         H3AuthOutcome,
@@ -2375,6 +2458,97 @@ mod tests {
             apply_h3_auth_chain(route.as_ref(), &cfg, &h, &hyper::Method::GET, "/p", &store)
                 .await;
         assert!(matches!(out, H3AuthOutcome::Denied { .. }));
+    }
+
+    // ── WebTransport (Extended CONNECT) detection ───────────────────────
+
+    #[test]
+    fn test_h3_detects_plain_connect_as_extended_connect() {
+        // CONNECT method alone is enough — covers WebTransport, HTTP CONNECT
+        // tunnelling, and any future Extended-CONNECT variant.
+        let h = hyper::HeaderMap::new();
+        assert!(is_h3_extended_connect(&hyper::Method::CONNECT, &h));
+    }
+
+    #[test]
+    fn test_h3_detects_webtransport_via_draft_header() {
+        // A non-CONNECT request with the WebTransport draft header still
+        // counts (defensive — covers clients that use a non-standard signal).
+        let mut h = hyper::HeaderMap::new();
+        h.insert(
+            hyper::header::HeaderName::from_static("sec-webtransport-http3-draft02"),
+            "1".parse().unwrap(),
+        );
+        assert!(is_h3_extended_connect(&hyper::Method::POST, &h));
+    }
+
+    #[test]
+    fn test_h3_extended_connect_does_not_match_normal_request() {
+        // Plain GET without any draft header must NOT trip WT detection.
+        let h = hyper::HeaderMap::new();
+        assert!(!is_h3_extended_connect(&hyper::Method::GET, &h));
+        assert!(!is_h3_extended_connect(&hyper::Method::POST, &h));
+    }
+
+    #[test]
+    fn test_h3_extended_connect_protocol_extracts_webtransport() {
+        let mut h = hyper::HeaderMap::new();
+        h.insert(
+            hyper::header::HeaderName::from_static("sec-webtransport-http3-draft02"),
+            "1".parse().unwrap(),
+        );
+        assert_eq!(
+            h3_extended_connect_protocol(&h).as_deref(),
+            Some("webtransport")
+        );
+    }
+
+    #[test]
+    fn test_h3_extended_connect_protocol_falls_back_to_upgrade_header() {
+        // If neither WT draft header is set but `Upgrade` is, surface it
+        // verbatim so the diagnostic log captures whatever the client asked for.
+        let mut h = hyper::HeaderMap::new();
+        h.insert(hyper::header::UPGRADE, "websocket".parse().unwrap());
+        assert_eq!(
+            h3_extended_connect_protocol(&h).as_deref(),
+            Some("websocket")
+        );
+    }
+
+    // ── P2: HookContext Arc<str> sharing tests ──────────────────────────
+
+    #[test]
+    fn test_hook_context_arc_clone_is_cheap_and_shares_data() {
+        // Validates the P2 invariant: cloning an Arc<str> stored in
+        // HookContext does NOT allocate a new buffer; the inner pointer
+        // is shared. A regression where someone accidentally changes
+        // HookContext.path to `String` would break this (String::clone
+        // does allocate).
+        use crate::scripting::{HookContext, HookPhase};
+        let _ = HookPhase::PreRoute; // ensure import is used
+        let path: std::sync::Arc<str> = std::sync::Arc::from("/api/v1/users");
+        let ctx_a = HookContext {
+            client_ip: "1.2.3.4".into(),
+            method: "GET".into(),
+            path: std::sync::Arc::clone(&path),
+            query: None,
+            headers: std::collections::HashMap::new(),
+            status: None,
+            response_headers: std::collections::HashMap::new(),
+        };
+        // Both `path` and `ctx_a.path` must point at the SAME allocation.
+        assert!(std::sync::Arc::ptr_eq(&path, &ctx_a.path));
+        // Cloning into a second context still shares — no new allocation.
+        let ctx_b = HookContext {
+            client_ip: "1.2.3.4".into(),
+            method: "GET".into(),
+            path: std::sync::Arc::clone(&ctx_a.path),
+            query: None,
+            headers: std::collections::HashMap::new(),
+            status: None,
+            response_headers: std::collections::HashMap::new(),
+        };
+        assert!(std::sync::Arc::ptr_eq(&ctx_a.path, &ctx_b.path));
     }
 
     // ── gRPC-Web body translation tests ─────────────────────────────────

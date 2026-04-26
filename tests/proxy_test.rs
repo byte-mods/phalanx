@@ -1340,9 +1340,9 @@ mod hook_engine_phase_tests {
 
     fn ctx() -> HookContext {
         HookContext {
-            client_ip: "127.0.0.1".to_string(),
-            method: "GET".to_string(),
-            path: "/test".to_string(),
+            client_ip: "127.0.0.1".into(),
+            method: "GET".into(),
+            path: "/test".into(),
             query: None,
             headers: HashMap::new(),
             status: None,
@@ -1511,9 +1511,9 @@ mod hook_engine_phase_tests {
         resp_headers.insert("x-custom".to_string(), "value123".to_string());
 
         let hook_ctx = HookContext {
-            client_ip: "10.0.0.1".to_string(),
-            method: "POST".to_string(),
-            path: "/api/data".to_string(),
+            client_ip: "10.0.0.1".into(),
+            method: "POST".into(),
+            path: "/api/data".into(),
             query: None,
             headers: HashMap::new(),
             status: Some(200),
@@ -1550,9 +1550,9 @@ mod hook_engine_phase_tests {
         });
 
         let hook_ctx = HookContext {
-            client_ip: "10.0.0.1".to_string(),
-            method: "GET".to_string(),
-            path: "/".to_string(),
+            client_ip: "10.0.0.1".into(),
+            method: "GET".into(),
+            path: "/".into(),
             query: None,
             headers: HashMap::new(),
             status: Some(200),

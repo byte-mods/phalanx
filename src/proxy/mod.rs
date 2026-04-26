@@ -894,6 +894,13 @@ async fn handle_http_request(
     let real_ip = realip::resolve_client_ip(&_peer, req.headers(), &trusted_proxies);
     let ip_str = real_ip.to_string();
 
+    // ── HookContext shared snapshots (P2): build Arc<str> once per request ──
+    // and Arc::clone (atomic increment, no heap alloc) at each phase site.
+    // ip and method don't change after this point. `path` may be rewritten
+    // later, so build the post-rewrite Arc lazily after the rewrite loop.
+    let ip_arc: std::sync::Arc<str> = std::sync::Arc::from(ip_str.as_str());
+    let method_arc: std::sync::Arc<str> = std::sync::Arc::from(method_str.as_str());
+
     // ── CAPTCHA Verification Endpoint (short-circuit) ───────────────────────
     if path == "/__phalanx/captcha/verify" {
         return handle_captcha_verify_request(req, &ip_str, captcha_manager).await;
@@ -963,11 +970,14 @@ async fn handle_http_request(
     // ── Step 3: PreRoute Scripting Hooks ──────────────────────────────────────
     // May rewrite path, inject headers, or short-circuit with a canned response
     if hook_engine.has_hooks(crate::scripting::HookPhase::PreRoute) {
+        // PreRoute fires BEFORE the rewrite loop, so it sees the original
+        // client-sent path. Build a separate Arc for this phase only.
+        let pre_route_path: std::sync::Arc<str> = std::sync::Arc::from(path.as_str());
         let hook_ctx = crate::scripting::HookContext {
-            client_ip: ip_str.clone(),
-            method: method_str.clone(),
-            path: path.clone(),
-            query: req.uri().query().map(str::to_string),
+            client_ip: std::sync::Arc::clone(&ip_arc),
+            method: std::sync::Arc::clone(&method_arc),
+            path: pre_route_path,
+            query: req.uri().query().map(std::sync::Arc::from),
             headers: req
                 .headers()
                 .iter()
@@ -1136,6 +1146,12 @@ async fn handle_http_request(
         }
         break 'rewrite;
     }
+
+    // After the rewrite loop, `path` is the final value used by the rest of
+    // the pipeline. Build one Arc<str> here so PreUpstream / PostUpstream /
+    // Log hook contexts can share it (Arc::clone is an atomic increment,
+    // not a heap allocation).
+    let final_path_arc: std::sync::Arc<str> = std::sync::Arc::from(path.as_str());
 
     // 1. Prefix path routing matching Nginx-like config
     // We sort routes by length descending at config load, or we find the longest matching prefix.
@@ -1760,10 +1776,10 @@ async fn handle_http_request(
     // PreUpstream hook: may add headers to the request or short-circuit before backend dispatch
     if hook_engine.has_hooks(crate::scripting::HookPhase::PreUpstream) {
         let hook_ctx = crate::scripting::HookContext {
-            client_ip: ip_str.clone(),
-            method: method_str.clone(),
-            path: path.clone(),
-            query: req.uri().query().map(str::to_string),
+            client_ip: std::sync::Arc::clone(&ip_arc),
+            method: std::sync::Arc::clone(&method_arc),
+            path: std::sync::Arc::clone(&final_path_arc),
+            query: req.uri().query().map(std::sync::Arc::from),
             headers: req
                 .headers()
                 .iter()
@@ -2143,9 +2159,9 @@ async fn handle_http_request(
                     .filter_map(|(k, v)| v.to_str().ok().map(|v| (k.to_string(), v.to_string())))
                     .collect();
                 let hook_ctx = crate::scripting::HookContext {
-                    client_ip: ip_str.clone(),
-                    method: method_str.clone(),
-                    path: path.clone(),
+                    client_ip: std::sync::Arc::clone(&ip_arc),
+                    method: std::sync::Arc::clone(&method_arc),
+                    path: std::sync::Arc::clone(&final_path_arc),
                     query: None,
                     headers: Default::default(),
                     status: Some(response.status().as_u16()),
@@ -2456,9 +2472,9 @@ async fn handle_http_request(
             // Log hook: post-response auditing (fire-and-forget, non-blocking)
             if hook_engine.has_hooks(crate::scripting::HookPhase::Log) {
                 let log_ctx = crate::scripting::HookContext {
-                    client_ip: ip_str,
-                    method: method_str,
-                    path,
+                    client_ip: std::sync::Arc::clone(&ip_arc),
+                    method: std::sync::Arc::clone(&method_arc),
+                    path: std::sync::Arc::clone(&final_path_arc),
                     query: None,
                     headers: Default::default(),
                     status: Some(status_code),
@@ -2567,6 +2583,11 @@ async fn handle_http2_request(
     let real_ip = realip::resolve_client_ip(&_peer, req.headers(), &trusted_proxies);
     let ip_str = real_ip.to_string();
 
+    // P2: per-request Arc<str> snapshots so HookContext sites only do
+    // Arc::clone (atomic increment) instead of String allocations.
+    let ip_arc: std::sync::Arc<str> = std::sync::Arc::from(ip_str.as_str());
+    let method_arc: std::sync::Arc<str> = std::sync::Arc::from(method_str.as_str());
+
     if path == "/__phalanx/captcha/verify" {
         return handle_captcha_verify_request(req, &ip_str, captcha_manager).await;
     }
@@ -2632,11 +2653,13 @@ async fn handle_http2_request(
 
     // ── Step 3: PreRoute Hooks ──
     if hook_engine.has_hooks(crate::scripting::HookPhase::PreRoute) {
+        // PreRoute fires BEFORE the rewrite loop — uses the original path.
+        let pre_route_path: std::sync::Arc<str> = std::sync::Arc::from(path.as_str());
         let hook_ctx = crate::scripting::HookContext {
-            client_ip: ip_str.clone(),
-            method: method_str.clone(),
-            path: path.clone(),
-            query: req.uri().query().map(str::to_string),
+            client_ip: std::sync::Arc::clone(&ip_arc),
+            method: std::sync::Arc::clone(&method_arc),
+            path: pre_route_path,
+            query: req.uri().query().map(std::sync::Arc::from),
             headers: req
                 .headers()
                 .iter()
@@ -2767,6 +2790,9 @@ async fn handle_http2_request(
         }
         break 'rewrite;
     }
+
+    // P2: post-rewrite path Arc<str>; cloned into PreUpstream / PostUpstream / Log contexts.
+    let final_path_arc: std::sync::Arc<str> = std::sync::Arc::from(path.as_str());
 
     // 1. Prefix path routing (with K8s Ingress route fallback)
     let k8s_pool_override: Option<String> = if let Some(ref ctrl) = *k8s_controller {
@@ -3290,10 +3316,10 @@ async fn handle_http2_request(
     // ── PreUpstream Hooks ──
     if hook_engine.has_hooks(crate::scripting::HookPhase::PreUpstream) {
         let hook_ctx = crate::scripting::HookContext {
-            client_ip: ip_str.clone(),
-            method: method_str.clone(),
-            path: path.clone(),
-            query: req.uri().query().map(str::to_string),
+            client_ip: std::sync::Arc::clone(&ip_arc),
+            method: std::sync::Arc::clone(&method_arc),
+            path: std::sync::Arc::clone(&final_path_arc),
+            query: req.uri().query().map(std::sync::Arc::from),
             headers: req
                 .headers()
                 .iter()
@@ -3511,9 +3537,9 @@ async fn handle_http2_request(
                     .filter_map(|(k, v)| v.to_str().ok().map(|v| (k.to_string(), v.to_string())))
                     .collect();
                 let hook_ctx = crate::scripting::HookContext {
-                    client_ip: ip_str.clone(),
-                    method: method_str.clone(),
-                    path: path.clone(),
+                    client_ip: std::sync::Arc::clone(&ip_arc),
+                    method: std::sync::Arc::clone(&method_arc),
+                    path: std::sync::Arc::clone(&final_path_arc),
                     query: None,
                     headers: Default::default(),
                     status: Some(response.status().as_u16()),
@@ -3814,9 +3840,9 @@ async fn handle_http2_request(
             // Log hook (parity with HTTP/1)
             if hook_engine.has_hooks(crate::scripting::HookPhase::Log) {
                 let log_ctx = crate::scripting::HookContext {
-                    client_ip: ip_str,
-                    method: method_str,
-                    path,
+                    client_ip: std::sync::Arc::clone(&ip_arc),
+                    method: std::sync::Arc::clone(&method_arc),
+                    path: std::sync::Arc::clone(&final_path_arc),
                     query: None,
                     headers: Default::default(),
                     status: Some(status_code),
