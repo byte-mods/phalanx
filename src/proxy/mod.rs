@@ -73,6 +73,7 @@ pub mod tls;
 pub mod udp;
 pub mod uwsgi;
 pub mod webrtc;
+pub mod wt;
 pub mod zero_copy;
 
 use fastcgi::serve_fastcgi;

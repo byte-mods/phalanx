@@ -245,9 +245,23 @@ pub async fn start_http3_proxy(
                     let remote_addr = conn.remote_address();
                     debug!("QUIC connection from {:?}", remote_addr);
 
-                    // Build h3 server connection (generic over Bytes buf)
+                    // Build h3 server connection (generic over Bytes buf).
+                    // When `webtransport_enabled`, advertise the three SETTINGS the
+                    // WT-over-HTTP/3 draft requires during the QUIC handshake:
+                    // `SETTINGS_ENABLE_WEBTRANSPORT`, `H3_DATAGRAM`, and
+                    // `ENABLE_CONNECT_PROTOCOL`. Without these the client refuses
+                    // to send Extended CONNECT, so the gate has to flip these
+                    // *before* `build()`.
+                    let mut h3_builder = h3::server::builder();
+                    if config_c.webtransport_enabled {
+                        h3_builder
+                            .enable_webtransport(true)
+                            .enable_extended_connect(true)
+                            .enable_datagram(true)
+                            .max_webtransport_sessions(64);
+                    }
                     let h3_conn: h3::server::Connection<h3_quinn::Connection, Bytes> =
-                        match h3::server::Connection::new(h3_quinn::Connection::new(conn)).await {
+                        match h3_builder.build(h3_quinn::Connection::new(conn)).await {
                             Ok(c) => c,
                             Err(e) => {
                                 debug!("HTTP/3 session setup failed: {}", e);
@@ -310,6 +324,8 @@ async fn serve_h3_connection(
     bandwidth: Arc<crate::telemetry::bandwidth::BandwidthTracker>,
     oidc_sessions: crate::auth::oidc::OidcSessionStore,
 ) {
+    let webtransport_enabled = app_config.webtransport_enabled;
+
     loop {
         // h3 0.0.8: accept() returns Option<RequestResolver<C,B>>
         match conn.accept().await {
@@ -322,6 +338,20 @@ async fn serve_h3_connection(
                         continue;
                     }
                 };
+
+                // ── WebTransport pre-spawn intercept ─────────────────────
+                // `WebTransportSession::accept` consumes the whole h3
+                // `Connection`, so we need to detect Extended CONNECT
+                // *before* spawning the regular request handler. Once a
+                // WT session is established, all further bidi/uni streams
+                // and datagrams on this QUIC connection are demuxed by
+                // the session driver (not by `conn.accept()`), so we
+                // return from `serve_h3_connection` and never come back.
+                if webtransport_enabled && crate::proxy::wt::is_webtransport_request(&req) {
+                    crate::proxy::wt::serve_session(req, stream, conn, remote_addr).await;
+                    return;
+                }
+
                 let u = Arc::clone(&upstreams);
                 let c = Arc::clone(&app_config);
                 let m = Arc::clone(&metrics);
@@ -513,22 +543,29 @@ async fn handle_h3_request(
         return;
     }
 
-    // ── WebTransport detection (RFC 9220 Extended CONNECT) ────────────────
-    // Phalanx does not yet implement the WebTransport-over-HTTP/3 session
-    // protocol (bidirectional streams, datagrams, SETTINGS_ENABLE_WEBTRANSPORT
-    // negotiation). Detecting CONNECT requests here lets us return a
-    // structured 501 with a `phalanx-webtransport-status` header so callers
-    // can distinguish "feature not implemented" from "URL not found" and
-    // operators can see attempted WT usage in their logs.
+    // ── WebTransport / Extended CONNECT fallback ─────────────────────────
+    // The `:protocol = webtransport` case is handled before this function
+    // is ever called — `serve_h3_connection` peeks at the resolved request
+    // and hands the whole h3 connection to `wt::serve_session` instead of
+    // spawning this handler. So when execution gets here, we are looking at
+    // either:
+    //   • Extended CONNECT with a non-WT protocol (we don't speak any
+    //     other extended-CONNECT protocols), or
+    //   • An Extended CONNECT for `webtransport` that arrived while the
+    //     `webtransport_enabled` gate is off.
+    // Both produce 501 with a `phalanx-webtransport-status` header so
+    // operators can tell "WT off" / "unknown extension" apart from a
+    // generic 404.
     if is_h3_extended_connect(&method, req.headers()) {
         let target = h3_extended_connect_protocol(req.headers())
             .unwrap_or_else(|| "<unknown>".to_string());
-        // Status header is now config-aware so operators can distinguish
-        // "feature is disabled" from "feature is enabled but session
-        // protocol not yet implemented" (W1 in plan.md).
-        let status_value = if app_config.webtransport_enabled {
-            "enabled_pending_implementation"
+        let status_value = if target == "webtransport" {
+            // Reached here only when the gate is off (config:
+            // `webtransport off;` or unset). Tells the operator the
+            // feature exists but is currently disabled.
+            "disabled"
         } else {
+            // Some other Extended CONNECT protocol we don't support.
             "not_implemented"
         };
         debug!(

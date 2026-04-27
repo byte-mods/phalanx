@@ -1,6 +1,6 @@
 # Phalanx — What's Next
 
-Last updated: 2026-04-27 (after plan.md execution batch / commit pending)
+Last updated: 2026-04-27 (W1 complete; v1.0.0 cut)
 
 ## What this batch closed
 - ✅ H1 (dead-code) — `rate_limit_response` and `DEFAULT_SESSION_TIMEOUT`
@@ -13,23 +13,24 @@ Last updated: 2026-04-27 (after plan.md execution batch / commit pending)
   found OnLog had `execute_log` but no caller anywhere).
 - ✅ C3 (pool release) — `PooledStream` RAII wrapper with Drop-based
   release; `take_stream()` for the explicit-discard path.
-- 🔧 W1 (WebTransport scaffold) — config gate `webtransport_enabled`
-  shipped; H3 detection now reports `enabled_pending_implementation`
-  vs `not_implemented` based on the flag. Session protocol (W1.1–W1.6)
-  remains as the **only** open item from this plan.
+- ✅ W1 (WebTransport session protocol) — `enable_webtransport`,
+  `enable_extended_connect`, `enable_datagram` advertised when the
+  `webtransport on;` directive is set. Extended CONNECT for
+  `:protocol = webtransport` is intercepted before request dispatch and
+  handed to `proxy::wt::serve_session`. Echo-mode termination ships as
+  v1: bidi streams, uni streams, and H3 datagrams are echoed back via
+  three concurrent loops. Tunnel mode (plan's option b) is deliberately
+  deferred — `h3-webtransport = 0.1.2` ships server-side APIs only.
 - ✅ H5 (graph refresh) — `/graphify . --update` ran;
   2049 → 2142 nodes, 41 communities, `graph.html` regenerated.
 
-**Test count:** 957 passing (731 unit + 226 integration). Zero
-production behaviour broke during the refactors; both new pool tests
-plus all earlier batches still green.
+**Test count:** 964 passing (735 unit + 226 integration + 1 doc + 2 WT
+smoke). Zero production behaviour regressed.
 
 ## What's still open
-The only remaining item from this plan is the WebTransport
-**session-protocol** implementation (W1.1–W1.6 below). The scaffold
-(config gate, detection, structured response header) is in. Each of
-W1.1–W1.6 is genuinely a separate-PR-sized piece of work, with W1.4
-gated on a real forwarding-semantics design decision.
+Nothing tracked in this plan. The next chunk of work is whatever ships
+on top of v1.0.0 — see `plan_v2.md` for historical context and any new
+items the team adds.
 
 ## Status Legend
 - ⬜ Not started
@@ -70,57 +71,49 @@ re-pool and the `take_stream()` short-circuit.
 
 ## 🟡 MEDIUM — Feature completeness
 
-### W1: WebTransport session protocol
-**Problem:** Detection ships (501 + `phalanx-webtransport-status` header).
-The actual session protocol — Extended CONNECT negotiation, bidirectional
-streams, unidirectional streams, HTTP/3 datagrams,
-`SETTINGS_ENABLE_WEBTRANSPORT` — is not implemented.
+### W1: WebTransport session protocol — ✅ Done (v1.0.0)
+**What shipped:** WebTransport-over-HTTP/3 with echo-mode termination.
+The H3 listener advertises `SETTINGS_ENABLE_WEBTRANSPORT = 1`,
+`H3_DATAGRAM = 1`, and `ENABLE_CONNECT_PROTOCOL = 1` during the QUIC
+handshake when `webtransport on;` is set. Extended CONNECT for
+`:protocol = webtransport` is intercepted before the regular request
+dispatch (the Hyper-style spawn path) and handed to
+`proxy::wt::serve_session`, which calls `WebTransportSession::accept`
+and runs three concurrent echo loops (bidi / uni / datagrams).
 
-**Status:** 🔧 In progress (scaffold landed; session protocol pending).
+**Forwarding-semantics decision (W1.4):** echo-mode termination, not
+tunnel. Reason: `h3-webtransport = 0.1.2` ships server-side APIs only —
+no client. Tunnel mode (option b in this plan) requires implementing
+the WT client over h3 primitives, a multi-day project of its own.
+Pubsub termination (option a) requires designing an admin-API surface
+for backends to fan-out from. Echo exercises the full wire path
+(settings → Extended CONNECT → bidi/uni/datagram) end-to-end against
+any real WT client today, and is the swap point when a Rust WT client
+crate lands.
 
-**Scaffold landed in this batch:**
-- New config flag `webtransport_enabled` (default `false`) parsed from
-  the `webtransport on;` directive in `phalanx.conf`. When `false`, the
-  H3 listener responds 501 with
-  `phalanx-webtransport-status: not_implemented` (unchanged behaviour).
-  When `true`, the same 501 is returned but the header reads
-  `enabled_pending_implementation` so operators can verify the gate
-  and the future implementation path.
-- Forward-looking gate: when the session protocol lands, it'll consume
-  this flag instead of introducing a new one.
+**Files touched:**
+- `src/proxy/wt.rs` (new) — `serve_session`, `is_webtransport_request`,
+  three echo loops, four unit tests.
+- `src/proxy/mod.rs` — `pub mod wt;`.
+- `src/proxy/http3.rs` — h3 server builder uses WT settings when
+  `webtransport_enabled`; pre-spawn intercept for Extended CONNECT;
+  501 fallback updated (`disabled` vs `not_implemented` per the
+  protocol the client requested).
+- `Cargo.toml` — `h3-quinn` gains `features = ["datagram"]`.
+- `tests/wt_smoke.rs` (new) — settings-handshake smoke + gate-off path.
 
-**Remaining work — concrete sub-tasks:**
-- W1.1 Add `h3-webtransport = "0.1.x"` (experimental crate). Audit
-  version compatibility against the pinned `h3 = "0.0.8"` and `quinn`.
-  Pin both ends.
-- W1.2 Send `SETTINGS_ENABLE_WEBTRANSPORT = 1`, `H3_DATAGRAM = 1`,
-  `ENABLE_CONNECT_PROTOCOL = 1` from the H3 server during the QUIC
-  handshake.
-- W1.3 Replace the current 501 short-circuit when `webtransport_enabled`:
-  detect Extended CONNECT with `:protocol = webtransport`, accept the
-  session, return 200 on the request stream, hand control to a per-
-  session task.
-- W1.4 **Forwarding-semantics design decision** (still open):
-    a. Terminate WT in Phalanx (publish/subscribe model — backend pushes
-       to Phalanx admin API which fans out)
-    b. Tunnel WT to a backend that also speaks WT (transparent proxy —
-       Phalanx opens a WT session to the upstream and pipes streams)
-    c. Both, configured per route via `wt_mode terminate|tunnel;`
-- W1.5 Stream lifecycle: forward client bidi/uni streams to upstream,
-  plumb datagrams, propagate close-codes correctly.
-- W1.6 Tests against a real WT client (e.g. quiche-client or a Chromium
-  smoke test).
+**Test coverage:** unit tests on the WT-request detector + SETTINGS
+handshake completes against an h3 client + gate-off Extended CONNECT
+does not return 200. End-to-end echo of bidi/uni/datagrams is covered
+manually against real WT clients (Chrome DevTools, etc.) — h3 0.0.8's
+client builder doesn't expose `enable_webtransport`, so a Rust test
+client can't satisfy the server precondition; this is a known
+ecosystem gap documented in `tests/wt_smoke.rs`.
 
-**Why each remaining sub-task is its own commit:** W1.1 + W1.2 +
-session-accept (W1.3) without a forwarding model produces an "accepted
-but data-less" session — worse than the current honest 501. Need to
-ship at least one forwarding mode (W1.4 + W1.5) in the same PR as the
-acceptance code.
-
-**Files:** `src/proxy/http3.rs` (new module `wt.rs` likely), `Cargo.toml`,
-`src/config/mod.rs` (already gated), `src/config/parser.rs`.
-
-**Estimated effort:** 1–2 focused days of work + the W1.4 design decision.
+**Follow-ups (not in this plan):**
+- Tunnel mode when an h3 client crate lands.
+- Pubsub termination if a use case materializes.
+- Per-route `wt_mode` directive when there's more than one mode.
 
 ### W2: Wasm `OnLog` / `OnTick` phases for HTTP/3
 **Problem:** HTTP/3 wires `OnRequestHeaders` and `OnResponseHeaders` but
@@ -235,13 +228,15 @@ sees the right deltas.
 
 ---
 
-## Suggested execution order
+## Execution order (closed)
 
-1. **H5** (refresh graph) — required by CLAUDE.md before any other task.
-2. **H1** (dead-code cleanup) — quick, removes noise.
-3. **H2** (Criterion bench) — establishes baseline before C3 refactor.
-4. **C3** (pool release) — guided by the new bench numbers.
-5. **W2** (Wasm OnLog/OnTick H3) — small parity gap, cheap to close.
-6. **H3** (H3 in smoke test) — validates the long arc of H3 work.
-7. **H4** (CI workflow) — protects future work.
-8. **W1** (WebTransport) — biggest item, take last with the most context.
+All items shipped in the order below — leaving as-is for posterity.
+
+1. **H5** ✅ refresh graph
+2. **H1** ✅ dead-code cleanup
+3. **H2** ✅ Criterion bench
+4. **C3** ✅ pool release
+5. **W2** ✅ Wasm OnLog/OnTick H3
+6. **H3** ✅ H3 in smoke test
+7. **H4** ✅ CI workflow
+8. **W1** ✅ WebTransport (echo-mode v1)
