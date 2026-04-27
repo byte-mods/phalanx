@@ -13,8 +13,23 @@ Last updated: 2026-04-27 (after plan.md execution batch / commit pending)
   found OnLog had `execute_log` but no caller anywhere).
 - ✅ C3 (pool release) — `PooledStream` RAII wrapper with Drop-based
   release; `take_stream()` for the explicit-discard path.
-- 🔧 W1 (WebTransport) — see updated section below.
-- ⬜ H5 (graph refresh) — execute next.
+- 🔧 W1 (WebTransport scaffold) — config gate `webtransport_enabled`
+  shipped; H3 detection now reports `enabled_pending_implementation`
+  vs `not_implemented` based on the flag. Session protocol (W1.1–W1.6)
+  remains as the **only** open item from this plan.
+- ✅ H5 (graph refresh) — `/graphify . --update` ran;
+  2049 → 2142 nodes, 41 communities, `graph.html` regenerated.
+
+**Test count:** 957 passing (731 unit + 226 integration). Zero
+production behaviour broke during the refactors; both new pool tests
+plus all earlier batches still green.
+
+## What's still open
+The only remaining item from this plan is the WebTransport
+**session-protocol** implementation (W1.1–W1.6 below). The scaffold
+(config gate, detection, structured response header) is in. Each of
+W1.1–W1.6 is genuinely a separate-PR-sized piece of work, with W1.4
+gated on a real forwarding-semantics design decision.
 
 ## Status Legend
 - ⬜ Not started
@@ -186,15 +201,27 @@ Cache the cargo registry + target dir.
 **Status:** ✅ Done (this batch).
 
 ### H5: Refresh `graphify-out/`
-**Problem:** The graph hasn't been re-built since batch 6
-(commit `ee5ba41`). Several batches of code changes since. Per the new
+**Problem (was):** The graph hadn't been re-built since batch 6
+(commit `ee5ba41`). Several batches of code changes since. Per
 `CLAUDE.md`, every change should trigger `/graphify . --update`.
 
-**Approach:** Run `/graphify . --update`. One-off chore.
+**Fix shipped:** `/graphify . --update` ran across the 11 changed code
+files + 4 changed docs from this batch. AST extracted 568 nodes /
+1461 edges; semantic extraction (one general-purpose subagent) added
+67 nodes / 98 edges over README/plan/plan_v2/CLAUDE — covering all
+the H1–H5 / W1 / W2 / C3 items as proper graph nodes with
+`rationale_for` / `semantically_similar_to` / `cites` edges to their
+v2-counterpart items and to the dated batch-update notes in README.
+
+**Result:** graph went from 2049 → **2142 nodes / 4670 edges /
+41 communities**. New top god nodes: `url()`, `parse_phalanx_config()`,
+`plan_v2.md`, `make_state()`, `handle_h3_request()`. `graph.html`
+regenerated. `manifest.json` snapshot taken so the next `--update`
+sees the right deltas.
 
 **Files:** `graphify-out/` (gitignored, local only).
 
-**Status:** 🔧 In progress (executing now).
+**Status:** ✅ Done (this batch).
 
 ---
 
