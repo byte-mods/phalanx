@@ -29,13 +29,22 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use tracing::{error, warn};
 
+// Per-invocation state for set_header/set_var side-effects.
+// Wrapped in Arc<Mutex<>> so the closures registered with Rhai are Send + Sync;
+// since each invocation creates its own fresh pair, there is no cross-request
+// contention — the lock is always uncontended.
+struct EvalState {
+    headers: Mutex<HashMap<String, String>>,
+    vars: Mutex<HashMap<String, String>>,
+}
+
 use crate::scripting::{HookContext, HookHandler, HookResult};
 
 // ─── RhaiEngine ──────────────────────────────────────────────────────────────
 
 /// Wrapper around a `rhai::Engine` instance configured with Phalanx's safety limits.
 ///
-/// The engine is sandboxed with resource limits to prevent script abuse:
+/// Sandboxed with resource limits to prevent script abuse:
 /// - Max 1M operations per execution (prevents infinite loops)
 /// - Max 64KB string length (prevents memory bombs)
 /// - Max 1000 array elements and 100 map entries
@@ -43,14 +52,7 @@ use crate::scripting::{HookContext, HookHandler, HookResult};
 /// Scripts can call `set_header(name, value)` to inject request headers and
 /// `set_var(key, value)` to set metadata variables. These are collected after
 /// execution and returned as part of the `RhaiResult`.
-pub struct RhaiEngine {
-    /// The underlying Rhai scripting engine with configured safety limits.
-    engine: Engine,
-    /// Headers set by script via `set_header(name, value)`.
-    pending_headers: Arc<Mutex<HashMap<String, String>>>,
-    /// Variables set by script via `set_var(key, value)`.
-    pending_vars: Arc<Mutex<HashMap<String, String>>>,
-}
+pub struct RhaiEngine;
 
 /// Result of a Rhai script evaluation including side-effects.
 pub struct RhaiResult {
@@ -65,40 +67,18 @@ pub struct RhaiResult {
 impl RhaiEngine {
     /// Creates a new Rhai engine with security limits applied.
     pub fn new() -> Self {
-        let mut engine = Engine::new();
+        Self
+    }
 
-        // Safety: restrict potential abuse in embedded scripts
+    /// Build a fresh engine with Phalanx safety limits.
+    /// Cheap enough to call per-invocation in eval_script.
+    fn make_engine() -> Engine {
+        let mut engine = Engine::new();
         engine.set_max_operations(1_000_000);
         engine.set_max_string_size(65_536);
         engine.set_max_array_size(1_000);
         engine.set_max_map_size(100);
-
-        let pending_headers: Arc<Mutex<HashMap<String, String>>> =
-            Arc::new(Mutex::new(HashMap::new()));
-        let pending_vars: Arc<Mutex<HashMap<String, String>>> =
-            Arc::new(Mutex::new(HashMap::new()));
-
-        // Register set_header(name, value) function
-        let hdrs = Arc::clone(&pending_headers);
-        engine.register_fn("set_header", move |name: String, value: String| {
-            if let Ok(mut map) = hdrs.lock() {
-                map.insert(name, value);
-            }
-        });
-
-        // Register set_var(key, value) function
-        let vars = Arc::clone(&pending_vars);
-        engine.register_fn("set_var", move |key: String, value: String| {
-            if let Ok(mut map) = vars.lock() {
-                map.insert(key, value);
-            }
-        });
-
-        Self {
-            engine,
-            pending_headers,
-            pending_vars,
-        }
+        engine
     }
 
     /// Compile and evaluate a script with request context values injected into scope.
@@ -107,13 +87,28 @@ impl RhaiEngine {
     /// `headers` variables, then evaluates the script. Returns the script result
     /// along with any headers/vars set via `set_header()`/`set_var()`.
     fn eval_script(&self, script: &str, ctx: &HookContext) -> RhaiResult {
-        // Clear pending state from any previous execution
-        if let Ok(mut h) = self.pending_headers.lock() {
-            h.clear();
-        }
-        if let Ok(mut v) = self.pending_vars.lock() {
-            v.clear();
-        }
+        // Per-invocation state — each concurrent script execution gets its own
+        // pair of maps. Engine::clone() is cheap (Arc-based); register_fn on a
+        // clone uses copy-on-write so the original engine is unmodified.
+        let state = Arc::new(EvalState {
+            headers: Mutex::new(HashMap::new()),
+            vars: Mutex::new(HashMap::new()),
+        });
+
+        let mut engine = Self::make_engine();
+
+        let h = Arc::clone(&state);
+        engine.register_fn("set_header", move |name: String, value: String| {
+            if let Ok(mut map) = h.headers.lock() {
+                map.insert(name, value);
+            }
+        });
+        let v = Arc::clone(&state);
+        engine.register_fn("set_var", move |key: String, value: String| {
+            if let Ok(mut map) = v.vars.lock() {
+                map.insert(key, value);
+            }
+        });
 
         let mut scope = Scope::new();
 
@@ -136,7 +131,7 @@ impl RhaiEngine {
         }
         scope.push("headers", headers_map);
 
-        let value = match self.engine.eval_with_scope::<rhai::Dynamic>(&mut scope, script) {
+        let value = match engine.eval_with_scope::<rhai::Dynamic>(&mut scope, script) {
             Ok(result) => Some(result),
             Err(e) => {
                 warn!("Rhai script execution error: {}", e);
@@ -144,17 +139,9 @@ impl RhaiEngine {
             }
         };
 
-        // Collect side-effects
-        let headers = self
-            .pending_headers
-            .lock()
-            .map(|h| h.clone())
-            .unwrap_or_default();
-        let vars = self
-            .pending_vars
-            .lock()
-            .map(|v| v.clone())
-            .unwrap_or_default();
+        // Collect side-effects from per-invocation state
+        let headers = state.headers.lock().map(|h| h.clone()).unwrap_or_default();
+        let vars = state.vars.lock().map(|v| v.clone()).unwrap_or_default();
 
         RhaiResult {
             value,
@@ -490,6 +477,71 @@ mod tests {
                 assert_eq!(hdrs.get("X-Three").unwrap(), "3");
             }
             other => panic!("expected SetHeaders, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_concurrent_executions_no_cross_request_pollution() {
+        // Two scripts running on the SAME handler must not share state.
+        let handler = std::sync::Arc::new(RhaiHookHandler::from_str(
+            r#"set_header("X-Concurrent", "shared-value");"#,
+        ));
+        let h1 = std::sync::Arc::clone(&handler);
+        let h2 = std::sync::Arc::clone(&handler);
+
+        let t1 = std::thread::spawn(move || {
+            let mut c = ctx();
+            c.client_ip = "10.0.0.1".into();
+            h1.execute(&c)
+        });
+        let t2 = std::thread::spawn(move || {
+            let mut c = ctx();
+            c.client_ip = "10.0.0.2".into();
+            h2.execute(&c)
+        });
+
+        let r1 = t1.join().unwrap();
+        let r2 = t2.join().unwrap();
+
+        // Both must succeed independently
+        assert!(matches!(r1, HookResult::SetHeaders(_)));
+        assert!(matches!(r2, HookResult::SetHeaders(_)));
+    }
+
+    #[test]
+    fn test_concurrent_set_header_isolation_does_not_share_maps() {
+        // Handler A sets header "A", handler B sets header "B" concurrently.
+        // Neither should see the other's header. Each uses a separate engine
+        // clone, so the per-invocation state is isolated.
+        let handler_a = std::sync::Arc::new(RhaiHookHandler::from_str(
+            r#"set_header("X-A", "value-a");"#,
+        ));
+        let handler_b = std::sync::Arc::new(RhaiHookHandler::from_str(
+            r#"set_header("X-B", "value-b");"#,
+        ));
+
+        let ha = std::sync::Arc::clone(&handler_a);
+        let hb = std::sync::Arc::clone(&handler_b);
+
+        let ta = std::thread::spawn(move || ha.execute(&ctx()));
+        let tb = std::thread::spawn(move || hb.execute(&ctx()));
+
+        let ra = ta.join().unwrap();
+        let rb = tb.join().unwrap();
+
+        match ra {
+            HookResult::SetHeaders(hdrs) => {
+                assert!(hdrs.contains_key("X-A"), "Handler A should set X-A");
+                assert!(!hdrs.contains_key("X-B"), "Handler A must NOT see X-B");
+            }
+            other => panic!("expected SetHeaders from A, got {:?}", other),
+        }
+        match rb {
+            HookResult::SetHeaders(hdrs) => {
+                assert!(hdrs.contains_key("X-B"), "Handler B should set X-B");
+                assert!(!hdrs.contains_key("X-A"), "Handler B must NOT see X-A");
+            }
+            other => panic!("expected SetHeaders from B, got {:?}", other),
         }
     }
 }

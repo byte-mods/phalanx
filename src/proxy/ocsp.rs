@@ -102,14 +102,11 @@ impl OcspStapler {
 
         debug!("Fetching OCSP response from {}", url);
 
-        let client = reqwest::Client::builder()
-            .timeout(Duration::from_secs(10))
-            .build()
-            .map_err(|e| format!("HTTP client error: {}", e))?;
+        let client = ocsp_client();
 
         let resp = if let Some(ref issuer) = self.issuer_der {
             // Build a proper OCSP request body (DER-encoded, minimal ASN.1)
-            let ocsp_request = build_ocsp_request(&self.cert_der, issuer);
+            let ocsp_request = build_ocsp_request(&self.cert_der, issuer)?;
             debug!("Sending OCSP POST request ({} bytes) to {}", ocsp_request.len(), url);
 
             client
@@ -168,22 +165,34 @@ impl OcspStapler {
     }
 }
 
-/// Builds a minimal DER-encoded OCSP request per RFC 6960.
+/// Builds a DER-encoded OCSP request per RFC 6960.
 ///
-/// The structure is:
+/// Structure:
 ///   OCSPRequest ::= SEQUENCE { tbsRequest TBSRequest }
 ///   TBSRequest  ::= SEQUENCE { requestList SEQUENCE OF Request }
 ///   Request     ::= SEQUENCE { reqCert CertID }
 ///   CertID      ::= SEQUENCE { hashAlgorithm, issuerNameHash, issuerKeyHash, serialNumber }
 ///
-/// We use SHA-1 as the hash algorithm (OID 1.3.14.3.2.26), which is the
-/// standard for OCSP certificate identification.
-fn build_ocsp_request(cert_der: &[u8], issuer_der: &[u8]) -> Vec<u8> {
-    let issuer_name_hash = simple_hash(issuer_der);
-    let issuer_key_hash = simple_hash(issuer_der); // simplified: hash entire issuer cert
-    let serial_hash = simple_hash(cert_der);
-    // Use first 8 bytes of cert hash as a simplified serial number
-    let serial_number = &serial_hash[..8];
+/// Uses SHA-1 (OID 1.3.14.3.2.26) as the hash algorithm per RFC 6960.
+///
+/// Correctly extracts:
+/// - **issuerNameHash**: SHA-1 of the DER-encoded issuer Subject Name.
+/// - **issuerKeyHash**:  SHA-1 of the DER-encoded issuer Subject Public Key Info.
+/// - **serialNumber**:   The actual certificate serial number (not a hash fragment).
+fn build_ocsp_request(cert_der: &[u8], issuer_der: &[u8]) -> Result<Vec<u8>, String> {
+    use x509_parser::parse_x509_certificate;
+
+    let (_, issuer_cert) =
+        parse_x509_certificate(issuer_der).map_err(|e| format!("Failed to parse issuer certificate: {}", e))?;
+    let (_, server_cert) =
+        parse_x509_certificate(cert_der).map_err(|e| format!("Failed to parse server certificate: {}", e))?;
+
+    // Hash of the DER encoding of the issuer's distinguished name
+    let issuer_name_hash = simple_hash(issuer_cert.tbs_certificate.issuer.as_raw());
+    // Hash of the DER encoding of the issuer's SubjectPublicKeyInfo
+    let issuer_key_hash = simple_hash(issuer_cert.tbs_certificate.subject_pki.raw);
+    // Actual certificate serial number
+    let serial_number = server_cert.tbs_certificate.raw_serial();
 
     // SHA-1 AlgorithmIdentifier: SEQUENCE { OID 1.3.14.3.2.26, NULL }
     let sha1_oid: &[u8] = &[0x06, 0x05, 0x2b, 0x0e, 0x03, 0x02, 0x1a];
@@ -206,7 +215,7 @@ fn build_ocsp_request(cert_der: &[u8], issuer_der: &[u8]) -> Vec<u8> {
     let tbs_request = der_sequence(&[&request_list]);
 
     // OCSPRequest: SEQUENCE { tbsRequest }
-    der_sequence(&[&tbs_request])
+    Ok(der_sequence(&[&tbs_request]))
 }
 
 /// Encodes data as a DER SEQUENCE (tag 0x30).
@@ -264,6 +273,17 @@ fn simple_hash(data: &[u8]) -> [u8; 20] {
     let mut hasher = Sha1::new();
     hasher.update(data);
     hasher.finalize().into()
+}
+
+/// Shared `reqwest::Client` for OCSP fetches, cached globally for reuse.
+fn ocsp_client() -> &'static reqwest::Client {
+    static CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
+    CLIENT.get_or_init(|| {
+        reqwest::Client::builder()
+            .timeout(Duration::from_secs(10))
+            .build()
+            .unwrap_or_else(|_| reqwest::Client::new())
+    })
 }
 
 /// Minimal hex encoding utility (avoids pulling in the `hex` crate for one call site).
@@ -331,11 +351,22 @@ mod tests {
         assert!(result.unwrap_err().contains("No OCSP responder URL"));
     }
 
+    /// Helper: generate a self-signed DER certificate + key via rcgen.
+    fn generate_test_cert(common_name: &str) -> (Vec<u8>, Vec<u8>) {
+        let params = rcgen::CertificateParams::new(vec![common_name.to_string()])
+            .expect("Failed to create cert params");
+        let key_pair = rcgen::KeyPair::generate().expect("Failed to generate key pair");
+        let cert = params.self_signed(&key_pair).expect("Failed to self-sign cert");
+        let der = cert.der().to_vec();
+        // For self-signed certs, issuer == cert
+        (der.clone(), der)
+    }
+
     #[test]
     fn test_build_ocsp_request_produces_valid_der() {
-        let cert = b"test-certificate-data";
-        let issuer = b"test-issuer-data";
-        let request = build_ocsp_request(cert, issuer);
+        let (cert_der, issuer_der) = generate_test_cert("test.example.com");
+        let request = build_ocsp_request(&cert_der, &issuer_der)
+            .expect("should build OCSP request from valid certs");
         // Must start with SEQUENCE tag (0x30)
         assert_eq!(request[0], 0x30);
         // Must be non-empty (typically 60-80 bytes)
@@ -344,19 +375,29 @@ mod tests {
 
     #[test]
     fn test_build_ocsp_request_deterministic() {
-        let cert = b"cert";
-        let issuer = b"issuer";
-        let r1 = build_ocsp_request(cert, issuer);
-        let r2 = build_ocsp_request(cert, issuer);
+        let (cert_der, issuer_der) = generate_test_cert("test.example.com");
+        let r1 = build_ocsp_request(&cert_der, &issuer_der)
+            .expect("should produce valid request");
+        let r2 = build_ocsp_request(&cert_der, &issuer_der)
+            .expect("should produce valid request");
         assert_eq!(r1, r2);
     }
 
     #[test]
     fn test_build_ocsp_request_different_for_different_certs() {
-        let issuer = b"issuer";
-        let r1 = build_ocsp_request(b"cert-a", issuer);
-        let r2 = build_ocsp_request(b"cert-b", issuer);
+        let (cert_a, issuer_a) = generate_test_cert("a.example.com");
+        let (cert_b, issuer_b) = generate_test_cert("b.example.com");
+        let r1 = build_ocsp_request(&cert_a, &issuer_a)
+            .expect("should produce valid request");
+        let r2 = build_ocsp_request(&cert_b, &issuer_b)
+            .expect("should produce valid request");
         assert_ne!(r1, r2);
+    }
+
+    #[test]
+    fn test_build_ocsp_request_rejects_invalid_der() {
+        let result = build_ocsp_request(b"not-a-cert", b"also-not-a-cert");
+        assert!(result.is_err());
     }
 
     #[test]

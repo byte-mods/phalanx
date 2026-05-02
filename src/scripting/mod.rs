@@ -215,10 +215,12 @@ impl HookEngine {
     ///
     /// On error, logs a warning and preserves existing hooks.
     pub fn reload_rhai_script(&self, script_path: &str) {
-        match rhai_engine::RhaiHookHandler::from_file(script_path) {
+        let sp = script_path.to_string();
+        let result = std::thread::spawn(move || {
+            rhai_engine::RhaiHookHandler::from_file(&sp)
+        }).join().unwrap_or(Err("Rhai reload thread panicked".to_string()));
+        match result {
             Ok(handler) => {
-                // Remove existing Rhai hooks, then recompute the per-phase
-                // presence bits — `retain` may have emptied a phase entirely.
                 {
                     let mut hooks = self.hooks.write();
                     for phase_hooks in hooks.values_mut() {
@@ -229,8 +231,6 @@ impl HookEngine {
                             .store(!phase_hooks.is_empty(), Ordering::Release);
                     }
                 }
-                // Register the new Rhai handler for all 4 phases. `register()`
-                // re-sets the corresponding presence bit.
                 let handler = std::sync::Arc::new(handler);
                 for phase in [HookPhase::PreRoute, HookPhase::PreUpstream, HookPhase::PostUpstream, HookPhase::Log] {
                     self.register(Hook {

@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
 use crate::admin::{AdminState, alerts::AlertEngine};
+use crate::cluster::ClusterState;
 use crate::middleware::ratelimit::PhalanxRateLimiter;
 use crate::telemetry::bandwidth::BandwidthTracker;
 
@@ -17,6 +18,9 @@ pub struct DashboardState {
     pub rate_limiter: Arc<PhalanxRateLimiter>,
     pub bandwidth: Arc<BandwidthTracker>,
     pub alert_engine: Arc<AlertEngine>,
+    pub cluster_state: Arc<ClusterState>,
+    /// Shared WebRTC SFU state for room stats from the dashboard.
+    pub sfu_state: Arc<crate::proxy::webrtc::SfuState>,
 }
 
 // ── WAF Ban Management ─────────────────────────────────────────────────────────
@@ -126,14 +130,20 @@ pub struct NodeStatus {
 }
 
 /// GET /api/cluster/nodes — registered cluster nodes and their health.
+/// Reads from the live gossip membership table when gossip is enabled,
+/// otherwise returns only the local node.
 #[get("/api/cluster/nodes")]
-pub async fn cluster_nodes() -> impl Responder {
-    let node_id = std::env::var("HOSTNAME").unwrap_or_else(|_| "local".to_string());
-    let nodes = vec![NodeStatus {
-        node_id,
-        status: "healthy".to_string(),
-        last_seen_secs: 0,
-    }];
+pub async fn cluster_nodes(state: web::Data<DashboardState>) -> impl Responder {
+    let nodes: Vec<NodeStatus> = state
+        .cluster_state
+        .list_nodes()
+        .into_iter()
+        .map(|n| NodeStatus {
+            node_id: n.node_id,
+            status: n.status,
+            last_seen_secs: n.last_seen_secs,
+        })
+        .collect();
     HttpResponse::Ok().json(serde_json::json!({ "nodes": nodes }))
 }
 
@@ -220,26 +230,41 @@ mod tests {
         let cache = Arc::new(AdvancedCache::new(1000, 60, None));
         // Unique path per test to avoid RocksDB lock contention.
         let db_path = format!("/tmp/phalanx_test_dash_{}", id);
-        let discovery = Arc::new(ServiceDiscovery::new(&db_path));
+        let discovery = Arc::new(ServiceDiscovery::new(&db_path).unwrap());
         let config = AppConfig::default();
-        let manager = Arc::new(UpstreamManager::new(&config, Arc::clone(&discovery)));
+        let manager = Arc::new(UpstreamManager::new(&config, Arc::clone(&discovery), tokio_util::sync::CancellationToken::new()));
         let keyval = KeyvalStore::new(0, None);
         let metrics = Arc::new(ProxyMetrics::new());
         let rate_limiter = Arc::new(PhalanxRateLimiter::new(100, 200, None, None));
         let bandwidth = BandwidthTracker::new();
         let alert_engine = AlertEngine::new(Arc::clone(&bandwidth));
 
+        let cluster_state = Arc::new(
+            crate::cluster::ClusterState::new(
+                crate::cluster::ClusterBackend::Standalone,
+                "test-node".to_string(),
+            )
+        );
+        let sfu_state = crate::proxy::webrtc::SfuState::new();
         let base = AdminState {
             metrics, discovery, manager, keyval, waf, cache,
             rate_limiter: Arc::clone(&rate_limiter),
             bandwidth: Arc::clone(&bandwidth),
             alert_engine: Arc::clone(&alert_engine),
+            dynamic_routes: Arc::new(dashmap::DashMap::new()),
+            dynamic_certs: Arc::new(dashmap::DashMap::new()),
+            config_path: "phalanx.conf".to_string(),
+            cluster_state: Arc::clone(&cluster_state),
+            sfu_state: Arc::clone(&sfu_state),
+            ice_servers: Vec::new(),
         };
         web::Data::new(DashboardState {
             base,
             rate_limiter,
             bandwidth,
             alert_engine,
+            cluster_state,
+            sfu_state,
         })
     }
 
@@ -406,7 +431,10 @@ mod tests {
 
     #[actix_web::test]
     async fn test_cluster_nodes() {
-        let app = test::init_service(App::new().service(cluster_nodes)).await;
+        let state = make_state();
+        let app = test::init_service(
+            App::new().app_data(state.clone()).service(cluster_nodes)
+        ).await;
         let req = test::TestRequest::get().uri("/api/cluster/nodes").to_request();
         let resp = test::call_service(&app, req).await;
         assert_eq!(resp.status(), 200);
@@ -502,15 +530,16 @@ mod tests {
     async fn test_list_alerts_after_threshold_breach() {
         use crate::telemetry::bandwidth::ProtocolThreshold;
         let state = make_state();
-        // Set tiny threshold and add traffic
+        // Set tiny threshold, establish baseline, then add traffic
         state.bandwidth.set_threshold("tcp", ProtocolThreshold {
             bandwidth_bps_warn: 1,
             bandwidth_bps_critical: 1_000_000,
             connections_warn: 999_999,
             connections_critical: 9_999_999,
         });
+        state.alert_engine.check().await; // establish baseline
         state.bandwidth.protocol("tcp").add_in(100);
-        state.alert_engine.check().await;
+        state.alert_engine.check().await; // rate now exceeds threshold
 
         let app = test::init_service(
             App::new().app_data(state.clone()).service(list_alerts)

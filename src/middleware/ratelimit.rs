@@ -40,6 +40,9 @@ pub struct PhalanxRateLimiter {
     inner: ArcSwap<RateLimiterInner>,
     /// Optional Redis client for distributed rate limiting.
     pub redis_client: Option<redis::Client>,
+    /// Lazily-initialized multiplexed Redis connection, cached to avoid
+    /// creating a new connection on every rate-limit check.
+    redis_conn: tokio::sync::Mutex<Option<redis::aio::MultiplexedConnection>>,
     /// Per-IP cumulative request counter for the admin dashboard's top-N queries.
     pub request_counts: Arc<dashmap::DashMap<String, u64>>,
 }
@@ -106,6 +109,7 @@ impl PhalanxRateLimiter {
         Self {
             inner: ArcSwap::from_pointee(inner),
             redis_client,
+            redis_conn: tokio::sync::Mutex::new(None),
             request_counts: Arc::new(dashmap::DashMap::new()),
         }
     }
@@ -154,14 +158,49 @@ impl PhalanxRateLimiter {
     }
 
     /// Returns the top N IPs by cumulative request count, sorted descending.
+    ///
+    /// Uses a capped min-heap to keep memory bounded at O(N) rather than O(total IPs).
+    /// Each entry is pushed onto a `BinaryHeap<Reverse<(count, key)>>`; once the heap
+    /// exceeds `n`, the smallest element is popped. After iteration, the heap contains
+    /// exactly the top N entries which are drained into a descending Vec.
     pub fn top_ips(&self, n: usize) -> Vec<(String, u64)> {
-        let mut v: Vec<(String, u64)> = self.request_counts
-            .iter()
-            .map(|e| (e.key().clone(), *e.value()))
-            .collect();
-        v.sort_by(|a, b| b.1.cmp(&a.1));
-        v.truncate(n);
-        v
+        use std::collections::BinaryHeap;
+        use std::cmp::Reverse;
+
+        if n == 0 {
+            return Vec::new();
+        }
+
+        let mut heap: BinaryHeap<Reverse<(u64, String)>> = BinaryHeap::with_capacity(n);
+
+        for entry in self.request_counts.iter() {
+            let item = Reverse((*entry.value(), entry.key().clone()));
+            heap.push(item);
+            if heap.len() > n {
+                heap.pop();
+            }
+        }
+
+        heap
+            .into_sorted_vec()
+            .into_iter()
+            .map(|Reverse((count, key))| (key, count))
+            .collect()
+    }
+
+    /// Spawns a background sweeper that periodically resets the `request_counts`
+    /// DashMap to prevent unbounded memory growth under high-cardinality traffic.
+    pub fn spawn_sweeper(&self) {
+        let counts = Arc::clone(&self.request_counts);
+        let Ok(handle) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        handle.spawn(async move {
+            loop {
+                tokio::time::sleep(std::time::Duration::from_secs(300)).await;
+                counts.clear();
+            }
+        });
     }
 
     /// Lua script for a sliding window or strict token bucket rate limit
@@ -188,7 +227,15 @@ impl PhalanxRateLimiter {
     pub async fn check_ip(&self, ip: IpAddr) -> bool {
         // 1. Redis Cluster Sync: global + per-IP checks (when Redis is available)
         if let Some(ref client) = self.redis_client {
-            if let Ok(mut con) = client.get_multiplexed_async_connection().await {
+            // Lazy-init: cache the multiplexed connection to avoid creating a new
+            // TCP connection on every rate-limit check.
+            let mut guard = self.redis_conn.lock().await;
+            if guard.is_none() {
+                if let Ok(con) = client.get_multiplexed_async_connection().await {
+                    *guard = Some(con);
+                }
+            }
+            if let Some(ref mut con) = *guard {
                 let now = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .unwrap()
@@ -202,7 +249,7 @@ impl PhalanxRateLimiter {
                         .arg(gr)
                         .arg(now)
                         .arg(1000u64)
-                        .invoke_async(&mut con)
+                        .invoke_async(&mut *con)
                         .await;
                     if let Ok(0) = result {
                         warn!("Global DDoS Rate Limit Exceeded (Redis)! {:?}", ip);
@@ -220,7 +267,7 @@ impl PhalanxRateLimiter {
                     .arg(ip_burst)
                     .arg(now)
                     .arg(1000u64)
-                    .invoke_async(&mut con)
+                    .invoke_async(&mut *con)
                     .await;
                 if let Ok(0) = result {
                     warn!("Per-IP Rate Limit Exceeded (Redis) for {}! Dropping connection.", ip);
@@ -378,6 +425,47 @@ mod tests {
     fn test_top_ips_empty() {
         let limiter = PhalanxRateLimiter::new(100, 200, None, None);
         assert!(limiter.top_ips(10).is_empty());
+    }
+
+    #[test]
+    fn test_top_ips_heap_allocates_bounded() {
+        let limiter = PhalanxRateLimiter::new(1000, 2000, None, None);
+        // 100 unique IPs, each with distinct counts
+        for i in 0..100u64 {
+            for _ in 0..=i {
+                limiter.record_request(&format!("10.0.0.{}", i));
+            }
+        }
+        let top = limiter.top_ips(3);
+        assert_eq!(top.len(), 3);
+        // Highest-count IPs: 10.0.0.99 (100 hits), 10.0.0.98 (99), 10.0.0.97 (98)
+        assert_eq!(top[0].0, "10.0.0.99");
+        assert_eq!(top[0].1, 100);
+        assert_eq!(top[1].0, "10.0.0.98");
+        assert_eq!(top[2].0, "10.0.0.97");
+        // Verify descending order
+        for w in top.windows(2) {
+            assert!(w[0].1 >= w[1].1);
+        }
+    }
+
+    #[test]
+    fn test_top_ips_n_zero() {
+        let limiter = PhalanxRateLimiter::new(1000, 2000, None, None);
+        limiter.record_request("10.0.0.1");
+        assert!(limiter.top_ips(0).is_empty());
+    }
+
+    #[test]
+    fn test_top_ips_n_greater_than_entries() {
+        let limiter = PhalanxRateLimiter::new(1000, 2000, None, None);
+        limiter.record_request("a");
+        limiter.record_request("b");
+        limiter.record_request("b");
+        let top = limiter.top_ips(10);
+        assert_eq!(top.len(), 2);
+        assert_eq!(top[0].0, "b");
+        assert_eq!(top[0].1, 2);
     }
 
     #[test]

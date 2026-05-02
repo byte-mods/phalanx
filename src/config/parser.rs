@@ -93,6 +93,9 @@ pub struct ServerBlock {
     pub routes: HashMap<String, RouteBlock>,
     /// Generic key-value directives (e.g., rate_limit_per_ip, waf_enabled, ai_epsilon)
     pub directives: HashMap<String, String>,
+    /// ICE server URLs for WebRTC NAT traversal (STUN/TURN).
+    /// Each entry is a URL like `stun:host:port` or `turn:host:port?transport=udp`.
+    pub ice_servers: Vec<String>,
 }
 
 /// Represents a `route /path { ... }` block inside a server.
@@ -411,6 +414,15 @@ fn parse_server_block(tokens: &[String], mut i: usize) -> Result<(ServerBlock, u
             continue;
         }
 
+        // Parse: `ice_server stun:host:port;` or `ice_server turn:host:port?transport=udp;`
+        // Accumulates — each directive appends one ICE server URL.
+        if token == "ice_server" {
+            expect_directive_value_semicolon(tokens, i, "ice_server")?;
+            block.ice_servers.push(tokens[i + 1].clone());
+            i += 3;
+            continue;
+        }
+
         // Generic directive: `key value;`
         // Must match exactly: TOKEN VALUE ;
         if i + 2 < tokens.len() && tokens[i + 2] == ";" {
@@ -620,7 +632,10 @@ fn parse_route_block(
         // Parse: `gzip_min_length 1024;`
         if token == "gzip_min_length" {
             expect_directive_value_semicolon(tokens, i, "gzip_min_length")?;
-            block.gzip_min_length = tokens[i + 1].parse().unwrap_or(1024);
+            block.gzip_min_length = match tokens[i + 1].parse() {
+                Ok(v) => v,
+                Err(_) => return Err(format!("Invalid value '{}' for gzip_min_length", tokens[i + 1])),
+            };
             i += 3;
             continue;
         }
@@ -636,7 +651,10 @@ fn parse_route_block(
         // Parse: `proxy_cache_valid 60;`
         if token == "proxy_cache_valid" {
             expect_directive_value_semicolon(tokens, i, "proxy_cache_valid")?;
-            block.proxy_cache_valid_secs = tokens[i + 1].parse().unwrap_or(60);
+            block.proxy_cache_valid_secs = match tokens[i + 1].parse() {
+                Ok(v) => v,
+                Err(_) => return Err(format!("Invalid value '{}' for proxy_cache_valid", tokens[i + 1])),
+            };
             i += 3;
             continue;
         }
@@ -668,7 +686,10 @@ fn parse_route_block(
         // Parse: `proxy_connect_timeout 10;`
         if token == "proxy_connect_timeout" {
             expect_directive_value_semicolon(tokens, i, "proxy_connect_timeout")?;
-            block.proxy_connect_timeout_secs = tokens[i + 1].parse().unwrap_or(0);
+            block.proxy_connect_timeout_secs = match tokens[i + 1].parse() {
+                Ok(v) => v,
+                Err(_) => return Err(format!("Invalid value '{}' for proxy_connect_timeout", tokens[i + 1])),
+            };
             i += 3;
             continue;
         }
@@ -676,7 +697,10 @@ fn parse_route_block(
         // Parse: `proxy_read_timeout 60;`
         if token == "proxy_read_timeout" {
             expect_directive_value_semicolon(tokens, i, "proxy_read_timeout")?;
-            block.proxy_read_timeout_secs = tokens[i + 1].parse().unwrap_or(0);
+            block.proxy_read_timeout_secs = match tokens[i + 1].parse() {
+                Ok(v) => v,
+                Err(_) => return Err(format!("Invalid value '{}' for proxy_read_timeout", tokens[i + 1])),
+            };
             i += 3;
             continue;
         }
@@ -684,7 +708,10 @@ fn parse_route_block(
         // Parse: `proxy_next_upstream_tries 3;`
         if token == "proxy_next_upstream_tries" {
             expect_directive_value_semicolon(tokens, i, "proxy_next_upstream_tries")?;
-            block.proxy_next_upstream_tries = tokens[i + 1].parse().unwrap_or(0);
+            block.proxy_next_upstream_tries = match tokens[i + 1].parse() {
+                Ok(v) => v,
+                Err(_) => return Err(format!("Invalid value '{}' for proxy_next_upstream_tries", tokens[i + 1])),
+            };
             i += 3;
             continue;
         }
@@ -692,7 +719,10 @@ fn parse_route_block(
         // Parse: `proxy_next_upstream_timeout 30;`
         if token == "proxy_next_upstream_timeout" {
             expect_directive_value_semicolon(tokens, i, "proxy_next_upstream_timeout")?;
-            block.proxy_next_upstream_timeout_secs = tokens[i + 1].parse().unwrap_or(0);
+            block.proxy_next_upstream_timeout_secs = match tokens[i + 1].parse() {
+                Ok(v) => v,
+                Err(_) => return Err(format!("Invalid value '{}' for proxy_next_upstream_timeout", tokens[i + 1])),
+            };
             i += 3;
             continue;
         }
@@ -700,7 +730,10 @@ fn parse_route_block(
         // Parse: `client_max_body_size 10M;`
         if token == "client_max_body_size" {
             expect_directive_value_semicolon(tokens, i, "client_max_body_size")?;
-            block.client_max_body_size = crate::config::parse_size_value(&tokens[i + 1]);
+            block.client_max_body_size = match crate::config::parse_size_value(&tokens[i + 1]) {
+                Ok(v) => v,
+                Err(e) => return Err(e),
+            };
             i += 3;
             continue;
         }
@@ -759,7 +792,10 @@ fn parse_route_block(
         // Parse: `cors_max_age 86400;`
         if token == "cors_max_age" {
             expect_directive_value_semicolon(tokens, i, "cors_max_age")?;
-            block.cors_max_age_secs = tokens[i + 1].parse().unwrap_or(86400);
+            block.cors_max_age_secs = match tokens[i + 1].parse() {
+                Ok(v) => v,
+                Err(_) => return Err(format!("Invalid value '{}' for cors_max_age", tokens[i + 1])),
+            };
             i += 3;
             continue;
         }
@@ -861,7 +897,10 @@ fn parse_upstream_block(
         // Parse: `max_fails 3;`
         if token == "max_fails" {
             expect_directive_value_semicolon(tokens, i, "max_fails")?;
-            block.max_fails = tokens[i + 1].parse().unwrap_or(3);
+            block.max_fails = match tokens[i + 1].parse() {
+                Ok(v) => v,
+                Err(_) => return Err(format!("Invalid value '{}' for max_fails", tokens[i + 1])),
+            };
             i += 3;
             continue;
         }
@@ -877,7 +916,10 @@ fn parse_upstream_block(
         // Parse: `fail_timeout 30;`
         if token == "fail_timeout" {
             expect_directive_value_semicolon(tokens, i, "fail_timeout")?;
-            block.fail_timeout_secs = tokens[i + 1].parse().unwrap_or(30);
+            block.fail_timeout_secs = match tokens[i + 1].parse() {
+                Ok(v) => v,
+                Err(_) => return Err(format!("Invalid value '{}' for fail_timeout", tokens[i + 1])),
+            };
             i += 3;
             continue;
         }
@@ -885,7 +927,10 @@ fn parse_upstream_block(
         // Parse: `slow_start 30;`
         if token == "slow_start" {
             expect_directive_value_semicolon(tokens, i, "slow_start")?;
-            block.slow_start_secs = tokens[i + 1].parse().unwrap_or(0);
+            block.slow_start_secs = match tokens[i + 1].parse() {
+                Ok(v) => v,
+                Err(_) => return Err(format!("Invalid value '{}' for slow_start", tokens[i + 1])),
+            };
             i += 3;
             continue;
         }
@@ -942,7 +987,10 @@ fn parse_upstream_block(
         // Parse: `keepalive 32;`
         if token == "keepalive" {
             expect_directive_value_semicolon(tokens, i, "keepalive")?;
-            block.keepalive = tokens[i + 1].parse().unwrap_or(0);
+            block.keepalive = match tokens[i + 1].parse() {
+                Ok(v) => v,
+                Err(_) => return Err(format!("Invalid value '{}' for keepalive", tokens[i + 1])),
+            };
             i += 3;
             continue;
         }
@@ -958,7 +1006,10 @@ fn parse_upstream_block(
         // Parse: `health_check_status 200;`
         if token == "health_check_status" {
             expect_directive_value_semicolon(tokens, i, "health_check_status")?;
-            block.health_check_status = tokens[i + 1].parse().unwrap_or(200);
+            block.health_check_status = match tokens[i + 1].parse() {
+                Ok(v) => v,
+                Err(_) => return Err(format!("Invalid value '{}' for health_check_status", tokens[i + 1])),
+            };
             i += 3;
             continue;
         }
@@ -966,7 +1017,10 @@ fn parse_upstream_block(
         // Parse: `health_check_interval 10;`
         if token == "health_check_interval" {
             expect_directive_value_semicolon(tokens, i, "health_check_interval")?;
-            block.health_check_interval_secs = tokens[i + 1].parse().unwrap_or(5);
+            block.health_check_interval_secs = match tokens[i + 1].parse() {
+                Ok(v) => v,
+                Err(_) => return Err(format!("Invalid value '{}' for health_check_interval", tokens[i + 1])),
+            };
             i += 3;
             continue;
         }
@@ -974,7 +1028,10 @@ fn parse_upstream_block(
         // Parse: `health_check_timeout 5;`
         if token == "health_check_timeout" {
             expect_directive_value_semicolon(tokens, i, "health_check_timeout")?;
-            block.health_check_timeout_secs = tokens[i + 1].parse().unwrap_or(3);
+            block.health_check_timeout_secs = match tokens[i + 1].parse() {
+                Ok(v) => v,
+                Err(_) => return Err(format!("Invalid value '{}' for health_check_timeout", tokens[i + 1])),
+            };
             i += 3;
             continue;
         }
@@ -1603,5 +1660,98 @@ mod tests {
         assert!(result.is_ok());
         let route = &result.unwrap().http.unwrap().servers[0].routes["/upload"];
         assert_eq!(route.client_max_body_size, 1024 * 1024 * 1024);
+    }
+
+    #[test]
+    fn test_ice_server_single_directive() {
+        let cfg = r#"
+            http {
+                upstream default { server 127.0.0.1:8081; }
+                server {
+                    listen 8080;
+                    ice_server stun:stun.l.google.com:19302;
+                }
+            }
+        "#;
+        let result = parse_phalanx_config(cfg);
+        assert!(result.is_ok());
+        let servers = &result.unwrap().http.unwrap().servers;
+        assert_eq!(servers[0].ice_servers, vec!["stun:stun.l.google.com:19302"]);
+    }
+
+    #[test]
+    fn test_ice_server_multiple_directives_accumulate() {
+        let cfg = r#"
+            http {
+                upstream default { server 127.0.0.1:8081; }
+                server {
+                    listen 8080;
+                    ice_server stun:stun.l.google.com:19302;
+                    ice_server turn:turn.example.com:3478?transport=udp;
+                    ice_server turns:turns.example.com:5349?transport=tcp;
+                }
+            }
+        "#;
+        let result = parse_phalanx_config(cfg);
+        assert!(result.is_ok());
+        let servers = &result.unwrap().http.unwrap().servers;
+        assert_eq!(servers[0].ice_servers.len(), 3);
+        assert_eq!(servers[0].ice_servers[0], "stun:stun.l.google.com:19302");
+        assert_eq!(servers[0].ice_servers[1], "turn:turn.example.com:3478?transport=udp");
+        assert_eq!(servers[0].ice_servers[2], "turns:turns.example.com:5349?transport=tcp");
+    }
+
+    #[test]
+    fn test_ice_server_missing_semicolon() {
+        let cfg = r#"
+            http {
+                upstream default { server 127.0.0.1:8081; }
+                server {
+                    listen 8080;
+                    ice_server stun:stun.l.google.com:19302
+                }
+            }
+        "#;
+        let result = parse_phalanx_config(cfg);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_ice_server_missing_value() {
+        let cfg = r#"
+            http {
+                upstream default { server 127.0.0.1:8081; }
+                server {
+                    listen 8080;
+                    ice_server;
+                }
+            }
+        "#;
+        let result = parse_phalanx_config(cfg);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_ice_server_multiple_server_blocks_accumulate_independently() {
+        let cfg = r#"
+            http {
+                upstream default { server 127.0.0.1:8081; }
+                server {
+                    listen 8080;
+                    ice_server stun:stun-a.example.com:3478;
+                }
+                server {
+                    listen 8443;
+                    ice_server turn:turn-b.example.com:3478;
+                    ice_server stun:stun-b.example.com:3478;
+                }
+            }
+        "#;
+        let result = parse_phalanx_config(cfg);
+        assert!(result.is_ok());
+        let servers = &result.unwrap().http.unwrap().servers;
+        assert_eq!(servers.len(), 2);
+        assert_eq!(servers[0].ice_servers, vec!["stun:stun-a.example.com:3478"]);
+        assert_eq!(servers[1].ice_servers.len(), 2);
     }
 }

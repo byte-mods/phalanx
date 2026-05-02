@@ -109,13 +109,15 @@ impl ZoneLimiter {
     }
 
     /// Releases a connection slot for the given key.
+    ///
+    /// Does not remove the entry when the count reaches zero — that would race
+    /// with a concurrent acquire (`fetch_sub` → `prev <= 1` → `remove` leaves a
+    /// window for another thread to re-insert the key). Zero counters are harmless:
+    /// the next `acquire_connection` calls `or_insert_with(AtomicU32::new(0))` and
+    /// `fetch_add(1)` succeeds since `0 < max_conns`.
     pub fn release_connection(&self, key: &str) {
         if let Some(counter) = self.connections.get(key) {
-            let prev = counter.fetch_sub(1, Ordering::Relaxed);
-            if prev <= 1 {
-                drop(counter);
-                self.connections.remove(key);
-            }
+            counter.fetch_sub(1, Ordering::Relaxed);
         }
     }
 
@@ -193,17 +195,19 @@ impl ZoneKeySource {
 }
 
 /// Extracts a named cookie value from the `Cookie` request header.
+///
+/// Needle is built once outside the split loop to avoid per-cookie allocations.
 fn extract_cookie_value(headers: &hyper::HeaderMap, name: &str) -> Option<String> {
     headers
         .get(hyper::header::COOKIE)
         .and_then(|v| v.to_str().ok())
         .and_then(|cookies| {
+            let needle = format!("{}=", name);
             for part in cookies.split(';') {
                 let part = part.trim();
-                if let Some(val) = part.strip_prefix(name) {
-                    let val = val.trim_start_matches('=');
+                if let Some(val) = part.strip_prefix(needle.as_str()) {
                     if !val.is_empty() {
-                        return Some(val.to_string());
+                        return Some(val.trim().to_string());
                     }
                 }
             }
@@ -322,6 +326,19 @@ mod tests {
     }
 
     #[test]
+    fn test_extract_cookie_value_no_partial_match() {
+        // "sid" must NOT match "session_id=abc" (prefix collision)
+        let mut headers = hyper::HeaderMap::new();
+        headers.insert(
+            hyper::header::COOKIE,
+            "session_id=abc; sid=xyz".parse().unwrap(),
+        );
+        assert_eq!(extract_cookie_value(&headers, "sid"), Some("xyz".to_string()));
+        assert_eq!(extract_cookie_value(&headers, "session_id"), Some("abc".to_string()));
+        assert_eq!(extract_cookie_value(&headers, "session"), None);
+    }
+
+    #[test]
     fn test_zone_key_source_uri() {
         let src = ZoneKeySource::Uri;
         let headers = hyper::HeaderMap::new();
@@ -385,6 +402,56 @@ mod tests {
         limiter.reload(100, 10, 5);
         // Existing counters are preserved (2 active), but limit is now 5
         assert!(limiter.acquire_connection("k"), "should allow 3rd after reload to 5");
+    }
+
+    /// M45 regression: concurrent acquire/release must not lose counters.
+    /// The old `release_connection` had a TOCTOU between fetch_sub and remove
+    /// that could delete a counter re-inserted by a concurrent acquire.
+    #[test]
+    fn test_zone_limiter_concurrent_acquire_release_no_counter_loss() {
+        use std::sync::Arc;
+        use std::thread;
+
+        let limiter = Arc::new(ZoneLimiter::new("concurrent", 1000, 100, 10));
+        let keys: Vec<String> = (0..8).map(|i| format!("key-{}", i)).collect();
+
+        let mut handles = vec![];
+        for _ in 0..8 {
+            let lim = Arc::clone(&limiter);
+            let keys = keys.clone();
+            handles.push(thread::spawn(move || {
+                for _ in 0..500 {
+                    for k in &keys {
+                        if lim.acquire_connection(k) {
+                            lim.release_connection(k);
+                        }
+                    }
+                }
+            }));
+        }
+
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        // After all releases, every key's counter should be 0 (not negative).
+        // If the TOCTOU had deleted a re-inserted counter, some keys would
+        // have non-zero counts or the DashMap would be in an inconsistent state.
+        for k in &keys {
+            // All connections were released, so acquire should always succeed
+            // up to the max_connections limit (10).
+            for _ in 0..10 {
+                assert!(
+                    limiter.acquire_connection(k),
+                    "key {} should be acquirable after all releases",
+                    k
+                );
+            }
+            // Release all 10
+            for _ in 0..10 {
+                limiter.release_connection(k);
+            }
+        }
     }
 }
 

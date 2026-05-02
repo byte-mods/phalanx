@@ -70,36 +70,36 @@ pub async fn serve_session(
     stream: RequestStream<BidiStream<Bytes>, Bytes>,
     conn: Connection<h3_quinn::Connection, Bytes>,
     remote_addr: SocketAddr,
+    metrics: Arc<crate::admin::ProxyMetrics>,
 ) {
     let session = match WebTransportSession::accept(req, stream, conn).await {
         Ok(s) => {
             info!("WebTransport session accepted from {}", remote_addr);
+            metrics.wt_sessions_total.with_label_values(&["accepted"]).inc();
+            metrics.wt_active_sessions.inc();
             s
         }
         Err(e) => {
-            // accept() also closes the stream / connection on failure.
             warn!(
                 "WebTransport accept failed from {}: {}",
                 remote_addr, e
             );
+            metrics.wt_sessions_total.with_label_values(&["error"]).inc();
             return;
         }
     };
 
     let session = Arc::new(session);
+    let metrics_clone = Arc::clone(&metrics);
 
-    // Three concurrent echo loops sharing the session via Arc. The
-    // session itself uses internal `Mutex<Connection<...>>` and
-    // `Mutex<OpenStreams>`, so concurrent calls serialize at the lock
-    // boundary — fine for echo, where there's no critical-path latency
-    // budget. `select!` exits as soon as any loop completes (which in WT
-    // means the session ended), so the other two are dropped together.
+    // Three concurrent echo loops sharing the session via Arc.
     tokio::select! {
-        _ = bidi_echo_loop(session.clone(), remote_addr) => {},
-        _ = uni_echo_loop(session.clone(), remote_addr) => {},
-        _ = datagram_echo_loop(session.clone(), remote_addr) => {},
+        _ = bidi_echo_loop(session.clone(), remote_addr, Arc::clone(&metrics)) => {},
+        _ = uni_echo_loop(session.clone(), remote_addr, Arc::clone(&metrics)) => {},
+        _ = datagram_echo_loop(session.clone(), remote_addr, metrics_clone) => {},
     }
 
+    metrics.wt_active_sessions.dec();
     debug!("WebTransport session ended (remote={})", remote_addr);
 }
 
@@ -110,27 +110,35 @@ type WtSession = WebTransportSession<h3_quinn::Connection, Bytes>;
 /// Echo every incoming bidirectional stream back to the client. Each
 /// accepted stream is handled in its own task so a slow reader on one
 /// stream doesn't stall accepting the next.
-async fn bidi_echo_loop(session: Arc<WtSession>, remote_addr: SocketAddr) {
+async fn bidi_echo_loop(
+    session: Arc<WtSession>,
+    remote_addr: SocketAddr,
+    metrics: Arc<crate::admin::ProxyMetrics>,
+) {
     loop {
         match session.accept_bi().await {
             Ok(Some(AcceptedBi::BidiStream(_session_id, mut bidi))) => {
+                let m = metrics.clone();
                 tokio::spawn(async move {
                     let mut buf = [0u8; 8192];
-                    loop {
+                    let outcome = loop {
                         match bidi.read(&mut buf).await {
-                            Ok(0) => break, // peer half-closed
+                            Ok(0) => break "echoed", // peer half-closed
                             Ok(n) => {
                                 if let Err(e) = bidi.write_all(&buf[..n]).await {
                                     debug!("WT bidi echo write: {}", e);
-                                    break;
+                                    break "error";
                                 }
                             }
                             Err(e) => {
                                 debug!("WT bidi echo read: {}", e);
-                                break;
+                                break "error";
                             }
                         }
-                    }
+                    };
+                    m.wt_streams_total
+                        .with_label_values(&["bidi", outcome])
+                        .inc();
                     // Best-effort flush + finish; ignore errors because
                     // the peer may already have closed the stream.
                     let _ = bidi.shutdown().await;
@@ -164,41 +172,58 @@ async fn bidi_echo_loop(session: Arc<WtSession>, remote_addr: SocketAddr) {
 /// opening a fresh server-initiated uni stream and writing the same
 /// bytes back. (Uni streams are one-way by definition, so the echo path
 /// has to use a new stream in the opposite direction.)
-async fn uni_echo_loop(session: Arc<WtSession>, remote_addr: SocketAddr) {
+async fn uni_echo_loop(
+    session: Arc<WtSession>,
+    remote_addr: SocketAddr,
+    metrics: Arc<crate::admin::ProxyMetrics>,
+) {
     loop {
         match session.accept_uni().await {
             Ok(Some((session_id, mut recv))) => {
                 let session_for_task = session.clone();
+                let m = metrics.clone();
                 tokio::spawn(async move {
                     // Drain the incoming uni stream first. WT uni
                     // streams typically carry small messages, so an
                     // 8 KiB scratch buffer + a Vec is fine for v1.
                     let mut payload: Vec<u8> = Vec::with_capacity(4096);
                     let mut buf = [0u8; 8192];
-                    loop {
+                    let outcome = loop {
                         match recv.read(&mut buf).await {
-                            Ok(0) => break,
+                            Ok(0) => break "drained",
                             Ok(n) => payload.extend_from_slice(&buf[..n]),
                             Err(e) => {
                                 debug!("WT uni read: {}", e);
+                                m.wt_streams_total
+                                    .with_label_values(&["uni", "error"])
+                                    .inc();
                                 return;
                             }
                         }
-                    }
+                    };
                     // Open a fresh server-initiated uni stream back to
                     // the client and write the captured payload.
                     let mut send = match session_for_task.open_uni(session_id).await {
                         Ok(s) => s,
                         Err(e) => {
                             debug!("WT uni open_uni: {}", e);
+                            m.wt_streams_total
+                                .with_label_values(&["uni", "error"])
+                                .inc();
                             return;
                         }
                     };
                     if let Err(e) = send.write_all(&payload).await {
                         debug!("WT uni echo write: {}", e);
+                        m.wt_streams_total
+                            .with_label_values(&["uni", "error"])
+                            .inc();
                         return;
                     }
                     let _ = send.shutdown().await;
+                    m.wt_streams_total
+                        .with_label_values(&["uni", outcome])
+                        .inc();
                 });
             }
             Ok(None) => {
@@ -217,7 +242,11 @@ async fn uni_echo_loop(session: Arc<WtSession>, remote_addr: SocketAddr) {
 /// `send_datagram` is non-blocking on quinn (the OS buffers; if it
 /// can't, the datagram is dropped — that's the contract for unreliable
 /// transport).
-async fn datagram_echo_loop(session: Arc<WtSession>, remote_addr: SocketAddr) {
+async fn datagram_echo_loop(
+    session: Arc<WtSession>,
+    remote_addr: SocketAddr,
+    metrics: Arc<crate::admin::ProxyMetrics>,
+) {
     let mut reader = session.datagram_reader();
     let mut sender = session.datagram_sender();
 
@@ -227,14 +256,26 @@ async fn datagram_echo_loop(session: Arc<WtSession>, remote_addr: SocketAddr) {
                 let payload = dgram.into_payload();
                 if let Err(e) = sender.send_datagram(payload) {
                     debug!("WT datagram send: {}", e);
+                    metrics
+                        .wt_datagrams_total
+                        .with_label_values(&["error"])
+                        .inc();
                     return;
                 }
+                metrics
+                    .wt_datagrams_total
+                    .with_label_values(&["echoed"])
+                    .inc();
             }
             Err(e) => {
                 debug!(
                     "WT datagram read error (remote={}): {}",
                     remote_addr, e
                 );
+                metrics
+                    .wt_datagrams_total
+                    .with_label_values(&["error"])
+                    .inc();
                 return;
             }
         }

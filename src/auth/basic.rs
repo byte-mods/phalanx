@@ -8,6 +8,11 @@ use base64::{Engine as _, engine::general_purpose::STANDARD};
 use hyper::{HeaderMap, StatusCode};
 use std::collections::HashMap;
 
+/// Dummy bcrypt hash used to burn CPU time when an unknown username is presented,
+/// neutralizing the timing oracle that would otherwise reveal that the user
+/// does not exist.
+const DUMMY_BCRYPT_HASH: &str = "$2b$12$LJ3m4ys3LkPGsHFRbJBNkeI5QjF6QFjpREsFOxNKHqFJqXKjmqB2W";
+
 /// Check HTTP Basic Authentication against a configured set of `username:password` pairs.
 ///
 /// Passwords may be stored as:
@@ -75,7 +80,12 @@ pub fn check(headers: &HeaderMap, _realm: &str, users: &HashMap<String, String>)
     // Look up the user
     let stored = match users.get(username) {
         Some(s) => s,
-        None => return AuthResult::Denied(StatusCode::UNAUTHORIZED, "Invalid credentials"),
+        None => {
+            // Run bcrypt against a dummy hash to close the timing oracle that
+            // would otherwise reveal whether a username exists.
+            let _ = bcrypt::verify(password, DUMMY_BCRYPT_HASH);
+            return AuthResult::Denied(StatusCode::UNAUTHORIZED, "Invalid credentials");
+        }
     };
 
     // Verify password — supports bcrypt hashes and plaintext
@@ -170,6 +180,24 @@ mod tests {
             check(&headers, "Test", &users),
             AuthResult::Denied(..)
         ));
+    }
+
+    /// M34 regression: unknown-user and wrong-password must return the same
+    /// status code and error message so attackers cannot enumerate valid
+    /// usernames via timing or error-content side-channels.
+    #[test]
+    fn test_basic_auth_constant_time_missing_user() {
+        let users = make_users(&[("admin", "correct")]);
+        // Wrong password for known user
+        let r1 = check(&make_headers(&basic_header("admin", "wrong")), "Test", &users);
+        // Unknown user
+        let r2 = check(&make_headers(&basic_header("nobody", "anything")), "Test", &users);
+        // Both must be 401 with identical message
+        assert_eq!(
+            format!("{:?}", r1),
+            format!("{:?}", r2),
+            "unknown-user and wrong-password must be indistinguishable"
+        );
     }
 
     #[test]

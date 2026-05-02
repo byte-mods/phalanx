@@ -14,10 +14,6 @@ use crate::config::RouteConfig;
 /// RBAC token validation on top of the base `AdminState`.
 pub struct ExtendedAdminState {
     pub base: super::AdminState,
-    /// Dynamically managed routes (overlay on top of config-file routes)
-    pub dynamic_routes: Arc<dashmap::DashMap<String, RouteConfig>>,
-    /// Dynamically managed SSL certificates
-    pub dynamic_certs: Arc<dashmap::DashMap<String, SslCertEntry>>,
     /// RBAC token → role mapping
     pub api_tokens: Arc<dashmap::DashMap<String, ApiRole>>,
 }
@@ -49,8 +45,6 @@ impl ExtendedAdminState {
 
         Self {
             base,
-            dynamic_routes: Arc::new(dashmap::DashMap::new()),
-            dynamic_certs: Arc::new(dashmap::DashMap::new()),
             api_tokens,
         }
     }
@@ -167,7 +161,7 @@ pub async fn create_route(
         ..Default::default()
     };
 
-    state.dynamic_routes.insert(body.path.clone(), route);
+    state.base.dynamic_routes.insert(body.path.clone(), route);
     info!("Dynamic route added: {}", body.path);
 
     HttpResponse::Created().json(serde_json::json!({
@@ -187,6 +181,7 @@ pub async fn list_routes(
     }
 
     let routes: Vec<serde_json::Value> = state
+        .base
         .dynamic_routes
         .iter()
         .map(|entry| {
@@ -213,7 +208,7 @@ pub async fn delete_route(
     }
 
     let route_path = format!("/{}", path.into_inner());
-    if state.dynamic_routes.remove(&route_path).is_some() {
+    if state.base.dynamic_routes.remove(&route_path).is_some() {
         HttpResponse::Ok().json(serde_json::json!({ "status": "deleted" }))
     } else {
         HttpResponse::NotFound().json(serde_json::json!({ "error": "route not found" }))
@@ -235,7 +230,7 @@ pub async fn add_ssl_cert(
 
     let entry = body.into_inner();
     let name = entry.server_name.clone();
-    state.dynamic_certs.insert(name.clone(), entry);
+    state.base.dynamic_certs.insert(name.clone(), entry);
     info!("SSL certificate added for {}", name);
 
     HttpResponse::Created().json(serde_json::json!({
@@ -255,6 +250,7 @@ pub async fn list_ssl_certs(
     }
 
     let certs: Vec<serde_json::Value> = state
+        .base
         .dynamic_certs
         .iter()
         .map(|entry| {
@@ -280,7 +276,7 @@ pub async fn delete_ssl_cert(
     }
 
     let name = path.into_inner();
-    if state.dynamic_certs.remove(&name).is_some() {
+    if state.base.dynamic_certs.remove(&name).is_some() {
         HttpResponse::Ok().json(serde_json::json!({ "status": "deleted" }))
     } else {
         HttpResponse::NotFound().json(serde_json::json!({ "error": "cert not found" }))
@@ -358,12 +354,24 @@ pub async fn ml_upload(
     body: web::Bytes,
     _req: actix_web::HttpRequest,
 ) -> impl Responder {
-    let _ = std::fs::create_dir_all("models");
-    let model_path = "models/fraud_model.onnx";
-    
-    if let Err(e) = std::fs::write(model_path, body) {
-        return HttpResponse::InternalServerError().json(serde_json::json!({ "error": format!("Failed to write model: {}", e) }));
+    let body_bytes = body.to_vec();
+    let write_result = tokio::task::spawn_blocking(move || {
+        let _ = std::fs::create_dir_all("models");
+        std::fs::write("models/fraud_model.onnx", &body_bytes)
+    })
+    .await;
+
+    match write_result {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => {
+            return HttpResponse::InternalServerError().json(serde_json::json!({ "error": format!("Failed to write model: {}", e) }));
+        }
+        Err(_) => {
+            return HttpResponse::InternalServerError().json(serde_json::json!({ "error": "spawn_blocking failed for model write" }));
+        }
     }
+
+    let model_path = "models/fraud_model.onnx";
 
     state.waf.ml_engine.load_model(
         model_path,

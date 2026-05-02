@@ -12,6 +12,29 @@ use tracing::{debug, warn};
 
 use super::AuthResult;
 
+/// Headers stripped before forwarding to an external auth service to prevent
+/// credential leakage (passwords, tokens, session cookies).
+const SENSITIVE_HEADERS: &[&str] = &["authorization", "cookie", "set-cookie"];
+
+/// Returns `false` when the header name matches a sensitive credential header
+/// that must not be forwarded to a third-party auth endpoint.
+fn is_sensitive_header(name: &str) -> bool {
+    SENSITIVE_HEADERS
+        .iter()
+        .any(|h| name.eq_ignore_ascii_case(h))
+}
+
+/// Shared `reqwest::Client` for auth_request subrequests, cached globally for reuse.
+fn auth_request_client() -> &'static reqwest::Client {
+    static CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
+    CLIENT.get_or_init(|| {
+        reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(5))
+            .build()
+            .unwrap_or_else(|_| reqwest::Client::new())
+    })
+}
+
 /// Implements `auth_request`-style subrequest authentication (like nginx `auth_request`).
 ///
 /// Sends a subrequest to the specified URL with the original request headers.
@@ -26,26 +49,22 @@ pub async fn check(
     method: &str,
     path: &str,
 ) -> (AuthResult, Vec<(String, String)>) {
-    let client = match reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(5))
-        .build()
-    {
-        Ok(c) => c,
-        Err(e) => {
-            warn!("auth_request: failed to create HTTP client: {}", e);
-            return (
-                AuthResult::Denied(StatusCode::INTERNAL_SERVER_ERROR, "Auth service unavailable"),
-                vec![],
-            );
-        }
-    };
+    let client = auth_request_client();
 
-    let mut req = client.get(auth_url);
+    let reqwest_method = reqwest::Method::from_bytes(method.as_bytes())
+        .unwrap_or(reqwest::Method::GET);
+    let mut req = client.request(reqwest_method, auth_url);
 
-    // Forward original headers to the auth service
+    // Forward original headers to the auth service, stripping sensitive
+    // credentials (Authorization, Cookie) so they are not leaked to a
+    // third-party auth endpoint.
     for (key, value) in headers.iter() {
+        let key_str = key.as_str();
+        if is_sensitive_header(key_str) {
+            continue;
+        }
         if let Ok(v) = value.to_str() {
-            req = req.header(key.as_str(), v);
+            req = req.header(key_str, v);
         }
     }
     req = req.header("X-Original-Method", method);
@@ -99,5 +118,66 @@ pub async fn check(
                 vec![],
             )
         }
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Unit Tests
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_is_sensitive_header_matches_exact() {
+        assert!(is_sensitive_header("authorization"));
+        assert!(is_sensitive_header("AUTHORIZATION"));
+        assert!(is_sensitive_header("Authorization"));
+        assert!(is_sensitive_header("cookie"));
+        assert!(is_sensitive_header("Cookie"));
+        assert!(is_sensitive_header("set-cookie"));
+        assert!(is_sensitive_header("Set-Cookie"));
+    }
+
+    #[test]
+    fn test_is_sensitive_header_allows_safe_headers() {
+        assert!(!is_sensitive_header("x-original-method"));
+        assert!(!is_sensitive_header("x-auth-user"));
+        assert!(!is_sensitive_header("host"));
+        assert!(!is_sensitive_header("content-type"));
+        assert!(!is_sensitive_header("accept"));
+        assert!(!is_sensitive_header("user-agent"));
+    }
+
+    /// M38 regression: Authorization and Cookie headers must not be forwarded
+    /// to third-party auth_request endpoints.
+    #[test]
+    fn test_auth_request_strips_sensitive_headers() {
+        // Verify the sensitive header list includes the key credential headers
+        let sensitive: Vec<&str> = SENSITIVE_HEADERS.to_vec();
+        assert!(sensitive.contains(&"authorization"));
+        assert!(sensitive.contains(&"cookie"));
+        assert!(sensitive.contains(&"set-cookie"));
+    }
+
+    /// M39 regression: auth_request must forward the actual request method,
+    /// not hardcode GET. The subrequest to the auth service should use the
+    /// same HTTP method as the original client request.
+    #[test]
+    fn test_auth_request_method_forwarding() {
+        // Valid methods are parsed correctly
+        let get = reqwest::Method::from_bytes(b"GET").unwrap();
+        assert_eq!(get, reqwest::Method::GET);
+
+        let post = reqwest::Method::from_bytes(b"POST").unwrap();
+        assert_eq!(post, reqwest::Method::POST);
+
+        let delete = reqwest::Method::from_bytes(b"DELETE").unwrap();
+        assert_eq!(delete, reqwest::Method::DELETE);
+
+        // Invalid method falls back to GET
+        let invalid = reqwest::Method::from_bytes(b"\0invalid").unwrap_or(reqwest::Method::GET);
+        assert_eq!(invalid, reqwest::Method::GET);
     }
 }

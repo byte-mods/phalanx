@@ -28,7 +28,8 @@ pub enum ConfigParsePolicy {
 
 impl ConfigParsePolicy {
     /// Reads `PHALANX_CONFIG_POLICY` from the environment.
-    /// Returns `Strict` if the variable is set to "strict", otherwise defaults to `Lenient`.
+    /// Returns `Strict` by default — invalid configs fail fast.
+    /// Set `PHALANX_CONFIG_POLICY=lenient` to fall back to defaults on parse errors.
     pub fn from_env() -> Self {
         match std::env::var("PHALANX_CONFIG_POLICY")
             .ok()
@@ -36,8 +37,8 @@ impl ConfigParsePolicy {
             .map(|v| v.to_ascii_lowercase())
             .as_deref()
         {
-            Some("strict") => Self::Strict,
-            _ => Self::Lenient,
+            Some("lenient") => Self::Lenient,
+            _ => Self::Strict,
         }
     }
 }
@@ -318,6 +319,10 @@ fn default_cors_max_age() -> u64 {
     86400
 }
 
+fn default_room_idle_timeout() -> u64 {
+    300
+}
+
 /// The global application configuration state.
 ///
 /// This is the single source of truth for all Phalanx runtime settings. It is
@@ -412,6 +417,14 @@ pub struct AppConfig {
     /// protocol implementation lives in the W1 task in `plan.md`.
     #[serde(default)]
     pub webtransport_enabled: bool,
+    /// ICE server URLs for WebRTC NAT traversal.
+    /// Each entry is a URL like `stun:host:port` or `turn:host:port?transport=udp`.
+    #[serde(default)]
+    pub ice_servers: Vec<String>,
+    /// Seconds before an idle (zero-peer) WebRTC room is garbage-collected.
+    /// Default: 300 (5 minutes). Set to 0 to disable housekeeping cleanup.
+    #[serde(default = "default_room_idle_timeout")]
+    pub room_idle_timeout_secs: u64,
     /// auth_request subrequest URL (per-route override is also possible).
     pub auth_request_url: Option<String>,
     /// Mirror/shadow upstream pool name for traffic tee.
@@ -670,6 +683,8 @@ impl Default for AppConfig {
             cache_disk_path: None,
             brotli_enabled: false,
             webtransport_enabled: false,
+            ice_servers: Vec::new(),
+            room_idle_timeout_secs: 300,
             auth_request_url: None,
             mirror_pool: None,
             proxy_proto_v2: false,
@@ -831,6 +846,10 @@ pub fn try_load_config(
                 if let Some(v) = server.directives.get("webtransport") {
                     app_cfg.webtransport_enabled = v == "on" || v == "true";
                 }
+                // ICE servers accumulate from parser (not from directives map).
+                app_cfg
+                    .ice_servers
+                    .extend(server.ice_servers.iter().cloned());
                 if let Some(v) = server.directives.get("auth_request") {
                     app_cfg.auth_request_url = Some(v.clone());
                 }
@@ -861,6 +880,8 @@ pub fn try_load_config(
                 if let Some(v) = server.directives.get("waf_auto_ban_duration") {
                     if let Ok(val) = v.parse::<u64>() {
                         app_cfg.waf_auto_ban_duration = Some(val);
+                    } else {
+                        tracing::warn!("Invalid value '{}' for waf_auto_ban_duration: expected a number, ignoring", v);
                     }
                 }
 
@@ -871,21 +892,29 @@ pub fn try_load_config(
                 if let Some(v) = server.directives.get("ai_epsilon") {
                     if let Ok(val) = v.parse::<f64>() {
                         app_cfg.ai_epsilon = Some(val);
+                    } else {
+                        tracing::warn!("Invalid value '{}' for ai_epsilon: expected a number, ignoring", v);
                     }
                 }
                 if let Some(v) = server.directives.get("ai_temperature") {
                     if let Ok(val) = v.parse::<f64>() {
                         app_cfg.ai_temperature = Some(val);
+                    } else {
+                        tracing::warn!("Invalid value '{}' for ai_temperature: expected a number, ignoring", v);
                     }
                 }
                 if let Some(v) = server.directives.get("ai_ucb_constant") {
                     if let Ok(val) = v.parse::<f64>() {
                         app_cfg.ai_ucb_constant = Some(val);
+                    } else {
+                        tracing::warn!("Invalid value '{}' for ai_ucb_constant: expected a number, ignoring", v);
                     }
                 }
                 if let Some(v) = server.directives.get("ai_thompson_threshold_ms") {
                     if let Ok(val) = v.parse::<f64>() {
                         app_cfg.ai_thompson_threshold_ms = Some(val);
+                    } else {
+                        tracing::warn!("Invalid value '{}' for ai_thompson_threshold_ms: expected a number, ignoring", v);
                     }
                 }
 
@@ -929,6 +958,8 @@ pub fn try_load_config(
                 if let Some(v) = server.directives.get("gossip_interval_ms") {
                     if let Ok(val) = v.parse::<u64>() {
                         app_cfg.gossip_interval_ms = Some(val);
+                    } else {
+                        tracing::warn!("Invalid value '{}' for gossip_interval_ms: expected a number, ignoring", v);
                     }
                 }
                 if let Some(v) = server.directives.get("ml_fraud_model_path") {
@@ -964,6 +995,8 @@ pub fn try_load_config(
                 if let Some(v) = server.directives.get("captcha_challenge_threshold") {
                     if let Ok(val) = v.parse::<f64>() {
                         app_cfg.captcha_challenge_threshold = Some(val);
+                    } else {
+                        tracing::warn!("Invalid value '{}' for captcha_challenge_threshold: expected a number, ignoring", v);
                     }
                 }
                 if let Some(v) = server.directives.get("wasm_plugin_config") {
@@ -981,6 +1014,8 @@ pub fn try_load_config(
                 if let Some(v) = server.directives.get("gslb_max_latency_ms") {
                     if let Ok(val) = v.parse::<f64>() {
                         app_cfg.gslb_max_latency_ms = Some(val);
+                    } else {
+                        tracing::warn!("Invalid value '{}' for gslb_max_latency_ms: expected a number, ignoring", v);
                     }
                 }
 
@@ -988,11 +1023,15 @@ pub fn try_load_config(
                 if let Some(v) = server.directives.get("proxy_connect_timeout") {
                     if let Ok(val) = v.parse::<u64>() {
                         app_cfg.proxy_connect_timeout_secs = val;
+                    } else {
+                        tracing::warn!("Invalid value '{}' for proxy_connect_timeout: expected a number, ignoring", v);
                     }
                 }
                 if let Some(v) = server.directives.get("proxy_read_timeout") {
                     if let Ok(val) = v.parse::<u64>() {
                         app_cfg.proxy_read_timeout_secs = val;
+                    } else {
+                        tracing::warn!("Invalid value '{}' for proxy_read_timeout: expected a number, ignoring", v);
                     }
                 }
 
@@ -1003,18 +1042,25 @@ pub fn try_load_config(
                 if let Some(v) = server.directives.get("proxy_next_upstream_timeout") {
                     if let Ok(val) = v.parse::<u64>() {
                         app_cfg.proxy_next_upstream_timeout_secs = val;
+                    } else {
+                        tracing::warn!("Invalid value '{}' for proxy_next_upstream_timeout: expected a number, ignoring", v);
                     }
                 }
 
                 // Request body size limit (global default)
                 if let Some(v) = server.directives.get("client_max_body_size") {
-                    app_cfg.client_max_body_size = parse_size_value(v);
+                    match parse_size_value(v) {
+                        Ok(sz) => app_cfg.client_max_body_size = sz,
+                        Err(e) => tracing::warn!("Bad client_max_body_size '{}': {}", v, e),
+                    }
                 }
 
                 // Graceful shutdown timeout
                 if let Some(v) = server.directives.get("shutdown_timeout") {
                     if let Ok(val) = v.parse::<u64>() {
                         app_cfg.shutdown_timeout_secs = val;
+                    } else {
+                        tracing::warn!("Invalid value '{}' for shutdown_timeout: expected a number, ignoring", v);
                     }
                 }
 
@@ -1022,6 +1068,8 @@ pub fn try_load_config(
                 if let Some(v) = server.directives.get("websocket_idle_timeout") {
                     if let Ok(val) = v.parse::<u64>() {
                         app_cfg.websocket_idle_timeout_secs = val;
+                    } else {
+                        tracing::warn!("Invalid value '{}' for websocket_idle_timeout: expected a number, ignoring", v);
                     }
                 }
 
@@ -1029,6 +1077,15 @@ pub fn try_load_config(
                 if let Some(v) = server.directives.get("udp_session_timeout") {
                     if let Ok(val) = v.parse::<u64>() {
                         app_cfg.udp_session_timeout_secs = val;
+                    } else {
+                        tracing::warn!("Invalid value '{}' for udp_session_timeout: expected a number, ignoring", v);
+                    }
+                }
+                if let Some(v) = server.directives.get("room_idle_timeout") {
+                    if let Ok(val) = v.parse::<u64>() {
+                        app_cfg.room_idle_timeout_secs = val;
+                    } else {
+                        tracing::warn!("Invalid value '{}' for room_idle_timeout: expected a number, ignoring", v);
                     }
                 }
 
@@ -1065,6 +1122,8 @@ pub fn try_load_config(
                 if let Some(v) = server.directives.get("hsts_max_age") {
                     if let Ok(val) = v.parse::<u64>() {
                         app_cfg.hsts_max_age = Some(val);
+                    } else {
+                        tracing::warn!("Invalid value '{}' for hsts_max_age: expected a number, ignoring", v);
                     }
                 }
 
@@ -1072,6 +1131,8 @@ pub fn try_load_config(
                 if let Some(v) = server.directives.get("rate_limit_retry_after") {
                     if let Ok(val) = v.parse::<u64>() {
                         app_cfg.rate_limit_retry_after = Some(val);
+                    } else {
+                        tracing::warn!("Invalid value '{}' for rate_limit_retry_after: expected a number, ignoring", v);
                     }
                 }
 
@@ -1214,15 +1275,22 @@ pub fn load_config(conf_path: &str) -> AppConfig {
 
 /// Helper to extract a u32 directive from the server block's directives map.
 fn route_or_directive_u32(directives: &HashMap<String, String>, key: &str) -> Option<u32> {
-    directives.get(key).and_then(|v| v.parse::<u32>().ok())
+    let v = directives.get(key)?;
+    match v.parse::<u32>() {
+        Ok(val) => Some(val),
+        Err(_) => {
+            tracing::warn!("Invalid value '{}' for {}: expected an unsigned integer, ignoring", v, key);
+            None
+        }
+    }
 }
 
 /// Parses a size value with optional K/M/G suffix into bytes.
 /// Examples: "1024" -> 1024, "10K" -> 10240, "1M" -> 1048576, "2G" -> 2147483648
-fn parse_size_value(s: &str) -> usize {
+fn parse_size_value(s: &str) -> Result<usize, String> {
     let s = s.trim();
     if s.is_empty() {
-        return 0;
+        return Ok(0);
     }
     let (num_str, multiplier) = if let Some(n) = s.strip_suffix('G').or_else(|| s.strip_suffix('g')) {
         (n, 1024 * 1024 * 1024)
@@ -1233,7 +1301,11 @@ fn parse_size_value(s: &str) -> usize {
     } else {
         (s, 1)
     };
-    num_str.trim().parse::<usize>().unwrap_or(0) * multiplier
+    let n = num_str
+        .trim()
+        .parse::<usize>()
+        .map_err(|_| format!("Invalid size value '{}': expected a positive integer", s))?;
+    Ok(n * multiplier)
 }
 
 #[cfg(test)]
@@ -1472,25 +1544,27 @@ mod tests {
 
     #[test]
     fn test_parse_size_value_bytes() {
-        assert_eq!(parse_size_value("1024"), 1024);
-        assert_eq!(parse_size_value("0"), 0);
-        assert_eq!(parse_size_value(""), 0);
+        assert_eq!(parse_size_value("1024").unwrap(), 1024);
+        assert_eq!(parse_size_value("0").unwrap(), 0);
+        assert_eq!(parse_size_value("").unwrap(), 0);
     }
 
     #[test]
     fn test_parse_size_value_suffixes() {
-        assert_eq!(parse_size_value("10K"), 10 * 1024);
-        assert_eq!(parse_size_value("10k"), 10 * 1024);
-        assert_eq!(parse_size_value("1M"), 1024 * 1024);
-        assert_eq!(parse_size_value("1m"), 1024 * 1024);
-        assert_eq!(parse_size_value("2G"), 2 * 1024 * 1024 * 1024);
-        assert_eq!(parse_size_value("2g"), 2 * 1024 * 1024 * 1024);
+        assert_eq!(parse_size_value("10K").unwrap(), 10 * 1024);
+        assert_eq!(parse_size_value("10k").unwrap(), 10 * 1024);
+        assert_eq!(parse_size_value("1M").unwrap(), 1024 * 1024);
+        assert_eq!(parse_size_value("1m").unwrap(), 1024 * 1024);
+        assert_eq!(parse_size_value("2G").unwrap(), 2 * 1024 * 1024 * 1024);
+        assert_eq!(parse_size_value("2g").unwrap(), 2 * 1024 * 1024 * 1024);
     }
 
     #[test]
     fn test_parse_size_value_invalid() {
-        assert_eq!(parse_size_value("abc"), 0);
-        assert_eq!(parse_size_value("M"), 0);
+        assert!(parse_size_value("abc").is_err());
+        assert!(parse_size_value("M").is_err());
+        assert!(parse_size_value("10X").is_err());
+        assert!(parse_size_value("1OOM").is_err());
     }
 
     #[test]

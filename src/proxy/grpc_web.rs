@@ -36,10 +36,22 @@ pub fn is_grpc_web<T>(req: &Request<T>) -> bool {
 /// - Strips the `grpc-web` content type prefix → `application/grpc`
 /// - If the original was `grpc-web-text` (base64), decodes the body
 /// - Adds required HTTP/2 TE header
+///
+/// Callers pass the already-split `parts` and `body_bytes` to avoid
+/// the `Full<Bytes>` extract/re-wrap dance.
 pub fn translate_request(
-    req: Request<Full<Bytes>>,
-) -> Request<Full<Bytes>> {
-    let (mut parts, body) = req.into_parts();
+    parts: hyper::http::request::Parts,
+    body_bytes: Bytes,
+) -> (hyper::http::request::Parts, Bytes) {
+    let mut parts = parts;
+
+    // Detect grpc-web-text before rewriting content-type
+    let is_text = parts
+        .headers
+        .get(hyper::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .map(|ct| ct.starts_with("application/grpc-web-text"))
+        .unwrap_or(false);
 
     // Rewrite content-type from grpc-web → grpc
     if let Some(ct) = parts.headers.get(hyper::header::CONTENT_TYPE) {
@@ -59,7 +71,30 @@ pub fn translate_request(
         .headers
         .insert(hyper::header::TE, "trailers".parse().unwrap());
 
-    Request::from_parts(parts, body)
+    // Base64-decode the body for grpc-web-text requests
+    let decoded_body = if is_text {
+        match base64_decode(&body_bytes) {
+            Ok(decoded) => Bytes::from(decoded),
+            Err(_) => {
+                tracing::warn!("gRPC-Web text mode: base64 decode failed, forwarding raw body");
+                body_bytes
+            }
+        }
+    } else {
+        body_bytes
+    };
+
+    (parts, decoded_body)
+}
+
+/// Base64-decode a byte slice, returning the decoded bytes or an error.
+fn base64_decode(input: &[u8]) -> Result<Vec<u8>, ()> {
+    use base64::Engine;
+    // Strip whitespace that browsers may include
+    let trimmed: Vec<u8> = input.iter().copied().filter(|b| !b.is_ascii_whitespace()).collect();
+    base64::engine::general_purpose::STANDARD
+        .decode(&trimmed)
+        .map_err(|_| ())
 }
 
 /// Translates a standard gRPC response back to gRPC-Web format.
@@ -226,15 +261,18 @@ mod tests {
 
     #[test]
     fn test_translate_request_rewrites_content_type() {
-        let req = Request::builder()
+        let parts = Request::builder()
             .method("POST")
             .uri("http://example.com/rpc")
             .header(header::CONTENT_TYPE, "application/grpc-web")
-            .body(Full::new(Bytes::from_static(b"payload")))
-            .unwrap();
-        let out = translate_request(req);
+            .body(())
+            .unwrap()
+            .into_parts()
+            .0;
+        let (parts, _body) = translate_request(parts, Bytes::from_static(b"payload"));
         assert_eq!(
-            out.headers()
+            parts
+                .headers
                 .get(header::CONTENT_TYPE)
                 .and_then(|v| v.to_str().ok()),
             Some("application/grpc")
@@ -243,15 +281,17 @@ mod tests {
 
     #[test]
     fn test_translate_request_sets_te_trailers() {
-        let req = Request::builder()
+        let parts = Request::builder()
             .method("POST")
             .uri("http://example.com/rpc")
             .header(header::CONTENT_TYPE, "application/grpc-web+proto")
-            .body(Full::new(Bytes::new()))
-            .unwrap();
-        let out = translate_request(req);
+            .body(())
+            .unwrap()
+            .into_parts()
+            .0;
+        let (parts, _body) = translate_request(parts, Bytes::new());
         assert_eq!(
-            out.headers().get(header::TE).and_then(|v| v.to_str().ok()),
+            parts.headers.get(header::TE).and_then(|v| v.to_str().ok()),
             Some("trailers")
         );
     }

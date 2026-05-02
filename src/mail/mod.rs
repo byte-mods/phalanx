@@ -1,8 +1,9 @@
 use std::net::SocketAddr;
+use std::pin::Pin;
 use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
-use tokio_rustls::TlsAcceptor;
+use tokio_rustls::{TlsAcceptor, TlsConnector};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info};
 
@@ -67,6 +68,17 @@ pub struct MailProxyConfig {
 fn build_starttls_acceptor(cert_path: &str, key_path: &str) -> Option<TlsAcceptor> {
     let server_config = crate::proxy::tls::build_server_config(cert_path, key_path, None)?;
     Some(TlsAcceptor::from(server_config))
+}
+
+/// Builds a TLS connector for backend connections with webpki root certificates.
+fn build_backend_tls_connector() -> TlsConnector {
+    let root_store = rustls::RootCertStore {
+        roots: webpki_roots::TLS_SERVER_ROOTS.to_vec(),
+    };
+    let config = rustls::ClientConfig::builder()
+        .with_root_certificates(root_store)
+        .with_no_client_auth();
+    TlsConnector::from(Arc::new(config))
 }
 
 /// Detects a STARTTLS command in a protocol line.
@@ -317,8 +329,43 @@ pub async fn start_mail_proxy(
                 }
             };
 
-            // Connect to backend
-            let mut server = match TcpStream::connect(&backend.config.address).await {
+            // Connect to backend, optionally upgrading to TLS
+            enum BackendStream {
+                Plain(TcpStream),
+                Tls(tokio_rustls::client::TlsStream<TcpStream>),
+            }
+
+            impl tokio::io::AsyncRead for BackendStream {
+                fn poll_read(self: Pin<&mut Self>, cx: &mut std::task::Context<'_>, buf: &mut tokio::io::ReadBuf<'_>) -> std::task::Poll<std::io::Result<()>> {
+                    match self.get_mut() {
+                        BackendStream::Plain(s) => Pin::new(s).poll_read(cx, buf),
+                        BackendStream::Tls(s) => Pin::new(s).poll_read(cx, buf),
+                    }
+                }
+            }
+
+            impl tokio::io::AsyncWrite for BackendStream {
+                fn poll_write(self: Pin<&mut Self>, cx: &mut std::task::Context<'_>, buf: &[u8]) -> std::task::Poll<std::io::Result<usize>> {
+                    match self.get_mut() {
+                        BackendStream::Plain(s) => Pin::new(s).poll_write(cx, buf),
+                        BackendStream::Tls(s) => Pin::new(s).poll_write(cx, buf),
+                    }
+                }
+                fn poll_flush(self: Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> std::task::Poll<std::io::Result<()>> {
+                    match self.get_mut() {
+                        BackendStream::Plain(s) => Pin::new(s).poll_flush(cx),
+                        BackendStream::Tls(s) => Pin::new(s).poll_flush(cx),
+                    }
+                }
+                fn poll_shutdown(self: Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> std::task::Poll<std::io::Result<()>> {
+                    match self.get_mut() {
+                        BackendStream::Plain(s) => Pin::new(s).poll_shutdown(cx),
+                        BackendStream::Tls(s) => Pin::new(s).poll_shutdown(cx),
+                    }
+                }
+            }
+
+            let tcp = match TcpStream::connect(&backend.config.address).await {
                 Ok(s) => s,
                 Err(e) => {
                     error!(
@@ -329,15 +376,52 @@ pub async fn start_mail_proxy(
                 }
             };
 
-            // Warn if backend TLS certificate verification is disabled
-            if cfg.starttls && !verify_backend_tls {
-                tracing::warn!(
-                    "{} proxy: backend TLS certificate verification is disabled for {}. \
-                     Set 'mail_verify_backend_tls true;' to enable.",
-                    cfg.protocol.name(),
-                    backend.config.address
-                );
-            }
+            let mut server = if verify_backend_tls {
+                let hostname = backend.config.address.split(':').next().unwrap_or(&backend.config.address);
+                let connector = build_backend_tls_connector();
+                match rustls::pki_types::ServerName::try_from(hostname.to_string()) {
+                    Ok(name) => {
+                        match connector.connect(name, tcp).await {
+                            Ok(tls_stream) => {
+                                info!(
+                                    "{} proxy: backend TLS verified for {}",
+                                    cfg.protocol.name(),
+                                    backend.config.address
+                                );
+                                BackendStream::Tls(tls_stream)
+                            }
+                            Err(e) => {
+                                error!(
+                                    "{} proxy: backend TLS handshake failed for {}: {}",
+                                    cfg.protocol.name(),
+                                    backend.config.address,
+                                    e
+                                );
+                                return;
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        error!(
+                            "{} proxy: invalid backend hostname '{}': {}",
+                            cfg.protocol.name(),
+                            hostname,
+                            e
+                        );
+                        return;
+                    }
+                }
+            } else {
+                if cfg.starttls {
+                    tracing::warn!(
+                        "{} proxy: backend TLS certificate verification is disabled for {}. \
+                         Set 'mail_verify_backend_tls true;' to enable.",
+                        cfg.protocol.name(),
+                        backend.config.address
+                    );
+                }
+                BackendStream::Plain(tcp)
+            };
 
             // STARTTLS path: negotiate TLS upgrade before proxying
             if let Some(ref acceptor) = tls_acceptor {

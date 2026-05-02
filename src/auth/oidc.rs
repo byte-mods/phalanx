@@ -144,13 +144,26 @@ pub fn spawn_session_cleanup(
     });
 }
 
+/// Cached reqwest::Client with a 30 s timeout for all OIDC HTTP calls.
+fn oidc_client() -> &'static reqwest::Client {
+    static CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
+    CLIENT.get_or_init(|| {
+        reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(30))
+            .build()
+            .unwrap_or_else(|_| reqwest::Client::new())
+    })
+}
+
 /// Fetches the OIDC discovery document from the issuer.
 pub async fn discover(issuer_url: &str) -> Result<OidcDiscovery, String> {
     let url = format!(
         "{}/.well-known/openid-configuration",
         issuer_url.trim_end_matches('/')
     );
-    let resp = reqwest::get(&url)
+    let resp = oidc_client()
+        .get(&url)
+        .send()
         .await
         .map_err(|e| format!("OIDC discovery failed: {}", e))?;
     resp.json::<OidcDiscovery>()
@@ -159,11 +172,25 @@ pub async fn discover(issuer_url: &str) -> Result<OidcDiscovery, String> {
 }
 
 /// Thread-safe store for PKCE code verifiers, keyed by OAuth state parameter.
-pub type PkceVerifierStore = Arc<DashMap<String, String>>;
+/// Each entry includes a creation timestamp so abandoned verifiers can be evicted.
+pub type PkceVerifierStore = Arc<DashMap<String, (String, std::time::Instant)>>;
 
 /// Creates a new empty PKCE verifier store.
 pub fn new_pkce_verifier_store() -> PkceVerifierStore {
     Arc::new(DashMap::new())
+}
+
+/// Removes PKCE verifiers older than `ttl` seconds.
+///
+/// Returns the number of entries evicted. Call this periodically (e.g. every
+/// 5 minutes) to prevent unbounded growth from abandoned login flows.
+pub fn sweep_expired_pkce_verifiers(store: &PkceVerifierStore, ttl_secs: u64) -> usize {
+    let cutoff = std::time::Instant::now()
+        .checked_sub(std::time::Duration::from_secs(ttl_secs))
+        .unwrap_or(std::time::Instant::now());
+    let before = store.len();
+    store.retain(|_, (_, created_at)| *created_at > cutoff);
+    before.saturating_sub(store.len())
 }
 
 /// Generates a cryptographically random PKCE code_verifier (43-128 chars, RFC 7636).
@@ -216,7 +243,7 @@ pub fn authorization_url_with_pkce(
     if let Some(store) = pkce_store {
         let verifier = generate_code_verifier();
         let challenge = compute_code_challenge(&verifier);
-        store.insert(state.to_string(), verifier);
+        store.insert(state.to_string(), (verifier, std::time::Instant::now()));
         url.push_str(&format!(
             "&code_challenge={}&code_challenge_method=S256",
             urlencoded(&challenge),
@@ -244,8 +271,6 @@ pub async fn exchange_code_with_pkce(
     code: &str,
     code_verifier: Option<&str>,
 ) -> Result<OidcSession, String> {
-    let client = reqwest::Client::new();
-
     let mut params: Vec<(&str, &str)> = vec![
         ("grant_type", "authorization_code"),
         ("code", code),
@@ -257,7 +282,7 @@ pub async fn exchange_code_with_pkce(
         params.push(("code_verifier", verifier));
     }
 
-    let resp = client
+    let resp = oidc_client()
         .post(&discovery.token_endpoint)
         .form(&params)
         .send()
@@ -275,7 +300,7 @@ pub async fn exchange_code_with_pkce(
 
     // Decode ID token claims (without full validation for simplicity)
     let sub = if let Some(ref id_token) = token_resp.id_token {
-        extract_sub_from_id_token(id_token).unwrap_or_else(|| "unknown".to_string())
+        extract_sub_from_id_token(id_token, None, None).await.unwrap_or_else(|| "unknown".to_string())
     } else {
         "unknown".to_string()
     };
@@ -346,8 +371,6 @@ pub async fn refresh_session(
     discovery: &OidcDiscovery,
     refresh_token: &str,
 ) -> Result<OidcSession, String> {
-    let client = reqwest::Client::new();
-
     let params = [
         ("grant_type", "refresh_token"),
         ("refresh_token", refresh_token),
@@ -355,7 +378,7 @@ pub async fn refresh_session(
         ("client_secret", &config.client_secret),
     ];
 
-    let resp = client
+    let resp = oidc_client()
         .post(&discovery.token_endpoint)
         .form(&params)
         .send()
@@ -372,7 +395,7 @@ pub async fn refresh_session(
         .map_err(|e| format!("Token parse error: {}", e))?;
 
     let sub = if let Some(ref id_token) = token_resp.id_token {
-        extract_sub_from_id_token(id_token).unwrap_or_else(|| "unknown".to_string())
+        extract_sub_from_id_token(id_token, None, None).await.unwrap_or_else(|| "unknown".to_string())
     } else {
         "unknown".to_string()
     };
@@ -497,12 +520,33 @@ fn extract_cookie(headers: &HeaderMap, name: &str) -> Option<String> {
         })
 }
 
-/// Extracts the `sub` claim from a JWT ID token without full cryptographic validation.
+/// Extracts the `sub` claim from a JWT ID token, optionally verifying the
+/// signature against JWKS keys.
 ///
-/// Splits the token on `.`, base64url-decodes the payload (part 2), and reads
-/// the `sub` field. This is safe because the token has already been received
-/// over a trusted TLS channel from the token endpoint.
-fn extract_sub_from_id_token(id_token: &str) -> Option<String> {
+/// When `jwks_manager` and `jwks_uri` are both provided, the token's header is
+/// decoded to find the `kid`, the matching key is resolved from the JWKS
+/// endpoint, and the signature is cryptographically verified before extracting
+/// any claims. When JWKS is not available (e.g. before the OIDC callback
+/// endpoint is fully wired), the function logs a warning and falls back to
+/// unverified extraction — callers should upgrade to passing JWKS.
+async fn extract_sub_from_id_token(
+    id_token: &str,
+    jwks_manager: Option<&super::jwks::JwksManager>,
+    jwks_uri: Option<&str>,
+) -> Option<String> {
+    if let (Some(manager), Some(uri)) = (jwks_manager, jwks_uri) {
+        return extract_sub_with_jwks_verification(id_token, manager, uri).await;
+    }
+
+    tracing::warn!(
+        "OIDC id_token extracted without signature verification — \
+         wire JwksManager into exchange_code_with_pkce"
+    );
+    extract_sub_unverified(id_token)
+}
+
+/// Decode the payload without signature verification (legacy fallback).
+fn extract_sub_unverified(id_token: &str) -> Option<String> {
     let parts: Vec<&str> = id_token.split('.').collect();
     if parts.len() < 2 {
         return None;
@@ -513,6 +557,34 @@ fn extract_sub_from_id_token(id_token: &str) -> Option<String> {
         .ok()?;
     let claims: serde_json::Value = serde_json::from_slice(&payload).ok()?;
     claims.get("sub").and_then(|v| v.as_str()).map(String::from)
+}
+
+/// Verify the ID token signature using JWKS keys, then extract `sub`.
+async fn extract_sub_with_jwks_verification(
+    id_token: &str,
+    manager: &super::jwks::JwksManager,
+    jwks_uri: &str,
+) -> Option<String> {
+    use jsonwebtoken::{Validation, decode_header};
+    use super::jwks::JwksManager;
+
+    let header = decode_header(id_token).ok()?;
+    let kid = header.kid.as_deref()?;
+
+    let jwk = manager.find_key(jwks_uri, kid).await?;
+    let (decoding_key, algo) = JwksManager::decoding_key_from_jwk(&jwk).ok()?;
+
+    let mut validation = Validation::new(algo);
+    validation.validate_aud = false;
+    validation.validate_exp = false;
+
+    let token_data =
+        jsonwebtoken::decode::<serde_json::Value>(id_token, &decoding_key, &validation).ok()?;
+    token_data
+        .claims
+        .get("sub")
+        .and_then(|v| v.as_str())
+        .map(String::from)
 }
 
 /// Minimal percent-encoding for URL query parameter values.
@@ -654,22 +726,22 @@ mod tests {
         assert!(matches!(result, AuthResult::Denied(..)));
     }
 
-    #[test]
-    fn test_extract_sub_from_id_token() {
+    #[tokio::test]
+    async fn test_extract_sub_from_id_token_unverified() {
         use base64::Engine;
         let claims = serde_json::json!({"sub": "user-42", "name": "Test"});
         let payload_b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD
             .encode(serde_json::to_vec(&claims).unwrap());
         let token = format!("header.{}.signature", payload_b64);
         assert_eq!(
-            extract_sub_from_id_token(&token),
+            extract_sub_from_id_token(&token, None, None).await,
             Some("user-42".to_string())
         );
     }
 
-    #[test]
-    fn test_extract_sub_from_id_token_malformed() {
-        assert_eq!(extract_sub_from_id_token("no-dots"), None);
+    #[tokio::test]
+    async fn test_extract_sub_from_id_token_malformed() {
+        assert_eq!(extract_sub_from_id_token("no-dots", None, None).await, None);
     }
 
     #[test]
@@ -864,10 +936,35 @@ mod tests {
     fn test_pkce_verifier_store_operations() {
         let store = new_pkce_verifier_store();
         assert!(store.is_empty());
-        store.insert("state-1".to_string(), "verifier-1".to_string());
+        store.insert("state-1".to_string(), ("verifier-1".to_string(), std::time::Instant::now()));
         assert_eq!(store.len(), 1);
-        let v = store.remove("state-1").map(|(_, v)| v);
+        let v = store.remove("state-1").map(|(_, (v, _))| v);
         assert_eq!(v, Some("verifier-1".to_string()));
         assert!(store.is_empty());
+    }
+
+    #[test]
+    fn test_pkce_verifier_sweep_evicts_expired() {
+        let store = new_pkce_verifier_store();
+        // Insert a verifier with a creation time in the distant past
+        let past = std::time::Instant::now()
+            .checked_sub(std::time::Duration::from_secs(3600))
+            .unwrap_or(std::time::Instant::now());
+        store.insert("old-state".to_string(), ("old-verifier".to_string(), past));
+        store.insert("fresh-state".to_string(), ("fresh-verifier".to_string(), std::time::Instant::now()));
+        assert_eq!(store.len(), 2);
+
+        // Sweep with 300s TTL — old entry should be evicted, fresh one kept
+        let removed = sweep_expired_pkce_verifiers(&store, 300);
+        assert_eq!(removed, 1);
+        assert!(!store.contains_key("old-state"));
+        assert!(store.contains_key("fresh-state"));
+    }
+
+    #[test]
+    fn test_pkce_verifier_sweep_empty() {
+        let store = new_pkce_verifier_store();
+        let removed = sweep_expired_pkce_verifiers(&store, 300);
+        assert_eq!(removed, 0);
     }
 }

@@ -4,6 +4,7 @@
 /// - A tiered bot classification (known-good, known-bad, unknown)
 /// - Rate-anomaly scoring for bot-like traffic patterns
 /// - A CAPTCHA challenge interface with provider-specific rendering and verification hooks
+use dashmap::DashMap;
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -25,7 +26,8 @@ pub enum BotClass {
 
 /// Classifies a User-Agent string into a bot tier.
 ///
-/// Returns `None` if the UA is blank (handled separately by the WAF core as block).
+/// An empty or blank UA returns `Human` here; the WAF core handles
+/// missing/empty UAs at the call site with a strike but no automatic block.
 pub fn classify_user_agent(ua: &str) -> BotClass {
     let ua_lower = ua.to_lowercase();
 
@@ -77,9 +79,12 @@ pub fn classify_user_agent(ua: &str) -> BotClass {
 ///
 /// Tracks request timestamps in a sliding window and returns an anomaly
 /// score (requests per second) that the WAF can use to challenge or block.
+///
+/// Uses `DashMap` for lock-free per-IP access on the hot path. A background
+/// sweeper evicts stale IP entries to prevent unbounded memory growth.
 pub struct BotRateTracker {
-    /// IP → ring-buffer of request timestamps
-    windows: Arc<Mutex<HashMap<String, Vec<Instant>>>>,
+    /// IP → ring-buffer of request timestamps (lock-free sharded map)
+    windows: Arc<DashMap<String, Vec<Instant>>>,
     /// Duration of the sliding window
     window: Duration,
 }
@@ -87,21 +92,45 @@ pub struct BotRateTracker {
 impl BotRateTracker {
     /// Creates a new rate tracker with the given sliding window duration.
     ///
+    /// Spawns a background sweeper that evicts IP entries with no recent
+    /// timestamps, preventing unbounded memory growth from abandoned sessions.
+    ///
     /// # Arguments
     /// * `window_secs` - Length of the sliding window in seconds. Requests
     ///   older than this are evicted before computing the rate.
     pub fn new(window_secs: u64) -> Self {
         Self {
-            windows: Arc::new(Mutex::new(HashMap::new())),
+            windows: Arc::new(DashMap::new()),
             window: Duration::from_secs(window_secs),
         }
+    }
+
+    /// Spawns a background sweeper that evicts IPs with no recent timestamps,
+    /// preventing unbounded memory growth from abandoned sessions.
+    ///
+    /// No-ops silently when no Tokio runtime is active (e.g. in unit tests).
+    pub fn spawn_sweeper(&self) {
+        let Ok(handle) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        let windows = Arc::clone(&self.windows);
+        let window = self.window;
+        handle.spawn(async move {
+            let interval = std::time::Duration::from_secs(60);
+            loop {
+                tokio::time::sleep(interval).await;
+                windows.retain(|_ip, timestamps| {
+                    timestamps.retain(|t| t.elapsed() < window);
+                    !timestamps.is_empty()
+                });
+            }
+        });
     }
 
     /// Records a request for `ip` and returns the current request rate (req/s).
     pub fn record_and_rate(&self, ip: &str) -> f64 {
         let now = Instant::now();
-        let mut guard = self.windows.lock().unwrap();
-        let timestamps = guard.entry(ip.to_string()).or_default();
+        let mut timestamps = self.windows.entry(ip.to_string()).or_default();
 
         // Evict old entries outside the window
         timestamps.retain(|t| now.duration_since(*t) < self.window);
@@ -114,7 +143,7 @@ impl BotRateTracker {
 
     /// Clears state for an IP (e.g., after a ban is lifted).
     pub fn clear(&self, ip: &str) {
-        self.windows.lock().unwrap().remove(ip);
+        self.windows.remove(ip);
     }
 }
 
@@ -259,13 +288,15 @@ impl CaptchaManager {
         provider: CaptchaProvider,
         challenge_threshold: f64,
     ) -> Self {
+        let rate_tracker = BotRateTracker::new(60);
+        rate_tracker.spawn_sweeper();
         Self {
             site_key,
             secret_key,
             provider,
             verified_ips: Arc::new(Mutex::new(HashSet::new())),
             challenge_threshold,
-            rate_tracker: BotRateTracker::new(60),
+            rate_tracker,
             pending_challenges: Arc::new(Mutex::new(HashMap::new())),
             challenge_ttl: Duration::from_secs(600),
         }

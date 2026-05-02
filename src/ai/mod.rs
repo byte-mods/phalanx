@@ -27,6 +27,12 @@ pub trait AiRouter: Send + Sync {
 
     /// Selects the best backend from the given healthy list.
     fn predict_best_backend(&self, backends: &[Arc<BackendNode>]) -> Option<Arc<BackendNode>>;
+
+    /// Evicts stale entries for backends no longer in the active set.
+    /// Called periodically from the health-check loop to prevent unbounded memory growth.
+    fn sweep_stale_backends(&self, active_addrs: &[String]) {
+        let _ = active_addrs;
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -60,6 +66,11 @@ impl EpsilonGreedyRouter {
 }
 
 impl AiRouter for EpsilonGreedyRouter {
+    fn sweep_stale_backends(&self, active_addrs: &[String]) {
+        let active: std::collections::HashSet<&str> = active_addrs.iter().map(|s| s.as_str()).collect();
+        self.scores.retain(|addr, _| active.contains(addr.as_str()));
+    }
+
     fn update_score(&self, backend: &str, latency_ms: u64, is_error: bool) {
         // Penalty = raw latency + a large constant for errors to heavily penalize failures
         let mut penalty = latency_ms as f64;
@@ -162,6 +173,11 @@ impl Ucb1Router {
 }
 
 impl AiRouter for Ucb1Router {
+    fn sweep_stale_backends(&self, active_addrs: &[String]) {
+        let active: std::collections::HashSet<&str> = active_addrs.iter().map(|s| s.as_str()).collect();
+        self.stats.retain(|addr, _| active.contains(addr.as_str()));
+    }
+
     fn update_score(&self, backend: &str, latency_ms: u64, is_error: bool) {
         let mut penalty = latency_ms as f64;
         if is_error {
@@ -259,6 +275,11 @@ impl SoftmaxRouter {
 }
 
 impl AiRouter for SoftmaxRouter {
+    fn sweep_stale_backends(&self, active_addrs: &[String]) {
+        let active: std::collections::HashSet<&str> = active_addrs.iter().map(|s| s.as_str()).collect();
+        self.scores.retain(|addr, _| active.contains(addr.as_str()));
+    }
+
     fn update_score(&self, backend: &str, latency_ms: u64, is_error: bool) {
         let mut penalty = latency_ms as f64;
         if is_error {
@@ -386,6 +407,11 @@ impl ThompsonSamplingRouter {
 }
 
 impl AiRouter for ThompsonSamplingRouter {
+    fn sweep_stale_backends(&self, active_addrs: &[String]) {
+        let active: std::collections::HashSet<&str> = active_addrs.iter().map(|s| s.as_str()).collect();
+        self.params.retain(|addr, _| active.contains(addr.as_str()));
+    }
+
     fn update_score(&self, backend: &str, latency_ms: u64, is_error: bool) {
         // Classify the outcome: success if no error AND latency is below threshold
         let is_success = !is_error && (latency_ms as f64) < self.latency_threshold_ms;

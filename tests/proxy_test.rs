@@ -7,6 +7,7 @@
 mod waf_url_decode_tests {
     use ai_load_balancer::waf::WafEngine;
     use ai_load_balancer::waf::reputation::IpReputationManager;
+    use std::collections::HashMap;
     use std::sync::Arc;
 
     fn make_waf() -> WafEngine {
@@ -22,6 +23,7 @@ mod waf_url_decode_tests {
             "10.0.0.1",
             "/api",
             Some("q=UNION%20SELECT%20password%20FROM%20users"),
+            &HashMap::new(),
             Some("Mozilla/5.0"),
         );
         assert!(
@@ -37,6 +39,7 @@ mod waf_url_decode_tests {
             "10.0.0.2",
             "/api",
             Some("q=1;%20DROP%20TABLE%20users"),
+            &HashMap::new(),
             Some("Mozilla/5.0"),
         );
         assert!(
@@ -52,6 +55,7 @@ mod waf_url_decode_tests {
             "10.0.0.3",
             "/api",
             Some("q=%3Cscript%3Ealert(1)%3C/script%3E"),
+            &HashMap::new(),
             Some("Mozilla/5.0"),
         );
         assert!(
@@ -67,6 +71,7 @@ mod waf_url_decode_tests {
             "10.0.0.4",
             "/api",
             Some("file=%2e%2e%2f%2e%2e%2f%2e%2e%2fetc%2fpasswd"),
+            &HashMap::new(),
             Some("Mozilla/5.0"),
         );
         assert!(
@@ -82,6 +87,7 @@ mod waf_url_decode_tests {
             "10.0.0.5",
             "/api",
             Some("ip=127.0.0.1;%20cat%20/etc/hosts"),
+            &HashMap::new(),
             Some("Mozilla/5.0"),
         );
         assert!(
@@ -97,6 +103,7 @@ mod waf_url_decode_tests {
             "10.0.0.6",
             "/api",
             Some("category=electronics&page=2"),
+            &HashMap::new(),
             Some("Mozilla/5.0 Chrome/120"),
         );
         assert!(
@@ -108,7 +115,7 @@ mod waf_url_decode_tests {
     #[test]
     fn test_bot_sqlmap_blocked() {
         let waf = make_waf();
-        let result = waf.inspect("10.0.0.7", "/", None, Some("sqlmap/1.5.8"));
+        let result = waf.inspect("10.0.0.7", "/", None, &HashMap::new(), Some("sqlmap/1.5.8"));
         assert!(
             matches!(result, ai_load_balancer::waf::WafAction::Block(_)),
             "WAF should block sqlmap bot"
@@ -116,12 +123,14 @@ mod waf_url_decode_tests {
     }
 
     #[test]
-    fn test_empty_user_agent_blocked() {
+    fn test_empty_user_agent_allowed_with_strike() {
         let waf = make_waf();
-        let result = waf.inspect("10.0.0.8", "/", None, None);
+        let result = waf.inspect("10.0.0.8", "/", None, &HashMap::new(), None);
+        // Empty UA is no longer an automatic block (health checks, internal services).
+        // It still accumulates a strike for the reputation system.
         assert!(
-            matches!(result, ai_load_balancer::waf::WafAction::Block(_)),
-            "WAF should block empty user agent"
+            matches!(result, ai_load_balancer::waf::WafAction::Allow),
+            "WAF should allow empty user agent (not block)"
         );
     }
 
@@ -132,6 +141,8 @@ mod waf_url_decode_tests {
         let result = waf.inspect_body(
             "10.0.0.9",
             "username=admin%27%20OR%20%271%27=%271&password=test",
+            "/",
+            None,
         );
         assert!(
             matches!(result, ai_load_balancer::waf::WafAction::Block(_)),
@@ -148,7 +159,7 @@ mod waf_url_decode_tests {
         reputation.add_strike("10.0.0.10", 15);
 
         // Should be banned now
-        let result = waf.inspect("10.0.0.10", "/", None, Some("Mozilla/5.0"));
+        let result = waf.inspect("10.0.0.10", "/", None, &HashMap::new(), Some("Mozilla/5.0"));
         assert!(
             matches!(result, ai_load_balancer::waf::WafAction::Block(_)),
             "IP should be banned after exceeding threshold"
@@ -157,7 +168,7 @@ mod waf_url_decode_tests {
         // Wait for ban to expire
         std::thread::sleep(std::time::Duration::from_secs(2));
 
-        let result = waf.inspect("10.0.0.10", "/", None, Some("Mozilla/5.0"));
+        let result = waf.inspect("10.0.0.10", "/", None, &HashMap::new(), Some("Mozilla/5.0"));
         assert!(
             matches!(result, ai_load_balancer::waf::WafAction::Allow),
             "IP ban should have expired"
@@ -413,10 +424,18 @@ mod sticky_session_tests {
             secure: false,
             max_age: 0,
         });
-        assert_eq!(
-            mgr.extract_from_cookie("SRV=abc123; other=val"),
-            Some("abc123".to_string())
-        );
+        // Roundtrip: sign then extract — must produce the original payload
+        let header = mgr.set_cookie_header("10.0.0.1:8080").unwrap();
+        let value = header
+            .split('=')
+            .nth(1)
+            .and_then(|s| s.split(';').next())
+            .unwrap();
+        let extracted = mgr.extract_from_cookie(&format!("SRV={}", value));
+        assert!(extracted.is_some(), "signed cookie should be extractable");
+        // Payload is base64-encoded addr
+        let decoded = base64_decode_addr(&extracted.unwrap());
+        assert_eq!(decoded, Some("10.0.0.1:8080".to_string()));
     }
 
     #[test]
@@ -430,8 +449,10 @@ mod sticky_session_tests {
             max_age: 0,
         });
         let header = mgr.set_cookie_header(addr).unwrap();
-        let encoded = header.split('=').nth(1).and_then(|s| s.split(';').next()).unwrap();
-        let decoded = base64_decode_addr(encoded).unwrap();
+        let full_value = header.split('=').nth(1).and_then(|s| s.split(';').next()).unwrap();
+        // Cookie value is <base64_payload>.<base64_hmac> — extract just the payload
+        let payload = full_value.rsplit_once('.').map(|(p, _)| p).unwrap_or(full_value);
+        let decoded = base64_decode_addr(payload).unwrap();
         assert_eq!(decoded, addr);
     }
 }
@@ -878,6 +899,16 @@ mod grpc_web_integration_tests {
     use http_body_util::{BodyExt, Empty, Full};
     use hyper::{header, Request, Response, StatusCode};
 
+    fn grpc_web_req_parts_body(content_type: &str) -> (hyper::http::request::Parts, Bytes) {
+        let req = Request::builder()
+            .method("POST")
+            .uri("http://example.com/pkg.Service/Method")
+            .header(header::CONTENT_TYPE, content_type)
+            .body(())
+            .unwrap();
+        (req.into_parts().0, Bytes::from_static(b"\x00\x00\x00\x00\x05hello"))
+    }
+
     fn grpc_web_req(content_type: &str) -> Request<Full<Bytes>> {
         Request::builder()
             .method("POST")
@@ -917,31 +948,34 @@ mod grpc_web_integration_tests {
 
     #[test]
     fn test_translate_request_grpc_web_to_grpc() {
-        let out = translate_request(grpc_web_req("application/grpc-web"));
+        let (req_parts, body) = grpc_web_req_parts_body("application/grpc-web");
+        let (parts, _body) = translate_request(req_parts, body);
         assert_eq!(
-            out.headers().get(header::CONTENT_TYPE).and_then(|v| v.to_str().ok()),
+            parts.headers.get(header::CONTENT_TYPE).and_then(|v| v.to_str().ok()),
             Some("application/grpc")
         );
         assert_eq!(
-            out.headers().get(header::TE).and_then(|v| v.to_str().ok()),
+            parts.headers.get(header::TE).and_then(|v| v.to_str().ok()),
             Some("trailers")
         );
     }
 
     #[test]
     fn test_translate_request_grpc_web_proto_to_grpc_proto() {
-        let out = translate_request(grpc_web_req("application/grpc-web+proto"));
+        let (req_parts, body) = grpc_web_req_parts_body("application/grpc-web+proto");
+        let (parts, _body) = translate_request(req_parts, body);
         assert_eq!(
-            out.headers().get(header::CONTENT_TYPE).and_then(|v| v.to_str().ok()),
+            parts.headers.get(header::CONTENT_TYPE).and_then(|v| v.to_str().ok()),
             Some("application/grpc+proto")
         );
     }
 
     #[test]
     fn test_translate_request_grpc_web_text_to_grpc() {
-        let out = translate_request(grpc_web_req("application/grpc-web-text"));
+        let (req_parts, body) = grpc_web_req_parts_body("application/grpc-web-text");
+        let (parts, _body) = translate_request(req_parts, body);
         assert_eq!(
-            out.headers().get(header::CONTENT_TYPE).and_then(|v| v.to_str().ok()),
+            parts.headers.get(header::CONTENT_TYPE).and_then(|v| v.to_str().ok()),
             Some("application/grpc")
         );
     }
@@ -949,13 +983,15 @@ mod grpc_web_integration_tests {
     #[test]
     fn test_translate_request_always_adds_te_trailers() {
         // Even if TE was not set originally
-        let req = Request::builder()
+        let parts = Request::builder()
             .header(header::CONTENT_TYPE, "application/grpc-web+proto")
-            .body(Full::new(Bytes::new()))
-            .unwrap();
-        let out = translate_request(req);
+            .body(())
+            .unwrap()
+            .into_parts()
+            .0;
+        let (parts, _body) = translate_request(parts, Bytes::new());
         assert_eq!(
-            out.headers().get(header::TE).and_then(|v| v.to_str().ok()),
+            parts.headers.get(header::TE).and_then(|v| v.to_str().ok()),
             Some("trailers")
         );
     }
@@ -1086,7 +1122,7 @@ mod sticky_session_integration_tests {
     fn test_cookie_set_cookie_encodes_address() {
         let mgr = cookie_mgr();
         let header = mgr.set_cookie_header("10.0.0.1:8080").unwrap();
-        // The value between '=' and ';' is base64-encoded addr
+        // The value between '=' and ';' is <base64_addr>.<base64_hmac>
         let value = header
             .split('=')
             .nth(1)
@@ -1094,15 +1130,70 @@ mod sticky_session_integration_tests {
             .split(';')
             .next()
             .unwrap();
-        let decoded = base64_decode_addr(value);
+        // Extract just the payload part (before the '.') for decoding
+        let payload = value.rsplit_once('.').map(|(p, _)| p).unwrap_or(value);
+        let decoded = base64_decode_addr(payload);
         assert_eq!(decoded, Some("10.0.0.1:8080".to_string()));
     }
 
     #[test]
     fn test_cookie_extract_present() {
         let mgr = cookie_mgr();
-        let result = mgr.extract_from_cookie("other=val; PHALANXID=dGVzdA; more=x");
-        assert_eq!(result, Some("dGVzdA".to_string()));
+        // Build a properly signed cookie value for "dGVzdA" (base64("test"))
+        let addr = "test";
+        let header = mgr.set_cookie_header(addr).unwrap();
+        let signed_value = header
+            .split('=')
+            .nth(1)
+            .and_then(|s| s.split(';').next())
+            .unwrap();
+        let result = mgr.extract_from_cookie(&format!("other=val; PHALANXID={}; more=x", signed_value));
+        assert!(result.is_some());
+    }
+
+    #[test]
+    fn test_cookie_extract_tampered_signature_rejected() {
+        let mgr = cookie_mgr();
+        let header = mgr.set_cookie_header("10.0.0.1:8080").unwrap();
+        let signed_value = header
+            .split('=')
+            .nth(1)
+            .and_then(|s| s.split(';').next())
+            .unwrap();
+        // Tamper with the signature (change last char of the HMAC part)
+        let mut tampered = signed_value.to_string();
+        tampered.push('X');
+        let result = mgr.extract_from_cookie(&format!("PHALANXID={}", tampered));
+        assert!(result.is_none(), "tampered signature should be rejected");
+    }
+
+    #[test]
+    fn test_cookie_extract_unsigned_rejected() {
+        let mgr = cookie_mgr();
+        // Unsigned cookie values (no '.' separator) are rejected in Cookie mode
+        let result = mgr.extract_from_cookie("PHALANXID=dGVzdA");
+        assert!(result.is_none(), "unsigned cookie should be rejected in Cookie mode");
+    }
+
+    #[test]
+    fn test_cookie_hmac_cross_key_rejected() {
+        let mgr1 = cookie_mgr();
+        let mgr2 = StickySessionManager::new(StickyMode::Cookie {
+            name: "PHALANXID".to_string(),
+            path: "/".to_string(),
+            http_only: true,
+            secure: false,
+            max_age: 3600,
+        });
+        // mgr1 signs a cookie, mgr2 (different key) should reject it
+        let header = mgr1.set_cookie_header("10.0.0.1:8080").unwrap();
+        let signed_value = header
+            .split('=')
+            .nth(1)
+            .and_then(|s| s.split(';').next())
+            .unwrap();
+        let result = mgr2.extract_from_cookie(&format!("PHALANXID={}", signed_value));
+        assert!(result.is_none(), "cookie signed by different key should be rejected");
     }
 
     #[test]
@@ -1578,6 +1669,7 @@ mod waf_policy_engine_tests {
     };
     use ai_load_balancer::waf::reputation::IpReputationManager;
     use ai_load_balancer::waf::{WafAction, WafEngine};
+    use std::collections::HashMap;
 
     fn make_waf_with_policy(policy: WafPolicy) -> WafEngine {
         let reputation = IpReputationManager::new(100, 60, None);
@@ -1607,7 +1699,7 @@ mod waf_policy_engine_tests {
     fn test_policy_engine_new_is_empty() {
         let engine = PolicyEngine::new();
         // Empty engine returns no violations
-        let violations = engine.evaluate(None, "/safe", None, &[], None);
+        let violations = engine.evaluate(None, "/safe", None, &std::collections::HashMap::new(), None);
         assert!(violations.is_empty());
     }
 
@@ -1615,7 +1707,7 @@ mod waf_policy_engine_tests {
     fn test_policy_add_and_evaluate_block_rule() {
         let mut engine = PolicyEngine::new();
         engine.add_policy(blocking_policy(r"evil", RuleTarget::Url)).unwrap();
-        let violations = engine.evaluate(None, "/evil/path", None, &[], None);
+        let violations = engine.evaluate(None, "/evil/path", None, &std::collections::HashMap::new(), None);
         assert!(!violations.is_empty());
         assert!(matches!(violations[0].action, RuleAction::Block));
     }
@@ -1624,7 +1716,7 @@ mod waf_policy_engine_tests {
     fn test_policy_evaluate_no_match_allows() {
         let mut engine = PolicyEngine::new();
         engine.add_policy(blocking_policy(r"evil", RuleTarget::Url)).unwrap();
-        let violations = engine.evaluate(None, "/safe/path", None, &[], None);
+        let violations = engine.evaluate(None, "/safe/path", None, &std::collections::HashMap::new(), None);
         assert!(violations.is_empty());
     }
 
@@ -1632,7 +1724,7 @@ mod waf_policy_engine_tests {
     fn test_policy_query_target_match() {
         let mut engine = PolicyEngine::new();
         engine.add_policy(blocking_policy(r"malicious", RuleTarget::QueryString)).unwrap();
-        let violations = engine.evaluate(None, "/page", Some("q=malicious+content"), &[], None);
+        let violations = engine.evaluate(None, "/page", Some("q=malicious+content"), &std::collections::HashMap::new(), None);
         assert!(!violations.is_empty());
     }
 
@@ -1640,7 +1732,7 @@ mod waf_policy_engine_tests {
     fn test_policy_body_target_match() {
         let mut engine = PolicyEngine::new();
         engine.add_policy(blocking_policy(r"<script>", RuleTarget::Body)).unwrap();
-        let violations = engine.evaluate(None, "/post", None, &[], Some("<script>alert(1)</script>"));
+        let violations = engine.evaluate(None, "/post", None, &std::collections::HashMap::new(), Some("<script>alert(1)</script>"));
         assert!(!violations.is_empty());
     }
 
@@ -1648,7 +1740,9 @@ mod waf_policy_engine_tests {
     fn test_policy_headers_target_match() {
         let mut engine = PolicyEngine::new();
         engine.add_policy(blocking_policy(r"sqlmap", RuleTarget::Headers)).unwrap();
-        let headers = vec![("User-Agent".to_string(), "sqlmap/1.0".to_string())];
+        let headers: std::collections::HashMap<String, String> = [
+            ("User-Agent".to_string(), "sqlmap/1.0".to_string()),
+        ].into_iter().collect();
         let violations = engine.evaluate(None, "/api", None, &headers, None);
         assert!(!violations.is_empty());
     }
@@ -1672,17 +1766,17 @@ mod waf_policy_engine_tests {
         };
         engine.add_policy(policy).unwrap();
         // Excluded path — no violations
-        let violations = engine.evaluate(None, "/admin/evil", None, &[], None);
+        let violations = engine.evaluate(None, "/admin/evil", None, &std::collections::HashMap::new(), None);
         assert!(violations.is_empty(), "excluded path should not trigger rule");
         // Non-excluded path — blocked
-        let violations = engine.evaluate(None, "/public/evil", None, &[], None);
+        let violations = engine.evaluate(None, "/public/evil", None, &std::collections::HashMap::new(), None);
         assert!(!violations.is_empty());
     }
 
     #[test]
     fn test_waf_engine_policy_blocks_via_inspect() {
         let waf = make_waf_with_policy(blocking_policy(r"badactor", RuleTarget::Url));
-        let result = waf.inspect("1.2.3.4", "/badactor/action", None, Some("Mozilla/5.0"));
+        let result = waf.inspect("1.2.3.4", "/badactor/action", None, &HashMap::new(), Some("Mozilla/5.0"));
         assert!(
             matches!(result, WafAction::Block(_)),
             "policy engine should block matched URL"
@@ -1694,7 +1788,7 @@ mod waf_policy_engine_tests {
         let reputation = IpReputationManager::new(100, 60, None);
         let waf = WafEngine::new(true, reputation);
         // Empty policy engine — safe URL passes
-        let result = waf.inspect("1.2.3.4", "/safe", None, Some("Mozilla/5.0"));
+        let result = waf.inspect("1.2.3.4", "/safe", None, &HashMap::new(), Some("Mozilla/5.0"));
         assert_eq!(result, WafAction::Allow);
     }
 
@@ -1702,7 +1796,7 @@ mod waf_policy_engine_tests {
     fn test_policy_rule_id_and_category_in_violation() {
         let mut engine = PolicyEngine::new();
         engine.add_policy(blocking_policy(r"exploit", RuleTarget::All)).unwrap();
-        let violations = engine.evaluate(None, "/exploit", None, &[], None);
+        let violations = engine.evaluate(None, "/exploit", None, &std::collections::HashMap::new(), None);
         assert_eq!(violations[0].rule_id, 1001);
         assert!(!violations[0].category.is_empty());
     }
@@ -2285,7 +2379,7 @@ mod cluster_state_integration_tests {
     #[tokio::test]
     async fn test_redis_backend_returns_error_when_unavailable() {
         let state = ClusterState::new(
-            ClusterBackend::Redis { url: "redis://127.0.0.1:19999".to_string() },
+            ClusterBackend::Redis { url: "redis://127.0.0.1:19999".to_string(), client: std::sync::Arc::new(tokio::sync::Mutex::new(None)) },
             "node-b".to_string(),
         );
         // Should fail gracefully — not panic
@@ -2959,8 +3053,8 @@ mod tcp_proxy_integration_tests {
                 health_check_timeout_secs: 3,
             },
         );
-        let discovery = Arc::new(ServiceDiscovery::new("/tmp/phalanx_tcp_test_discovery"));
-        Arc::new(UpstreamManager::new(&config, discovery))
+        let discovery = Arc::new(ServiceDiscovery::new("/tmp/phalanx_tcp_test_discovery").unwrap());
+        Arc::new(UpstreamManager::new(&config, discovery, tokio_util::sync::CancellationToken::new()))
     }
 
     #[tokio::test]
@@ -3002,9 +3096,9 @@ mod tcp_proxy_integration_tests {
 
     #[tokio::test]
     async fn test_tcp_proxy_graceful_shutdown() {
-        let discovery = Arc::new(ServiceDiscovery::new("/tmp/phalanx_tcp_shutdown_discovery"));
+        let discovery = Arc::new(ServiceDiscovery::new("/tmp/phalanx_tcp_shutdown_discovery").unwrap());
         let config = AppConfig::default();
-        let upstreams = Arc::new(UpstreamManager::new(&config, discovery));
+        let upstreams = Arc::new(UpstreamManager::new(&config, discovery, tokio_util::sync::CancellationToken::new()));
 
         let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let proxy_addr = proxy_listener.local_addr().unwrap();
@@ -3031,7 +3125,7 @@ mod tcp_proxy_integration_tests {
     #[tokio::test]
     async fn test_tcp_proxy_no_healthy_backend_drops_connection() {
         // Pool with no backends → proxy accepts connection then drops it
-        let discovery = Arc::new(ServiceDiscovery::new("/tmp/phalanx_tcp_no_backend_discovery"));
+        let discovery = Arc::new(ServiceDiscovery::new("/tmp/phalanx_tcp_no_backend_discovery").unwrap());
         let mut config = AppConfig::default();
         config.upstreams.insert(
             "default".to_string(),
@@ -3044,7 +3138,7 @@ mod tcp_proxy_integration_tests {
                 health_check_timeout_secs: 3,
             },
         );
-        let upstreams = Arc::new(UpstreamManager::new(&config, discovery));
+        let upstreams = Arc::new(UpstreamManager::new(&config, discovery, tokio_util::sync::CancellationToken::new()));
 
         let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let proxy_addr = proxy_listener.local_addr().unwrap();

@@ -47,7 +47,10 @@ fn shared_upstream_client() -> &'static reqwest::Client {
             .pool_idle_timeout(Some(std::time::Duration::from_secs(90)))
             .pool_max_idle_per_host(64)
             .build()
-            .unwrap_or_default()
+            .unwrap_or_else(|e| {
+                warn!("shared_upstream_client builder failed, falling back to default: {}", e);
+                reqwest::Client::new()
+            })
     })
 }
 
@@ -67,7 +70,10 @@ fn shared_grpc_upstream_client() -> &'static reqwest::Client {
             .pool_max_idle_per_host(64)
             .http2_prior_knowledge()
             .build()
-            .unwrap_or_else(|_| reqwest::Client::new())
+            .unwrap_or_else(|e| {
+                warn!("shared_grpc_upstream_client builder failed, falling back to default: {}", e);
+                reqwest::Client::new()
+            })
     })
 }
 
@@ -246,17 +252,17 @@ pub async fn start_http3_proxy(
                     debug!("QUIC connection from {:?}", remote_addr);
 
                     // Build h3 server connection (generic over Bytes buf).
-                    // When `webtransport_enabled`, advertise the three SETTINGS the
-                    // WT-over-HTTP/3 draft requires during the QUIC handshake:
-                    // `SETTINGS_ENABLE_WEBTRANSPORT`, `H3_DATAGRAM`, and
-                    // `ENABLE_CONNECT_PROTOCOL`. Without these the client refuses
-                    // to send Extended CONNECT, so the gate has to flip these
-                    // *before* `build()`.
+                    // Extended CONNECT is required for both WebTransport (RFC 9220)
+                    // and WebSocket over HTTP/3 (RFC 9220). Enable it
+                    // unconditionally so clients can dial either protocol.
+                    // WT-specific settings (SETTINGS_ENABLE_WEBTRANSPORT,
+                    // H3_DATAGRAM, max sessions) are only advertised when the
+                    // operator has opted in via `webtransport on;`.
                     let mut h3_builder = h3::server::builder();
+                    h3_builder.enable_extended_connect(true);
                     if config_c.webtransport_enabled {
                         h3_builder
                             .enable_webtransport(true)
-                            .enable_extended_connect(true)
                             .enable_datagram(true)
                             .max_webtransport_sessions(64);
                     }
@@ -348,7 +354,7 @@ async fn serve_h3_connection(
                 // the session driver (not by `conn.accept()`), so we
                 // return from `serve_h3_connection` and never come back.
                 if webtransport_enabled && crate::proxy::wt::is_webtransport_request(&req) {
-                    crate::proxy::wt::serve_session(req, stream, conn, remote_addr).await;
+                    crate::proxy::wt::serve_session(req, stream, conn, remote_addr, Arc::clone(&metrics)).await;
                     return;
                 }
 
@@ -471,7 +477,7 @@ async fn handle_h3_request(
     // proxy boundary. Mirrors HTTP/1 at proxy/mod.rs:1865 — uses the same
     // 16-byte trace / 8-byte span hex shape so backends with W3C support
     // (jaeger / datadog / tempo) automatically continue the trace.
-    let (trace_id, span_id) = h3_generate_trace_ids();
+    let (trace_id, span_id) = crate::proxy::generate_trace_context_ids();
 
     // ── gRPC-Web detection ─────────────────────────────────────────────────
     // Captured early from the *original* request so the value isn't lost
@@ -511,9 +517,27 @@ async fn handle_h3_request(
         ConnectionGuard::new(Arc::clone(&zone_limiter), ip_str.clone())
     };
 
-    // ── Request body extraction ──
-    let request_body = match read_h3_request_body(&mut stream).await {
-        Ok(body) => body,
+    // ── Request body extraction (with client_max_body_size enforcement) ──
+    // Check Content-Length header early to reject oversized bodies before buffering.
+    let max_body = app_config.client_max_body_size;
+    if max_body > 0 {
+        if let Some(cl) = req.headers().get(hyper::header::CONTENT_LENGTH) {
+            if let Ok(len) = cl.to_str().unwrap_or("0").parse::<usize>() {
+                if len > max_body {
+                    warn!("HTTP/3 request body too large from {}: {} > {} bytes", ip_str, len, max_body);
+                    send_h3_error(&mut stream, StatusCode::PAYLOAD_TOO_LARGE).await;
+                    return;
+                }
+            }
+        }
+    }
+    let request_body = match read_h3_request_body(&mut stream, max_body).await {
+        Ok(Some(body)) => body,
+        Ok(None) => {
+            warn!("HTTP/3 request body exceeded limit {} from {}", max_body, ip_str);
+            send_h3_error(&mut stream, StatusCode::PAYLOAD_TOO_LARGE).await;
+            return;
+        }
         Err(e) => {
             debug!("HTTP/3 request body read failed: {}", e);
             send_h3_error(&mut stream, StatusCode::BAD_REQUEST).await;
@@ -553,30 +577,42 @@ async fn handle_h3_request(
     //     other extended-CONNECT protocols), or
     //   • An Extended CONNECT for `webtransport` that arrived while the
     //     `webtransport_enabled` gate is off.
-    // Both produce 501 with a `phalanx-webtransport-status` header so
-    // operators can tell "WT off" / "unknown extension" apart from a
+    // Both produce 501 with a diagnostic header so operators can tell
+    // "WT off" / "WS not supported" / "unknown extension" apart from a
     // generic 404.
     if is_h3_extended_connect(&method, req.headers()) {
-        let target = h3_extended_connect_protocol(req.headers())
-            .unwrap_or_else(|| "<unknown>".to_string());
-        let status_value = if target == "webtransport" {
-            // Reached here only when the gate is off (config:
-            // `webtransport off;` or unset). Tells the operator the
-            // feature exists but is currently disabled.
-            "disabled"
+        let (header_name, status_value) = if is_h3_websocket_connect(&method, req.headers()) {
+            // WebSocket over HTTP/3 (RFC 9220) — detected but not yet
+            // implemented. Full bidirectional-stream tunneling requires
+            // a dedicated upstream WS client and is deferred.
+            (
+                hyper::header::HeaderName::from_static("phalanx-h3-status"),
+                hyper::header::HeaderValue::from_static("websocket_not_implemented"),
+            )
         } else {
-            // Some other Extended CONNECT protocol we don't support.
-            "not_implemented"
+            let target = h3_extended_connect_protocol(req.headers())
+                .unwrap_or_else(|| "<unknown>".to_string());
+            let status_value = if target == "webtransport" {
+                // Reached here only when the gate is off (config:
+                // `webtransport off;` or unset).
+                "disabled"
+            } else {
+                "not_implemented"
+            };
+            debug!(
+                "HTTP/3 Extended CONNECT from {} for protocol {} — {}",
+                ip_str, target, status_value
+            );
+            (
+                hyper::header::HeaderName::from_static("phalanx-webtransport-status"),
+                hyper::header::HeaderValue::from_static(status_value),
+            )
         };
-        debug!(
-            "HTTP/3 Extended CONNECT from {} for protocol {} — {}",
-            ip_str, target, status_value
-        );
         send_h3_response_with_header(
             &mut stream,
             StatusCode::NOT_IMPLEMENTED,
-            hyper::header::HeaderName::from_static("phalanx-webtransport-status"),
-            hyper::header::HeaderValue::from_static(status_value),
+            header_name,
+            status_value,
         )
         .await;
         return;
@@ -675,7 +711,7 @@ async fn handle_h3_request(
                 return;
             }
             crate::waf::bot::CaptchaAction::Challenge => {
-                let return_to = build_return_to(&path, query_opt);
+                let return_to = crate::proxy::build_return_to(&path, query_opt);
                 send_h3_html_response(
                     &mut stream,
                     StatusCode::FORBIDDEN,
@@ -689,7 +725,8 @@ async fn handle_h3_request(
 
     // ── WAF inspection ──
     if waf_enabled {
-        if let crate::waf::WafAction::Block(reason) = waf.inspect(&ip_str, &path, query_opt, user_agent) {
+        let req_headers_map: std::collections::HashMap<String, String> = req.headers().iter().map(|(k, v)| (k.to_string(), v.to_str().unwrap_or("").to_string())).collect();
+        if let crate::waf::WafAction::Block(reason) = waf.inspect(&ip_str, &path, query_opt, &req_headers_map, user_agent) {
             warn!("WAF blocked HTTP/3 request from {}: {}", ip_str, reason);
             metrics.waf_blocks_total.with_label_values(&[&reason]).inc();
             send_h3_error(&mut stream, StatusCode::FORBIDDEN).await;
@@ -697,7 +734,7 @@ async fn handle_h3_request(
         }
         if matches!(method, hyper::Method::POST | hyper::Method::PUT | hyper::Method::PATCH) {
             if let Ok(body_text) = std::str::from_utf8(&request_body) {
-                if let crate::waf::WafAction::Block(reason) = waf.inspect_body(&ip_str, body_text) {
+                if let crate::waf::WafAction::Block(reason) = waf.inspect_body(&ip_str, body_text, &path, query_opt) {
                     warn!("WAF blocked HTTP/3 body from {}: {}", ip_str, reason);
                     metrics.waf_blocks_total.with_label_values(&[&reason]).inc();
                     send_h3_error(&mut stream, StatusCode::FORBIDDEN).await;
@@ -1016,6 +1053,18 @@ async fn handle_h3_request(
             forward_headers.insert(name, val);
         }
     }
+    // Route-level add_headers — injected upstream so backends receive
+    // operator-configured custom headers (e.g. X-Frame-Options, X-Version).
+    if let Some((_, r)) = route.as_ref() {
+        for (k, v) in &r.add_headers {
+            if let (Ok(name), Ok(val)) = (
+                reqwest::header::HeaderName::from_bytes(k.as_bytes()),
+                reqwest::header::HeaderValue::from_str(v),
+            ) {
+                forward_headers.insert(name, val);
+            }
+        }
+    }
     // W3C traceparent — `00-{trace_id}-{span_id}-01` (sampled). Backends
     // with W3C support continue the trace started here.
     if let Ok(traceparent) =
@@ -1063,7 +1112,7 @@ async fn handle_h3_request(
         .headers(forward_headers)
         .body(outgoing_body);
 
-    let backend_resp = match backend_request.send().await {
+    let mut backend_resp = match backend_request.send().await {
         Ok(r) => r,
         Err(e) => {
             error!("HTTP/3 upstream error for {}: {}", backend_url, e);
@@ -1161,13 +1210,36 @@ async fn handle_h3_request(
         }
     }
 
-    let raw_backend_body = match backend_resp.bytes().await {
-        Ok(b) => b,
-        Err(e) => {
-            error!("Failed to read HTTP/3 backend body: {}", e);
-            send_h3_error(&mut stream, StatusCode::BAD_GATEWAY).await;
-            return;
+    // ── Read upstream response body (streamed with size limit) ──
+    // Use client_max_body_size as the response buffer limit to prevent OOM
+    // on large upstream responses. Falls back to 64 MiB when unconfigured.
+    let resp_buffer_limit = if max_body > 0 { max_body } else { 64 * 1024 * 1024 };
+    let raw_backend_body = {
+        let mut body = BytesMut::with_capacity(8192);
+        let mut total = 0usize;
+        loop {
+            match backend_resp.chunk().await {
+                Ok(Some(chunk)) => {
+                    total += chunk.len();
+                    if total > resp_buffer_limit {
+                        warn!(
+                            "HTTP/3 upstream response body exceeded buffer limit {} from {}",
+                            resp_buffer_limit, backend.config.address
+                        );
+                        send_h3_error(&mut stream, StatusCode::BAD_GATEWAY).await;
+                        return;
+                    }
+                    body.extend_from_slice(&chunk);
+                }
+                Ok(None) => break,
+                Err(e) => {
+                    error!("Failed to read HTTP/3 backend body chunk: {}", e);
+                    send_h3_error(&mut stream, StatusCode::BAD_GATEWAY).await;
+                    return;
+                }
+            }
         }
+        body.freeze()
     };
 
     // gRPC-Web → gRPC-Web response translation: append a length-prefixed
@@ -1207,7 +1279,7 @@ async fn handle_h3_request(
                 cache_key,
                 CacheEntry {
                     status: status_u16,
-                    body: Bytes::copy_from_slice(&body_bytes),
+                    body: body_bytes.clone(),
                     content_type: content_type.clone(),
                     headers: vec![],
                     created_at: std::time::Instant::now(),
@@ -1277,7 +1349,7 @@ async fn handle_h3_request(
         && is_compressible
         && body_len_pre >= crate::middleware::brotli::MIN_BROTLI_SIZE
     {
-        match crate::middleware::brotli::brotli_compress(&body_bytes, 6) {
+        match crate::middleware::brotli::brotli_compress_async(body_bytes.clone(), 6).await {
             Some(c) => (c, "br"),
             None => (body_bytes, ""),
         }
@@ -1286,7 +1358,7 @@ async fn handle_h3_request(
         && body_len_pre
             >= route_gzip_min.max(crate::middleware::compression::MIN_COMPRESS_SIZE)
     {
-        match crate::middleware::compression::gzip_compress(&body_bytes) {
+        match crate::middleware::compression::gzip_compress_async(body_bytes.clone()).await {
             Some(c) => (c, "gzip"),
             None => (body_bytes, ""),
         }
@@ -1330,6 +1402,20 @@ async fn handle_h3_request(
             hyper::header::HeaderValue::from_str(v),
         ) {
             response = response.header(hk, hv);
+        }
+    }
+
+    // Route-level add_headers — injected into the client response so
+    // operator-configured custom headers (e.g. X-Frame-Options, X-Version,
+    // Cache-Control) reach the browser. Mirrors H2 at proxy/mod.rs:2373.
+    if let Some((_, r)) = route.as_ref() {
+        for (k, v) in &r.add_headers {
+            if let (Ok(hk), Ok(hv)) = (
+                hyper::header::HeaderName::from_bytes(k.as_bytes()),
+                hyper::header::HeaderValue::from_str(v),
+            ) {
+                response = response.header(hk, hv);
+            }
         }
     }
 
@@ -1425,18 +1511,25 @@ async fn handle_h3_request(
 
 /// Reads the full request body from an HTTP/3 stream into a contiguous `Bytes` buffer.
 /// Also drains any trailing headers (required by the h3 protocol to complete the stream).
+/// Reads the HTTP/3 request body stream, enforcing `max_body_bytes` when non-zero.
+/// Returns `None` if the body exceeds the limit (caller should reject with 413).
 async fn read_h3_request_body(
     stream: &mut RequestStream<h3_quinn::BidiStream<Bytes>, Bytes>,
-) -> Result<Bytes, h3::error::StreamError> {
+    max_body_bytes: usize,
+) -> Result<Option<Bytes>, h3::error::StreamError> {
     let mut body = BytesMut::new();
     while let Some(mut chunk) = stream.recv_data().await? {
         if chunk.has_remaining() {
             let bytes = chunk.copy_to_bytes(chunk.remaining());
             body.extend_from_slice(&bytes);
+            if max_body_bytes > 0 && body.len() > max_body_bytes {
+                let _ = stream.recv_trailers().await;
+                return Ok(None);
+            }
         }
     }
     let _ = stream.recv_trailers().await?;
-    Ok(body.freeze())
+    Ok(Some(body.freeze()))
 }
 
 /// Handles the `/__phalanx/captcha/verify` endpoint over HTTP/3.
@@ -1462,7 +1555,7 @@ async fn handle_h3_captcha_verify_request(
         return;
     }
 
-    let form_values = parse_urlencoded_form(body.as_ref());
+    let form_values = crate::proxy::parse_urlencoded_form(body.as_ref());
     let token = match manager.extract_token_from_form(&form_values) {
         Some(t) => t,
         None => {
@@ -1524,55 +1617,6 @@ async fn send_h3_html_response(
     let _ = stream.finish().await;
 }
 
-/// Decodes a single URL-encoded form component (percent-decoding + `+` to space).
-fn decode_form_component(input: &str) -> String {
-    let mut out = Vec::with_capacity(input.len());
-    let bytes = input.as_bytes();
-    let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i] == b'%' && i + 2 < bytes.len() {
-            let hex = &input[i + 1..i + 3];
-            if let Ok(v) = u8::from_str_radix(hex, 16) {
-                out.push(v);
-                i += 3;
-                continue;
-            }
-        }
-        if bytes[i] == b'+' {
-            out.push(b' ');
-        } else {
-            out.push(bytes[i]);
-        }
-        i += 1;
-    }
-    String::from_utf8_lossy(&out).to_string()
-}
-
-/// Parses a `application/x-www-form-urlencoded` body into a key-value map.
-fn parse_urlencoded_form(bytes: &[u8]) -> std::collections::HashMap<String, String> {
-    let mut out = std::collections::HashMap::new();
-    let raw = String::from_utf8_lossy(bytes);
-    for pair in raw.split('&') {
-        if pair.is_empty() {
-            continue;
-        }
-        let (k, v) = match pair.split_once('=') {
-            Some((k, v)) => (k, v),
-            None => (pair, ""),
-        };
-        out.insert(decode_form_component(k), decode_form_component(v));
-    }
-    out
-}
-
-/// Reconstructs the original URL (path + query) for post-CAPTCHA redirect.
-fn build_return_to(path: &str, query: Option<&str>) -> String {
-    match query {
-        Some(q) if !q.is_empty() => format!("{}?{}", path, q),
-        _ => path.to_string(),
-    }
-}
-
 /// Send a bare HTTP/3 error response (status only, no body) and close the stream.
 async fn send_h3_error(
     stream: &mut RequestStream<h3_quinn::BidiStream<Bytes>, Bytes>,
@@ -1621,13 +1665,13 @@ enum H3AuthOutcome {
 ///
 /// 1. Per-route Basic Auth (`auth_basic_realm`)
 /// 2. Per-route JWT Bearer (`auth_jwt_secret`) — injects claim headers on success
-/// 3. Per-route auth_request subrequest (`auth_request_url`) — injects X-Auth-* headers on success
-/// 4. Global auth_request fallback (`app_config.auth_request_url`) — only when no per-route auth is configured
+/// 3. Per-route OAuth 2.0 token introspection (`auth_oauth_introspect_url`)
+/// 4. Per-route JWKS-based JWT (`auth_jwks_uri`) — dynamic public key lookup by kid
+/// 5. Per-route OIDC session check (`auth_oidc_cookie_name`) — validates server-side session
+/// 6. Per-route auth_request subrequest (`auth_request_url`) — injects X-Auth-* headers on success
+/// 7. Global auth_request fallback (`app_config.auth_request_url`) — only when no per-route auth is configured
 ///
 /// Returns the headers to inject upstream on success, or a denial response.
-/// OAuth/JWKS/OIDC are intentionally **not** ported here — they involve session
-/// stores and discovery flows that need their own focused work; that remains
-/// a tracked C2 gap in `plan_v2.md`.
 async fn apply_h3_auth_chain(
     route: Option<&(String, crate::config::RouteConfig)>,
     app_config: &AppConfig,
@@ -1866,21 +1910,6 @@ async fn apply_h3_jwks(
     }
 }
 
-/// Generates a (trace_id, span_id) pair for one HTTP/3 request.
-/// 16-byte trace, 8-byte span, hex-encoded — matches the HTTP/1 helper at
-/// `proxy/mod.rs:3871` and the W3C Trace Context spec.
-fn h3_generate_trace_ids() -> (String, String) {
-    use rand::RngExt;
-    let mut trace = [0u8; 16];
-    let mut span = [0u8; 8];
-    let mut rng = rand::rng();
-    rng.fill(&mut trace);
-    rng.fill(&mut span);
-    let trace_id: String = trace.iter().map(|b| format!("{:02x}", b)).collect();
-    let span_id: String = span.iter().map(|b| format!("{:02x}", b)).collect();
-    (trace_id, span_id)
-}
-
 /// Detects a gRPC-Web CORS preflight request: an `OPTIONS` whose
 /// `Access-Control-Request-Headers` mentions `grpc-web` (case-insensitive).
 /// Browsers send these before issuing the actual `POST application/grpc-web`
@@ -1935,6 +1964,27 @@ fn h3_extended_connect_protocol(headers: &hyper::HeaderMap) -> Option<String> {
         .get("upgrade")
         .and_then(|v| v.to_str().ok())
         .map(|s| s.to_string())
+}
+
+/// True when the request is a WebSocket Extended CONNECT over HTTP/3
+/// (RFC 9220). h3 0.0.8 does not include `websocket` in its `Protocol`
+/// enum, so we detect via CONNECT method + `Upgrade: websocket` or the
+/// `sec-websocket-*` family of headers.
+fn is_h3_websocket_connect(method: &hyper::Method, headers: &hyper::HeaderMap) -> bool {
+    if *method != hyper::Method::CONNECT {
+        return false;
+    }
+    let upgrade_is_ws = headers
+        .get(hyper::header::UPGRADE)
+        .and_then(|v| v.to_str().ok())
+        .map(|v| v.eq_ignore_ascii_case("websocket"))
+        .unwrap_or(false);
+    if upgrade_is_ws {
+        return true;
+    }
+    // Some clients send sec-websocket-key / sec-websocket-version even
+    // over H3, despite RFC 9220 not requiring them.
+    headers.contains_key("sec-websocket-key") || headers.contains_key("sec-websocket-version")
 }
 
 /// CORS preflight response for gRPC-Web over HTTP/3. Mirrors the headers
@@ -2016,12 +2066,12 @@ fn build_quic_tls_config(app_config: &AppConfig) -> Option<rustls::ServerConfig>
 mod tests {
     use super::{
         apply_h3_auth_chain, build_h3_grpc_web_response_body, build_h3_grpc_web_trailer_frame,
-        build_return_to, decode_form_component, h3_extended_connect_protocol,
-        h3_generate_trace_ids, is_h3_extended_connect, is_h3_grpc_web,
-        is_h3_grpc_web_preflight, is_h3_grpc_web_text, parse_urlencoded_form,
+        h3_extended_connect_protocol, is_h3_extended_connect, is_h3_grpc_web,
+        is_h3_grpc_web_preflight, is_h3_grpc_web_text, is_h3_websocket_connect,
         shared_grpc_upstream_client, shared_upstream_client, translate_h3_grpc_web_request_body,
         H3AuthOutcome,
     };
+    use crate::proxy::{build_return_to, decode_form_component, generate_trace_context_ids, parse_urlencoded_form};
     use bytes::Bytes;
     use crate::config::{AppConfig, RouteConfig};
     use crate::telemetry::bandwidth::BandwidthTracker;
@@ -2589,6 +2639,67 @@ mod tests {
         );
     }
 
+    // ── WebSocket over HTTP/3 detection ──────────────────────────────
+
+    #[test]
+    fn test_h3_websocket_connect_detected_via_upgrade_header() {
+        let mut h = hyper::HeaderMap::new();
+        h.insert(hyper::header::UPGRADE, "websocket".parse().unwrap());
+        assert!(is_h3_websocket_connect(&hyper::Method::CONNECT, &h));
+    }
+
+    #[test]
+    fn test_h3_websocket_connect_upgrade_case_insensitive() {
+        let mut h = hyper::HeaderMap::new();
+        h.insert(hyper::header::UPGRADE, "WebSocket".parse().unwrap());
+        assert!(is_h3_websocket_connect(&hyper::Method::CONNECT, &h));
+        let mut h2 = hyper::HeaderMap::new();
+        h2.insert(hyper::header::UPGRADE, "WEBSOCKET".parse().unwrap());
+        assert!(is_h3_websocket_connect(&hyper::Method::CONNECT, &h2));
+    }
+
+    #[test]
+    fn test_h3_websocket_connect_detected_via_sec_websocket_key() {
+        let mut h = hyper::HeaderMap::new();
+        h.insert(
+            hyper::header::HeaderName::from_static("sec-websocket-key"),
+            "dGhlIHNhbXBsZSBub25jZQ==".parse().unwrap(),
+        );
+        assert!(is_h3_websocket_connect(&hyper::Method::CONNECT, &h));
+    }
+
+    #[test]
+    fn test_h3_websocket_connect_detected_via_sec_websocket_version() {
+        let mut h = hyper::HeaderMap::new();
+        h.insert(
+            hyper::header::HeaderName::from_static("sec-websocket-version"),
+            "13".parse().unwrap(),
+        );
+        assert!(is_h3_websocket_connect(&hyper::Method::CONNECT, &h));
+    }
+
+    #[test]
+    fn test_h3_websocket_connect_not_detected_on_normal_requests() {
+        let h = hyper::HeaderMap::new();
+        assert!(!is_h3_websocket_connect(&hyper::Method::GET, &h));
+        assert!(!is_h3_websocket_connect(&hyper::Method::POST, &h));
+    }
+
+    #[test]
+    fn test_h3_websocket_connect_not_detected_on_connect_without_ws_headers() {
+        let h = hyper::HeaderMap::new();
+        // CONNECT method alone is extended-connect but NOT specifically websocket
+        assert!(!is_h3_websocket_connect(&hyper::Method::CONNECT, &h));
+    }
+
+    #[test]
+    fn test_h3_websocket_connect_requires_connect_method() {
+        let mut h = hyper::HeaderMap::new();
+        h.insert(hyper::header::UPGRADE, "websocket".parse().unwrap());
+        // Upgrade: websocket on a GET is not a WebSocket CONNECT
+        assert!(!is_h3_websocket_connect(&hyper::Method::GET, &h));
+    }
+
     // ── P2: HookContext Arc<str> sharing tests ──────────────────────────
 
     #[test]
@@ -2848,8 +2959,8 @@ mod tests {
     #[test]
     fn test_h3_trace_ids_have_correct_shape() {
         // Each call must yield a fresh, well-formed pair.
-        let (trace_a, span_a) = h3_generate_trace_ids();
-        let (trace_b, span_b) = h3_generate_trace_ids();
+        let (trace_a, span_a) = generate_trace_context_ids();
+        let (trace_b, span_b) = generate_trace_context_ids();
 
         // Hex-encoded 16 bytes = 32 chars; 8 bytes = 16 chars.
         assert_eq!(trace_a.len(), 32);

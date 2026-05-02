@@ -55,23 +55,35 @@ struct CachedJwks {
 }
 
 /// Thread-safe JWKS manager that fetches and caches keys from remote endpoints.
-/// Automatically refreshes keys on a configurable interval.
+/// Automatically refreshes keys on a configurable interval. Uses a shared
+/// `reqwest::Client` for connection reuse and serves stale cached keys when
+/// the remote endpoint is unreachable.
 pub struct JwksManager {
     /// Maps JWKS URI → cached key set
     cache: DashMap<String, CachedJwks>,
+    /// Shared HTTP client for connection reuse across JWKS fetches.
+    client: reqwest::Client,
 }
 
 impl JwksManager {
-    /// Creates a new JWKS manager with an empty cache.
+    /// Creates a new JWKS manager with an empty cache and a shared HTTP client.
     pub fn new() -> Self {
+        let client = reqwest::Client::builder()
+            .timeout(JWKS_FETCH_TIMEOUT)
+            .build()
+            .unwrap_or_else(|_| reqwest::Client::new());
         Self {
             cache: DashMap::new(),
+            client,
         }
     }
 
     /// Fetches keys from the JWKS endpoint, using cache if available and fresh.
+    ///
+    /// If the remote endpoint is unreachable and cached keys exist (even if
+    /// stale), they are returned as a fallback rather than failing outright.
     pub async fn get_keys(&self, jwks_uri: &str) -> Result<JwksResponse, String> {
-        // Check cache
+        // Check cache — return immediately if still fresh
         if let Some(cached) = self.cache.get(jwks_uri) {
             if cached.fetched_at.elapsed() < JWKS_REFRESH_INTERVAL {
                 debug!("JWKS cache hit for {}", jwks_uri);
@@ -80,13 +92,38 @@ impl JwksManager {
         }
 
         // Fetch fresh keys
-        debug!("Fetching JWKS from {}", jwks_uri);
-        let client = reqwest::Client::builder()
-            .timeout(JWKS_FETCH_TIMEOUT)
-            .build()
-            .map_err(|e| format!("HTTP client error: {}", e))?;
+        match self.fetch_keys(jwks_uri).await {
+            Ok(jwks) => {
+                self.cache.insert(
+                    jwks_uri.to_string(),
+                    CachedJwks {
+                        keys: jwks.clone(),
+                        fetched_at: Instant::now(),
+                    },
+                );
+                Ok(jwks)
+            }
+            Err(e) => {
+                // Stale-while-revalidate: serve cached keys on fetch failure
+                if let Some(cached) = self.cache.get(jwks_uri) {
+                    warn!(
+                        "JWKS fetch failed for {} ({}), serving stale cache (age: {:?})",
+                        jwks_uri,
+                        e,
+                        cached.fetched_at.elapsed()
+                    );
+                    return Ok(cached.keys.clone());
+                }
+                Err(e)
+            }
+        }
+    }
 
-        let resp = client
+    /// Fetches fresh keys from the remote JWKS endpoint.
+    async fn fetch_keys(&self, jwks_uri: &str) -> Result<JwksResponse, String> {
+        debug!("Fetching JWKS from {}", jwks_uri);
+        let resp = self
+            .client
             .get(jwks_uri)
             .send()
             .await
@@ -105,14 +142,6 @@ impl JwksManager {
             "Loaded {} keys from JWKS endpoint {}",
             jwks.keys.len(),
             jwks_uri
-        );
-
-        self.cache.insert(
-            jwks_uri.to_string(),
-            CachedJwks {
-                keys: jwks.clone(),
-                fetched_at: Instant::now(),
-            },
         );
 
         Ok(jwks)
@@ -182,6 +211,18 @@ impl JwksManager {
                 }
             }
         });
+    }
+
+    /// Seeds the cache with a pre-fetched JWKS response (test-only).
+    #[cfg(test)]
+    fn seed_cache(&self, jwks_uri: &str, keys: JwksResponse, age: Duration) {
+        self.cache.insert(
+            jwks_uri.to_string(),
+            CachedJwks {
+                keys,
+                fetched_at: Instant::now().checked_sub(age).unwrap_or_else(Instant::now),
+            },
+        );
     }
 }
 
@@ -282,5 +323,49 @@ mod tests {
             crv: Some("P-256".to_string()),
         };
         assert!(JwksManager::decoding_key_from_jwk(&jwk).is_err());
+    }
+
+    #[tokio::test]
+    async fn test_jwks_stale_while_revalidate() {
+        let mgr = JwksManager::new();
+        // Seed cache with keys fetched 10 minutes ago (stale)
+        let jwks = JwksResponse {
+            keys: vec![Jwk {
+                kty: "RSA".to_string(),
+                kid: Some("test-key".to_string()),
+                use_: Some("sig".to_string()),
+                alg: Some("RS256".to_string()),
+                n: Some("test-n".to_string()),
+                e: Some("AQAB".to_string()),
+                x: None,
+                y: None,
+                crv: None,
+            }],
+        };
+        mgr.seed_cache(
+            "https://invalid.example.com/jwks",
+            jwks,
+            Duration::from_secs(600), // 10 min ago → expired
+        );
+
+        // Fetch should fail (invalid URL) but return stale cached keys
+        let result = mgr
+            .get_keys("https://invalid.example.com/jwks")
+            .await;
+        // Stale-while-revalidate: should succeed with cached keys despite fetch failure
+        assert!(result.is_ok(), "expected stale cache fallback, got err: {:?}", result.err());
+        let keys = result.unwrap();
+        assert_eq!(keys.keys.len(), 1);
+        assert_eq!(keys.keys[0].kid.as_deref(), Some("test-key"));
+    }
+
+    #[tokio::test]
+    async fn test_jwks_no_stale_cache_returns_error() {
+        let mgr = JwksManager::new();
+        // No cache seeded, unreachable URL → should return error
+        let result = mgr
+            .get_keys("https://invalid.example.com/jwks")
+            .await;
+        assert!(result.is_err());
     }
 }

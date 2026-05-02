@@ -8,6 +8,17 @@ use bytes::Bytes;
 use std::io::Write;
 use tracing::debug;
 
+/// Async wrapper that offloads Brotli compression to `spawn_blocking`.
+/// Prevents CPU-intensive compression from stalling Tokio worker threads.
+pub async fn brotli_compress_async(body: Bytes, quality: u32) -> Option<Bytes> {
+    if body.len() < MIN_BROTLI_SIZE {
+        return None;
+    }
+    tokio::task::spawn_blocking(move || brotli_compress(&body, quality))
+        .await
+        .unwrap_or(None)
+}
+
 /// Minimum body size to attempt Brotli compression (1 KB).
 /// Below this threshold, compression overhead exceeds the savings.
 pub const MIN_BROTLI_SIZE: usize = 1024;

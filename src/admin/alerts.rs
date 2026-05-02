@@ -10,10 +10,11 @@
 
 use crate::telemetry::bandwidth::{AlertLevel, BandwidthAlert, BandwidthTracker};
 use serde::{Deserialize, Serialize};
+use dashmap::DashMap;
 use std::{
     collections::VecDeque,
     sync::Arc,
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use tokio::sync::RwLock;
 
@@ -121,6 +122,9 @@ pub struct AlertEngine {
     log: Arc<RwLock<VecDeque<AlertRecord>>>,
     /// Optional webhook URL for external alert delivery.
     webhook_url: Option<String>,
+    /// Tracks last alert time for deduplication. Key: (category, protocol, metric).
+    /// Alerts for the same key are suppressed within 300s.
+    last_alert: DashMap<(String, String, String), Instant>,
 }
 
 impl AlertEngine {
@@ -131,6 +135,7 @@ impl AlertEngine {
             system_thresholds: SystemThresholds::default(),
             log: Arc::new(RwLock::new(VecDeque::with_capacity(MAX_ALERTS))),
             webhook_url: None,
+            last_alert: DashMap::new(),
         })
     }
 
@@ -141,6 +146,7 @@ impl AlertEngine {
             system_thresholds: self.system_thresholds.clone(),
             log: Arc::clone(&self.log),
             webhook_url: Some(url),
+            last_alert: DashMap::new(),
         })
     }
 
@@ -154,141 +160,123 @@ impl AlertEngine {
             new_alerts.push(AlertRecord::from_bandwidth(&ba));
         }
 
-        // --- Process memory (Linux: /proc/self/status) ---
-        #[cfg(target_os = "linux")]
-        {
-            if let Ok(status) = std::fs::read_to_string("/proc/self/status") {
-                for line in status.lines() {
-                    if line.starts_with("VmRSS:") {
-                        if let Some(kb_str) = line.split_whitespace().nth(1) {
-                            if let Ok(kb) = kb_str.parse::<u64>() {
-                                let bytes = kb * 1024;
-                                if bytes >= self.system_thresholds.memory_critical_bytes {
-                                    new_alerts.push(AlertRecord::system(
-                                        "critical",
-                                        "memory",
-                                        format!(
-                                            "Process RSS {:.1} GiB exceeds critical threshold",
-                                            bytes as f64 / (1024.0 * 1024.0 * 1024.0)
-                                        ),
-                                        bytes as f64,
-                                        self.system_thresholds.memory_critical_bytes as f64,
-                                    ));
-                                } else if bytes >= self.system_thresholds.memory_warn_bytes {
-                                    new_alerts.push(AlertRecord::system(
-                                        "warning",
-                                        "memory",
-                                        format!(
-                                            "Process RSS {:.1} MiB exceeds warning threshold",
-                                            bytes as f64 / (1024.0 * 1024.0)
-                                        ),
-                                        bytes as f64,
-                                        self.system_thresholds.memory_warn_bytes as f64,
-                                    ));
+        // --- System monitoring (offloaded to spawn_blocking) ---
+        let thresholds = self.system_thresholds.clone();
+        if let Ok(sys_alerts) = tokio::task::spawn_blocking(move || {
+            let mut alerts: Vec<AlertRecord> = Vec::new();
+
+            // --- Process memory (Linux: /proc/self/status) ---
+            #[cfg(target_os = "linux")]
+            {
+                if let Ok(status) = std::fs::read_to_string("/proc/self/status") {
+                    for line in status.lines() {
+                        if line.starts_with("VmRSS:") {
+                            if let Some(kb_str) = line.split_whitespace().nth(1) {
+                                if let Ok(kb) = kb_str.parse::<u64>() {
+                                    let bytes = kb * 1024;
+                                    if bytes >= thresholds.memory_critical_bytes {
+                                        alerts.push(AlertRecord::system(
+                                            "critical", "memory",
+                                            format!("Process RSS {:.1} GiB exceeds critical threshold", bytes as f64 / (1024.0 * 1024.0 * 1024.0)),
+                                            bytes as f64, thresholds.memory_critical_bytes as f64,
+                                        ));
+                                    } else if bytes >= thresholds.memory_warn_bytes {
+                                        alerts.push(AlertRecord::system(
+                                            "warning", "memory",
+                                            format!("Process RSS {:.1} MiB exceeds warning threshold", bytes as f64 / (1024.0 * 1024.0)),
+                                            bytes as f64, thresholds.memory_warn_bytes as f64,
+                                        ));
+                                    }
                                 }
                             }
+                            break;
                         }
-                        break;
                     }
                 }
             }
-        }
 
-        // --- Process memory (macOS: libc::getrusage) ---
-        #[cfg(target_os = "macos")]
-        {
-            let mut usage: libc::rusage = unsafe { std::mem::zeroed() };
-            let ret = unsafe { libc::getrusage(libc::RUSAGE_SELF, &mut usage) };
-            if ret == 0 {
-                // macOS reports ru_maxrss in bytes
-                let bytes = usage.ru_maxrss as u64;
-                if bytes >= self.system_thresholds.memory_critical_bytes {
-                    new_alerts.push(AlertRecord::system(
-                        "critical",
-                        "memory",
-                        format!(
-                            "Process RSS {:.1} GiB exceeds critical threshold",
-                            bytes as f64 / (1024.0 * 1024.0 * 1024.0)
-                        ),
-                        bytes as f64,
-                        self.system_thresholds.memory_critical_bytes as f64,
-                    ));
-                } else if bytes >= self.system_thresholds.memory_warn_bytes {
-                    new_alerts.push(AlertRecord::system(
-                        "warning",
-                        "memory",
-                        format!(
-                            "Process RSS {:.1} MiB exceeds warning threshold",
-                            bytes as f64 / (1024.0 * 1024.0)
-                        ),
-                        bytes as f64,
-                        self.system_thresholds.memory_warn_bytes as f64,
-                    ));
+            // --- Process memory (macOS: libc::getrusage) ---
+            #[cfg(target_os = "macos")]
+            {
+                let mut usage: libc::rusage = unsafe { std::mem::zeroed() };
+                if unsafe { libc::getrusage(libc::RUSAGE_SELF, &mut usage) } == 0 {
+                    let bytes = usage.ru_maxrss as u64;
+                    if bytes >= thresholds.memory_critical_bytes {
+                        alerts.push(AlertRecord::system(
+                            "critical", "memory",
+                            format!("Process RSS {:.1} GiB exceeds critical threshold", bytes as f64 / (1024.0 * 1024.0 * 1024.0)),
+                            bytes as f64, thresholds.memory_critical_bytes as f64,
+                        ));
+                    } else if bytes >= thresholds.memory_warn_bytes {
+                        alerts.push(AlertRecord::system(
+                            "warning", "memory",
+                            format!("Process RSS {:.1} MiB exceeds warning threshold", bytes as f64 / (1024.0 * 1024.0)),
+                            bytes as f64, thresholds.memory_warn_bytes as f64,
+                        ));
+                    }
                 }
             }
-        }
 
-        // --- Open file descriptors (Linux: /proc/self/fd) ---
-        #[cfg(target_os = "linux")]
-        {
-            if let Ok(entries) = std::fs::read_dir("/proc/self/fd") {
-                let fd_count = entries.count() as u64;
-                if fd_count >= self.system_thresholds.fd_critical {
-                    new_alerts.push(AlertRecord::system(
-                        "critical",
-                        "file_descriptors",
-                        format!(
-                            "Open FD count {} exceeds critical threshold {}",
-                            fd_count, self.system_thresholds.fd_critical
-                        ),
-                        fd_count as f64,
-                        self.system_thresholds.fd_critical as f64,
-                    ));
-                } else if fd_count >= self.system_thresholds.fd_warn {
-                    new_alerts.push(AlertRecord::system(
-                        "warning",
-                        "file_descriptors",
-                        format!(
-                            "Open FD count {} exceeds warning threshold {}",
-                            fd_count, self.system_thresholds.fd_warn
-                        ),
-                        fd_count as f64,
-                        self.system_thresholds.fd_warn as f64,
-                    ));
+            // --- Open file descriptors (Linux: /proc/self/fd) ---
+            #[cfg(target_os = "linux")]
+            {
+                if let Ok(entries) = std::fs::read_dir("/proc/self/fd") {
+                    let fd_count = entries.count() as u64;
+                    if fd_count >= thresholds.fd_critical {
+                        alerts.push(AlertRecord::system(
+                            "critical", "file_descriptors",
+                            format!("Open FD count {} exceeds critical threshold {}", fd_count, thresholds.fd_critical),
+                            fd_count as f64, thresholds.fd_critical as f64,
+                        ));
+                    } else if fd_count >= thresholds.fd_warn {
+                        alerts.push(AlertRecord::system(
+                            "warning", "file_descriptors",
+                            format!("Open FD count {} exceeds warning threshold {}", fd_count, thresholds.fd_warn),
+                            fd_count as f64, thresholds.fd_warn as f64,
+                        ));
+                    }
                 }
             }
-        }
 
-        // --- Open file descriptors (macOS: /dev/fd) ---
-        #[cfg(target_os = "macos")]
-        {
-            if let Ok(entries) = std::fs::read_dir("/dev/fd") {
-                let fd_count = entries.count() as u64;
-                if fd_count >= self.system_thresholds.fd_critical {
-                    new_alerts.push(AlertRecord::system(
-                        "critical",
-                        "file_descriptors",
-                        format!(
-                            "Open FD count {} exceeds critical threshold {}",
-                            fd_count, self.system_thresholds.fd_critical
-                        ),
-                        fd_count as f64,
-                        self.system_thresholds.fd_critical as f64,
-                    ));
-                } else if fd_count >= self.system_thresholds.fd_warn {
-                    new_alerts.push(AlertRecord::system(
-                        "warning",
-                        "file_descriptors",
-                        format!(
-                            "Open FD count {} exceeds warning threshold {}",
-                            fd_count, self.system_thresholds.fd_warn
-                        ),
-                        fd_count as f64,
-                        self.system_thresholds.fd_warn as f64,
-                    ));
+            // --- Open file descriptors (macOS: /dev/fd) ---
+            #[cfg(target_os = "macos")]
+            {
+                if let Ok(entries) = std::fs::read_dir("/dev/fd") {
+                    let fd_count = entries.count() as u64;
+                    if fd_count >= thresholds.fd_critical {
+                        alerts.push(AlertRecord::system(
+                            "critical", "file_descriptors",
+                            format!("Open FD count {} exceeds critical threshold {}", fd_count, thresholds.fd_critical),
+                            fd_count as f64, thresholds.fd_critical as f64,
+                        ));
+                    } else if fd_count >= thresholds.fd_warn {
+                        alerts.push(AlertRecord::system(
+                            "warning", "file_descriptors",
+                            format!("Open FD count {} exceeds warning threshold {}", fd_count, thresholds.fd_warn),
+                            fd_count as f64, thresholds.fd_warn as f64,
+                        ));
+                    }
                 }
             }
+
+            alerts
+        }).await {
+            new_alerts.extend(sys_alerts);
         }
+
+        // Deduplication: suppress alerts for (category, metric) within 300s cooldown
+        const COOLDOWN: Duration = Duration::from_secs(300);
+        let now = Instant::now();
+        new_alerts.retain(|a| {
+            let key = (a.category.clone(), a.protocol.clone(), a.metric.clone());
+            match self.last_alert.get(&key) {
+                Some(last) if now.duration_since(*last) < COOLDOWN => false,
+                _ => {
+                    self.last_alert.insert(key, now);
+                    true
+                }
+            }
+        });
 
         if new_alerts.is_empty() {
             return;
@@ -328,12 +316,19 @@ impl AlertEngine {
     }
 
     /// Spawn a background task that calls `check()` every `interval_secs` seconds.
-    pub fn spawn_background_check(self: Arc<Self>, interval_secs: u64) {
+    /// The task exits cleanly when `cancel` is signalled.
+    pub fn spawn_background_check(self: Arc<Self>, interval_secs: u64, cancel: tokio_util::sync::CancellationToken) {
         tokio::spawn(async move {
             let mut ticker =
                 tokio::time::interval(std::time::Duration::from_secs(interval_secs));
             loop {
-                ticker.tick().await;
+                tokio::select! {
+                    _ = cancel.cancelled() => {
+                        tracing::info!("Alert engine background check stopping");
+                        return;
+                    }
+                    _ = ticker.tick() => {}
+                }
                 self.check().await;
             }
         });
@@ -343,7 +338,7 @@ impl AlertEngine {
 // ─── Webhook Delivery ─────────────────────────────────────────────────────────
 
 /// Best-effort HTTP POST of a serialised alert to the configured webhook URL.
-/// Failures are logged but not retried.
+/// Failures are logged but not retried. Client is cached in a global OnceLock.
 async fn send_webhook(url: &str, alert: &AlertRecord) {
     let payload = match serde_json::to_string(alert) {
         Ok(s) => s,
@@ -353,16 +348,7 @@ async fn send_webhook(url: &str, alert: &AlertRecord) {
         }
     };
 
-    let client = match reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(5))
-        .build()
-    {
-        Ok(c) => c,
-        Err(e) => {
-            tracing::warn!("Alert webhook client build failed: {}", e);
-            return;
-        }
-    };
+    let client = webhook_client();
 
     match client
         .post(url)
@@ -386,6 +372,17 @@ async fn send_webhook(url: &str, alert: &AlertRecord) {
             tracing::warn!("Alert webhook POST to {} failed: {}", url, e);
         }
     }
+}
+
+/// Cached reqwest::Client for alert webhooks — avoids building a new client per alert.
+fn webhook_client() -> &'static reqwest::Client {
+    static CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
+    CLIENT.get_or_init(|| {
+        reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(5))
+            .build()
+            .unwrap_or_else(|_| reqwest::Client::new())
+    })
 }
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
@@ -419,6 +416,7 @@ mod tests {
             system_thresholds: thresholds,
             log: Arc::new(RwLock::new(VecDeque::with_capacity(MAX_ALERTS))),
             webhook_url: None,
+            last_alert: DashMap::new(),
         })
     }
 
@@ -431,16 +429,18 @@ mod tests {
 
     #[tokio::test]
     async fn test_bandwidth_alert_fires() {
-        let tracker = BandwidthTracker::new();
+        let tracker = Arc::new(BandwidthTracker::new());
         tracker.set_threshold("tcp", ProtocolThreshold {
             bandwidth_bps_warn: 100,
             bandwidth_bps_critical: 1_000_000,
             connections_warn: 999_999,
             connections_critical: 9_999_999,
         });
+        let engine = AlertEngine::new(Arc::clone(&tracker));
+        engine.check().await; // establish baseline
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
         tracker.protocol("tcp").add_in(200);
-        let engine = AlertEngine::new(tracker);
-        engine.check().await;
+        engine.check().await; // rate now exceeds threshold
         assert!(engine.count().await > 0);
         let recent = engine.recent(10).await;
         assert!(recent.iter().any(|a| a.protocol == "tcp" && a.metric == "bandwidth"));
@@ -465,8 +465,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_recent_returns_newest_first() {
-        let tracker = BandwidthTracker::new();
-        // Trigger alerts on two protocols with tiny thresholds
+        let tracker = Arc::new(BandwidthTracker::new());
+        // Set tiny thresholds
         for proto in &["http1", "http2"] {
             tracker.set_threshold(proto, ProtocolThreshold {
                 bandwidth_bps_warn: 1,
@@ -474,10 +474,14 @@ mod tests {
                 connections_warn: 999_999,
                 connections_critical: 9_999_999,
             });
+        }
+        let engine = AlertEngine::new(Arc::clone(&tracker));
+        engine.check().await; // establish baseline
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        for proto in &["http1", "http2"] {
             tracker.protocol(proto).add_in(10);
         }
-        let engine = AlertEngine::new(tracker);
-        engine.check().await;
+        engine.check().await; // rate now exceeds threshold
         let recent = engine.recent(5).await;
         assert!(recent.len() >= 2);
         // Newest first: timestamps should be non-increasing
@@ -529,16 +533,18 @@ mod tests {
 
     #[tokio::test]
     async fn test_alert_record_fields() {
-        let tracker = BandwidthTracker::new();
+        let tracker = Arc::new(BandwidthTracker::new());
         tracker.set_threshold("grpc", ProtocolThreshold {
             bandwidth_bps_warn: 1,
             bandwidth_bps_critical: u64::MAX,
             connections_warn: 999_999,
             connections_critical: 9_999_999,
         });
+        let engine = AlertEngine::new(Arc::clone(&tracker));
+        engine.check().await; // establish baseline
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
         tracker.protocol("grpc").add_in(50);
-        let engine = AlertEngine::new(tracker);
-        engine.check().await;
+        engine.check().await; // rate now exceeds threshold
         let recent = engine.recent(1).await;
         assert_eq!(recent.len(), 1);
         let r = &recent[0];
@@ -546,5 +552,30 @@ mod tests {
         assert_eq!(r.protocol, "grpc");
         assert!(r.timestamp > 0);
         assert!(r.value > 0.0);
+    }
+
+    #[tokio::test]
+    async fn test_alert_deduplication() {
+        let tracker = Arc::new(BandwidthTracker::new());
+        tracker.set_threshold("tcp", ProtocolThreshold {
+            bandwidth_bps_warn: 100,
+            bandwidth_bps_critical: u64::MAX,
+            connections_warn: 999_999,
+            connections_critical: 9_999_999,
+        });
+        let engine = AlertEngine::new(Arc::clone(&tracker));
+        engine.check().await; // baseline
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        tracker.protocol("tcp").add_in(200);
+        engine.check().await; // first alert fires (200 bytes / 5ms ≈ 40 KB/s > 100 B/s warn)
+        let count1 = engine.count().await;
+        assert!(count1 > 0, "first alert should fire");
+
+        // Immediate second check — same (bandwidth, tcp, bandwidth) alert deduplicated
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        tracker.protocol("tcp").add_in(200);
+        engine.check().await;
+        let count2 = engine.count().await;
+        assert_eq!(count1, count2, "duplicate alert within cooldown must be suppressed");
     }
 }

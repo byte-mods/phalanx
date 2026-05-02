@@ -25,6 +25,10 @@ pub struct ProtocolStats {
     pub requests: AtomicU64,
     /// Signed gauge so dec() never underflows below 0.
     pub active_connections: AtomicI64,
+    /// Bytes at the last threshold check (for rate calculation).
+    pub last_check_bytes: AtomicU64,
+    /// Unix millis at the last threshold check (for rate calculation).
+    pub last_check_time: AtomicU64,
 }
 
 impl ProtocolStats {
@@ -35,6 +39,8 @@ impl ProtocolStats {
             bytes_out: AtomicU64::new(0),
             requests: AtomicU64::new(0),
             active_connections: AtomicI64::new(0),
+            last_check_bytes: AtomicU64::new(0),
+            last_check_time: AtomicU64::new(0),
         }
     }
 
@@ -187,6 +193,11 @@ impl BandwidthTracker {
     /// Check all protocols against thresholds and return triggered alerts.
     pub fn check_thresholds(&self) -> Vec<BandwidthAlert> {
         let mut alerts = Vec::new();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+
         for entry in self.stats.iter() {
             let proto = entry.key();
             let stat = entry.value();
@@ -196,34 +207,49 @@ impl BandwidthTracker {
                 .map(|t| t.clone())
                 .unwrap_or_default();
 
-            let total_bytes = stat.bytes_in.load(Ordering::Relaxed)
+            let current_bytes = stat.bytes_in.load(Ordering::Relaxed)
                 + stat.bytes_out.load(Ordering::Relaxed);
             let active = stat.active_connections.load(Ordering::Relaxed);
 
-            if total_bytes >= threshold.bandwidth_bps_critical {
+            // Compute bytes-per-second rate since last check
+            let last_bytes = stat.last_check_bytes.load(Ordering::Relaxed);
+            let last_time = stat.last_check_time.load(Ordering::Relaxed);
+            let bps = if last_time > 0 && now > last_time {
+                let delta_bytes = current_bytes.saturating_sub(last_bytes);
+                let delta_secs = (now - last_time) as f64 / 1000.0;
+                (delta_bytes as f64 / delta_secs) as u64
+            } else {
+                0
+            };
+
+            // Update last-check snapshot
+            stat.last_check_bytes.store(current_bytes, Ordering::Relaxed);
+            stat.last_check_time.store(now, Ordering::Relaxed);
+
+            if bps >= threshold.bandwidth_bps_critical {
                 alerts.push(BandwidthAlert {
                     protocol: proto.clone(),
                     level: AlertLevel::Critical,
                     message: format!(
-                        "{} cumulative traffic {:.1} GiB exceeds critical threshold",
+                        "{} traffic {:.1} MiB/s exceeds critical threshold",
                         proto,
-                        total_bytes as f64 / (1024.0 * 1024.0 * 1024.0)
+                        bps as f64 / (1024.0 * 1024.0)
                     ),
                     metric: "bandwidth".to_string(),
-                    value: total_bytes as f64,
+                    value: bps as f64,
                     threshold: threshold.bandwidth_bps_critical as f64,
                 });
-            } else if total_bytes >= threshold.bandwidth_bps_warn {
+            } else if bps >= threshold.bandwidth_bps_warn {
                 alerts.push(BandwidthAlert {
                     protocol: proto.clone(),
                     level: AlertLevel::Warning,
                     message: format!(
-                        "{} cumulative traffic {:.1} MiB exceeds warning threshold",
+                        "{} traffic {:.1} MiB/s exceeds warning threshold",
                         proto,
-                        total_bytes as f64 / (1024.0 * 1024.0)
+                        bps as f64 / (1024.0 * 1024.0)
                     ),
                     metric: "bandwidth".to_string(),
-                    value: total_bytes as f64,
+                    value: bps as f64,
                     threshold: threshold.bandwidth_bps_warn as f64,
                 });
             }
@@ -348,8 +374,7 @@ mod tests {
     #[test]
     fn test_no_alerts_below_thresholds() {
         let tracker = BandwidthTracker::new();
-        // Small traffic — should not trigger
-        tracker.protocol("http1").add_in(1024);
+        // First check establishes baseline — should not trigger
         let alerts = tracker.check_thresholds();
         assert!(alerts.is_empty(), "Unexpected alerts: {:?}", alerts);
     }
@@ -357,17 +382,26 @@ mod tests {
     #[test]
     fn test_bandwidth_warning_alert() {
         let tracker = BandwidthTracker::new();
-        // Set a low warning threshold to trigger
         tracker.set_threshold("tcp", ProtocolThreshold {
             bandwidth_bps_warn: 100,
             bandwidth_bps_critical: 1_000_000,
             connections_warn: 999_999,
             connections_critical: 9_999_999,
         });
-        tracker.protocol("tcp").add_in(200);
+        let p = tracker.protocol("tcp");
+        // Seed last-check state to 1 second ago with 0 bytes
+        let one_sec_ago = std::time::SystemTime::now()
+            .checked_sub(std::time::Duration::from_secs(1))
+            .unwrap()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        p.last_check_bytes.store(0, Ordering::Relaxed);
+        p.last_check_time.store(one_sec_ago, Ordering::Relaxed);
+        p.add_in(200); // 200 B/s > 100 B/s warn threshold
         let alerts = tracker.check_thresholds();
         let tcp_alert = alerts.iter().find(|a| a.protocol == "tcp" && a.metric == "bandwidth");
-        assert!(tcp_alert.is_some());
+        assert!(tcp_alert.is_some(), "Expected bandwidth warning alert");
         assert_eq!(tcp_alert.unwrap().level, AlertLevel::Warning);
     }
 
@@ -380,10 +414,49 @@ mod tests {
             connections_warn: 999_999,
             connections_critical: 9_999_999,
         });
-        tracker.protocol("udp").add_out(600);
+        let p = tracker.protocol("udp");
+        let one_sec_ago = std::time::SystemTime::now()
+            .checked_sub(std::time::Duration::from_secs(1))
+            .unwrap()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        p.last_check_bytes.store(0, Ordering::Relaxed);
+        p.last_check_time.store(one_sec_ago, Ordering::Relaxed);
+        p.add_out(600); // 600 B/s > 500 B/s critical threshold
         let alerts = tracker.check_thresholds();
         let a = alerts.iter().find(|a| a.protocol == "udp" && a.level == AlertLevel::Critical);
-        assert!(a.is_some());
+        assert!(a.is_some(), "Expected bandwidth critical alert");
+    }
+
+    #[test]
+    fn test_bandwidth_threshold_rate_not_cumulative() {
+        let tracker = BandwidthTracker::new();
+        tracker.set_threshold("http1", ProtocolThreshold {
+            bandwidth_bps_warn: 1_000_000, // 1 MiB/s
+            bandwidth_bps_critical: 5_000_000,
+            connections_warn: 999_999,
+            connections_critical: 9_999_999,
+        });
+        let p = tracker.protocol("http1");
+        // Simulate a huge cumulative total with a very old baseline
+        let ten_min_ago = std::time::SystemTime::now()
+            .checked_sub(std::time::Duration::from_secs(600))
+            .unwrap()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        p.last_check_bytes.store(0, Ordering::Relaxed);
+        p.last_check_time.store(ten_min_ago, Ordering::Relaxed);
+        p.add_in(10 * 1024 * 1024); // 10 MiB over 10 min = ~17 KiB/s
+        let alerts = tracker.check_thresholds();
+        // Should NOT alert because rate (17 KiB/s) is well below 1 MiB/s threshold
+        let bw_alert = alerts.iter().find(|a| a.protocol == "http1" && a.metric == "bandwidth");
+        assert!(
+            bw_alert.is_none(),
+            "Rate-based check should not alert on low rate: {:?}",
+            bw_alert
+        );
     }
 
     #[test]

@@ -49,52 +49,98 @@ pub struct KeyvalStore {
 
 impl KeyvalStore {
     /// Create a new store. `default_ttl_secs = 0` disables TTL by default.
+    ///
+    /// Call `spawn_background_tasks()` after construction to start the periodic
+    /// eviction sweep and Redis pubsub listener (requires a Tokio runtime).
     pub fn new(default_ttl_secs: u64, redis_client: Option<redis::Client>) -> Arc<Self> {
         let default_ttl = if default_ttl_secs > 0 {
             Some(Duration::from_secs(default_ttl_secs))
         } else {
             None
         };
-        let store = Arc::new(Self {
+        Arc::new(Self {
             inner: Arc::new(DashMap::new()),
             default_ttl,
             redis_client: redis_client.clone(),
-        });
+        })
+    }
 
-        if let Some(client) = redis_client {
-            let store_clone = Arc::clone(&store);
+    /// Spawn background tasks: periodic eviction sweep (60s) and Redis pubsub
+    /// listener for cross-node sync. Requires a running Tokio runtime.
+    pub fn spawn_background_tasks(self: &Arc<Self>) {
+        self.spawn_eviction_sweep(Duration::from_secs(60));
+        self.spawn_redis_listener();
+    }
+
+    /// Spawn the periodic eviction sweep with the given interval.
+    ///
+    /// Each tick calls `evict_expired()`, which acquires per-shard locks
+    /// via `DashMap::retain`. The lock is held only for the duration of
+    /// the retain and never across an await point.
+    fn spawn_eviction_sweep(self: &Arc<Self>, interval_dur: Duration) {
+        let sweep_store = Arc::clone(self);
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(interval_dur);
+            loop {
+                interval.tick().await;
+                sweep_store.evict_expired();
+            }
+        });
+    }
+
+    /// Spawn the Redis pubsub listener for cross-node keyval sync.
+    ///
+    /// Wraps the pubsub subscription in a reconnection loop with capped
+    /// exponential backoff so transient Redis failures (restart, network
+    /// blip) don't permanently desync the store from the cluster.
+    fn spawn_redis_listener(self: &Arc<Self>) {
+        if let Some(client) = &self.redis_client {
+            let store_clone = Arc::clone(self);
+            let client = client.clone();
             tokio::spawn(async move {
-                if let Ok(mut pubsub) = client.get_async_pubsub().await {
-                    if pubsub.subscribe("phalanx:keyval:sync").await.is_ok() {
-                        let mut stream = pubsub.on_message();
-                        use futures_util::StreamExt;
-                        while let Some(msg) = stream.next().await {
-                            if let Ok(payload) = msg.get_payload::<String>() {
-                                // Simple text protocol: `SET:key:ttl_secs:value` or `DEL:key`
-                                if let Some((cmd, rest)) = payload.split_once(':') {
-                                    match cmd {
-                                        "SET" => {
-                                            if let Some((key, val_ttl)) = rest.split_once(':') {
-                                                if let Some((ttl_str, value)) = val_ttl.split_once(':') {
-                                                    let ttl = if ttl_str.is_empty() { None } else { ttl_str.parse().ok() };
-                                                    store_clone.set_local(key.to_string(), value.to_string(), ttl);
+                const BASE_MS: u64 = 100;
+                const MAX_MS: u64 = 30_000;
+                let mut backoff_ms: u64 = 0;
+                loop {
+                    match client.get_async_pubsub().await {
+                        Ok(mut pubsub) => {
+                            if pubsub.subscribe("phalanx:keyval:sync").await.is_ok() {
+                                // Connection established — reset backoff.
+                                backoff_ms = 0;
+                                let mut stream = pubsub.on_message();
+                                use futures_util::StreamExt;
+                                while let Some(msg) = stream.next().await {
+                                    if let Ok(payload) = msg.get_payload::<String>() {
+                                        if let Some((cmd, rest)) = payload.split_once(':') {
+                                            match cmd {
+                                                "SET" => {
+                                                    if let Some((key, val_ttl)) = rest.split_once(':') {
+                                                        if let Some((ttl_str, value)) = val_ttl.split_once(':') {
+                                                            let ttl = if ttl_str.is_empty() { None } else { ttl_str.parse().ok() };
+                                                            store_clone.set_local(key.to_string(), value.to_string(), ttl);
+                                                        }
+                                                    }
                                                 }
+                                                "DEL" => {
+                                                    store_clone.delete_local(rest);
+                                                }
+                                                _ => {}
                                             }
                                         }
-                                        "DEL" => {
-                                            store_clone.delete_local(rest);
-                                        }
-                                        _ => {}
                                     }
                                 }
                             }
+                            // Stream ended — connection dropped.
+                        }
+                        Err(_) => {
+                            // Could not connect.
                         }
                     }
+                    backoff_ms = next_backoff(backoff_ms, BASE_MS, MAX_MS);
+                    tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
                 }
             });
         }
-
-        store
     }
 
     /// Get a value by key. Returns `None` if absent or expired.
@@ -102,7 +148,10 @@ impl KeyvalStore {
         let entry = self.inner.get(key)?;
         if entry.is_expired() {
             drop(entry);
-            self.inner.remove(key);
+            // `remove_if` checks expiry atomically within the shard lock,
+            // preventing a TOCTOU race where another thread inserts a fresh
+            // entry between our expiry check and a blind `remove()`.
+            self.inner.remove_if(key, |_, v| v.is_expired());
             return None;
         }
         Some(entry.value.clone())
@@ -175,7 +224,21 @@ impl KeyvalStore {
     pub fn contains(&self, key: &str) -> bool {
         self.get(key).is_some()
     }
+}
 
+// ─── Backoff helper ──────────────────────────────────────────────────────────
+
+/// Compute the next reconnect backoff: double, capped at `max`.
+/// Resets to `base` on a successful (zero) connection.
+fn next_backoff(current_ms: u64, base_ms: u64, max_ms: u64) -> u64 {
+    if current_ms == 0 {
+        base_ms
+    } else {
+        (current_ms * 2).min(max_ms)
+    }
+}
+
+impl KeyvalStore {
     /// Remove all expired entries. Call periodically to prevent unbounded growth.
     pub fn evict_expired(&self) {
         let now = Instant::now();
@@ -301,5 +364,83 @@ mod tests {
         store.set("x".into(), "first".into(), None);
         store.set("x".into(), "second".into(), None);
         assert_eq!(store.get("x"), Some("second".to_string()));
+    }
+
+    /// `remove_if` must not delete a fresh entry inserted by another thread
+    /// between our expiry read and the conditional remove.
+    #[tokio::test]
+    async fn test_get_expired_remove_if_does_not_delete_fresh_entry() {
+        let store = KeyvalStore::new(0, None);
+
+        // Set an expired entry, then immediately overwrite with a fresh one.
+        store.set_local("key".into(), "expired".into(), Some(0));
+        std::thread::sleep(Duration::from_millis(10));
+        store.set_local("key".into(), "fresh".into(), Some(3600));
+
+        // get() must return the fresh value and leave it intact.
+        assert_eq!(store.get("key"), Some("fresh".to_string()));
+        assert_eq!(store.get("key"), Some("fresh".to_string()));
+    }
+
+    #[test]
+    fn test_next_backoff() {
+        // Reset to base on clean connection.
+        assert_eq!(next_backoff(0, 100, 30_000), 100);
+        // Double on failure.
+        assert_eq!(next_backoff(100, 100, 30_000), 200);
+        assert_eq!(next_backoff(200, 100, 30_000), 400);
+        // Cap at max.
+        assert_eq!(next_backoff(16_000, 100, 30_000), 30_000);
+        assert_eq!(next_backoff(30_000, 100, 30_000), 30_000);
+    }
+
+    /// The background eviction sweep must purge expired entries without
+    /// any explicit reads or manual calls to evict_expired().
+    #[tokio::test]
+    async fn test_background_eviction_sweep() {
+        let store = KeyvalStore::new(0, None);
+
+        // Insert an entry that expires within the sweep window.
+        store.set_local("ephemeral".into(), "val".into(), Some(0));
+        std::thread::sleep(Duration::from_millis(5));
+
+        // Start a fast sweep (50ms) and wait for it to fire.
+        store.spawn_eviction_sweep(Duration::from_millis(50));
+        tokio::time::sleep(Duration::from_millis(120)).await;
+
+        assert_eq!(store.get("ephemeral"), None);
+        assert_eq!(store.inner.len(), 0);
+    }
+
+    /// Concurrent get() on an expired key must not wipe a fresh entry
+    /// inserted by a racing writer.
+    #[tokio::test]
+    async fn test_get_toc_tou_race() {
+        let store = KeyvalStore::new(0, None);
+
+        store.set_local("shared".into(), "expiring".into(), Some(0));
+        std::thread::sleep(Duration::from_millis(10));
+
+        let store_a = store.clone();
+        let store_b = store.clone();
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+        let b1 = barrier.clone();
+        let b2 = barrier.clone();
+
+        let t_a = std::thread::spawn(move || {
+            b1.wait();
+            store_a.get("shared")
+        });
+
+        let t_b = std::thread::spawn(move || {
+            b2.wait();
+            store_b.set_local("shared".into(), "fresh".into(), Some(3600));
+        });
+
+        t_a.join().unwrap();
+        t_b.join().unwrap();
+
+        // The fresh entry must survive the race.
+        assert_eq!(store.get("shared"), Some("fresh".to_string()));
     }
 }

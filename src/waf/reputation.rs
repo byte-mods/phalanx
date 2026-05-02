@@ -16,7 +16,7 @@ use std::time::Instant;
 /// `ban_duration_secs` elapse since the last strike.
 pub struct IpReputationManager {
     /// Tracks (strike_count, last_strike_time) for each IP Address
-    strikes: DashMap<String, (u32, Instant)>,
+    strikes: Arc<DashMap<String, (u32, Instant)>>,
     /// Threshold of strikes before an auto-ban is enacted
     ban_threshold: u32,
     /// How long a ban lasts (in seconds) before the IP is automatically unbanned
@@ -37,7 +37,7 @@ impl IpReputationManager {
     /// and the optional background Pub/Sub task.
     pub fn new(ban_threshold: u32, ban_duration_secs: u64, redis_client: Option<redis::Client>) -> Arc<Self> {
         let mgr = Arc::new(Self {
-            strikes: DashMap::new(),
+            strikes: Arc::new(DashMap::new()),
             ban_threshold,
             ban_duration_secs,
             redis_client: redis_client.clone(),
@@ -173,6 +173,24 @@ impl IpReputationManager {
             .collect();
         result.sort_by(|a, b| b.1.cmp(&a.1));
         result
+    }
+
+    /// Spawns a background sweeper that periodically evicts expired strikes
+    /// to prevent unbounded memory growth from IPs that never return.
+    pub fn spawn_sweeper(self: &Arc<Self>) {
+        let strikes = Arc::clone(&self.strikes);
+        let ban_duration_secs = self.ban_duration_secs;
+        let Ok(handle) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        handle.spawn(async move {
+            loop {
+                tokio::time::sleep(std::time::Duration::from_secs(120)).await;
+                strikes.retain(|_ip, (_count, last_time)| {
+                    last_time.elapsed().as_secs() < ban_duration_secs * 2
+                });
+            }
+        });
     }
 }
 

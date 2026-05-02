@@ -86,7 +86,8 @@ pub struct MlEvent {
 pub struct MlFraudEngine {
     /// Channel sender for queuing events to the background worker.
     /// `None` until `load_model()` is called.
-    tx: std::sync::RwLock<Option<mpsc::Sender<MlEvent>>>,
+    /// Uses ArcSwap for lock-free reads on the request hot path.
+    tx: ArcSwap<Option<mpsc::Sender<MlEvent>>>,
     /// Current operational mode (Shadow or Active), atomically swappable at runtime.
     pub mode: Arc<ArcSwap<MlFraudMode>>,
     /// Rolling log of the last 100 inference results for the admin dashboard.
@@ -100,7 +101,7 @@ impl MlFraudEngine {
     /// Creates a new uninitialized ML engine (no model loaded yet).
     pub fn new() -> Self {
         Self {
-            tx: std::sync::RwLock::new(None),
+            tx: ArcSwap::from_pointee(None),
             mode: Arc::new(ArcSwap::from_pointee(MlFraudMode::Shadow)),
             logs: Arc::new(RwLock::new(VecDeque::with_capacity(100))),
             model_loaded: Arc::new(AtomicBool::new(false)),
@@ -125,9 +126,7 @@ impl MlFraudEngine {
         let model_path_v = model_path.to_string();
 
         let (tx, mut rx) = mpsc::channel::<MlEvent>(10_000);
-        if let Ok(mut guard) = self.tx.write() {
-            *guard = Some(tx);
-        }
+        self.tx.store(Arc::new(Some(tx)));
 
         let mode_ref = Arc::clone(&self.mode);
         let logs_ref = Arc::clone(&self.logs);
@@ -256,12 +255,11 @@ impl MlFraudEngine {
         });
     }
 
-    /// Queues a request for background asynchronous fraud evaluation
+    /// Queues a request for background asynchronous fraud evaluation.
+    /// Uses ArcSwap::load() for lock-free access on the request hot path.
     pub fn queue_inspection(&self, event: MlEvent) {
-        if let Ok(guard) = self.tx.read() {
-            if let Some(tx) = guard.as_ref() {
-                let _ = tx.try_send(event); // drop if channel full to prevent OOM
-            }
+        if let Some(tx) = self.tx.load().as_ref() {
+            let _ = tx.try_send(event); // drop if channel full to prevent OOM
         }
     }
 }

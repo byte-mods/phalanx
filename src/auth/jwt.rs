@@ -50,8 +50,26 @@ pub fn check(headers: &HeaderMap, secret: &str, algorithm: &str) -> (AuthResult,
         }
     };
 
-    let algo = parse_algorithm(algorithm);
-    let key = DecodingKey::from_secret(secret.as_bytes());
+    let algo = match parse_algorithm(algorithm) {
+        Ok(a) => a,
+        Err(e) => {
+            tracing::error!("JWT algorithm configuration error: {}", e);
+            return (
+                AuthResult::Denied(StatusCode::UNAUTHORIZED, "JWT configuration error"),
+                None,
+            );
+        }
+    };
+    let key = match decoding_key_from_secret(secret, algo) {
+        Ok(k) => k,
+        Err(e) => {
+            tracing::error!("JWT key material misconfigured for algorithm {:?}: {}", algo, e);
+            return (
+                AuthResult::Denied(StatusCode::UNAUTHORIZED, "JWT configuration error"),
+                None,
+            );
+        }
+    };
     let mut validation = Validation::new(algo);
     // Disable audience validation by default (configurable in future)
     validation.validate_aud = false;
@@ -77,22 +95,50 @@ pub fn extract_bearer_token(headers: &HeaderMap) -> Option<&str> {
     value.strip_prefix("Bearer ").map(str::trim)
 }
 
-/// Parse an algorithm name string into a `jsonwebtoken::Algorithm`.
-/// Falls back to HS256 for unrecognised values.
-fn parse_algorithm(algorithm: &str) -> Algorithm {
-    match algorithm.to_uppercase().as_str() {
-        "HS256" => Algorithm::HS256,
-        "HS384" => Algorithm::HS384,
-        "HS512" => Algorithm::HS512,
-        "RS256" => Algorithm::RS256,
-        "RS384" => Algorithm::RS384,
-        "RS512" => Algorithm::RS512,
-        "ES256" => Algorithm::ES256,
-        "ES384" => Algorithm::ES384,
-        _ => {
-            tracing::warn!("Unknown JWT algorithm '{}', defaulting to HS256", algorithm);
-            Algorithm::HS256
+/// Build a `DecodingKey` appropriate for the configured algorithm.
+///
+/// HMAC algorithms use `from_secret`; RSA uses `from_rsa_pem`;
+/// ECDSA uses `from_ec_pem`. If the PEM is malformed for an asymmetric
+/// algorithm, the function returns `Err` so the caller can deny all tokens
+/// (instead of silently falling back to HMAC which would always fail).
+fn decoding_key_from_secret(
+    secret: &str,
+    algo: Algorithm,
+) -> Result<DecodingKey, jsonwebtoken::errors::Error> {
+    match algo {
+        Algorithm::HS256 | Algorithm::HS384 | Algorithm::HS512 => {
+            Ok(DecodingKey::from_secret(secret.as_bytes()))
         }
+        Algorithm::RS256 | Algorithm::RS384 | Algorithm::RS512 => {
+            DecodingKey::from_rsa_pem(secret.as_bytes())
+        }
+        Algorithm::ES256 | Algorithm::ES384 => {
+            DecodingKey::from_ec_pem(secret.as_bytes())
+        }
+        Algorithm::EdDSA => {
+            DecodingKey::from_ed_pem(secret.as_bytes())
+        }
+        _ => Err(jsonwebtoken::errors::Error::from(
+            jsonwebtoken::errors::ErrorKind::InvalidAlgorithm,
+        )),
+    }
+}
+
+/// Parse an algorithm name string into a `jsonwebtoken::Algorithm`.
+///
+/// Returns `Err` for unrecognised algorithm strings instead of silently
+/// falling back — a typo like `RS265` must be surfaced, not treated as HMAC.
+fn parse_algorithm(algorithm: &str) -> Result<Algorithm, String> {
+    match algorithm.to_uppercase().as_str() {
+        "HS256" => Ok(Algorithm::HS256),
+        "HS384" => Ok(Algorithm::HS384),
+        "HS512" => Ok(Algorithm::HS512),
+        "RS256" => Ok(Algorithm::RS256),
+        "RS384" => Ok(Algorithm::RS384),
+        "RS512" => Ok(Algorithm::RS512),
+        "ES256" => Ok(Algorithm::ES256),
+        "ES384" => Ok(Algorithm::ES384),
+        _ => Err(format!("Unknown or unsupported JWT algorithm: '{}'", algorithm)),
     }
 }
 
@@ -217,12 +263,20 @@ mod tests {
     }
 
     #[test]
-    fn test_algorithm_fallback_to_hs256() {
-        assert!(matches!(parse_algorithm("BOGUS"), Algorithm::HS256));
+    fn test_unknown_algorithm_returns_error() {
+        assert!(parse_algorithm("BOGUS").is_err());
+        assert!(parse_algorithm("RS265").is_err());
     }
 
     #[test]
     fn test_hs512_algorithm_parsed() {
-        assert!(matches!(parse_algorithm("HS512"), Algorithm::HS512));
+        assert!(matches!(parse_algorithm("HS512"), Ok(Algorithm::HS512)));
+    }
+
+    #[test]
+    fn test_all_valid_algorithms_parsed() {
+        for alg in &["HS256", "HS384", "HS512", "RS256", "RS384", "RS512", "ES256", "ES384"] {
+            assert!(parse_algorithm(alg).is_ok(), "algorithm {} should parse", alg);
+        }
     }
 }

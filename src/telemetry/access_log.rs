@@ -99,17 +99,20 @@ impl AccessLogEntry {
     }
 }
 
-/// Async access log writer that receives log entries via a channel
+/// Maximum number of pending log entries before new entries are dropped.
+const LOG_CHANNEL_CAPACITY: usize = 10_000;
+
+/// Async access log writer that receives log entries via a bounded channel
 /// and appends them to a log file in the configured format.
 pub struct AccessLogger {
-    sender: mpsc::UnboundedSender<AccessLogEntry>,
+    sender: mpsc::Sender<AccessLogEntry>,
 }
 
 impl AccessLogger {
     /// Initializes the access logger with an async file writer.
     /// Creates the log directory if it doesn't exist.
     pub fn new(log_path: &str, format: LogFormat) -> Self {
-        let (sender, mut receiver) = mpsc::unbounded_channel::<AccessLogEntry>();
+        let (sender, mut receiver) = mpsc::channel::<AccessLogEntry>(LOG_CHANNEL_CAPACITY);
         let path = log_path.to_string();
 
         tokio::spawn(async move {
@@ -211,8 +214,9 @@ impl AccessLogger {
     }
 
     /// Non-blocking log entry submission. Returns immediately.
+    /// Drops the entry silently if the channel is full (backpressure).
     pub fn log(&self, entry: AccessLogEntry) {
-        let _ = self.sender.send(entry);
+        let _ = self.sender.try_send(entry);
     }
 }
 

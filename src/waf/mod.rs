@@ -194,6 +194,7 @@ impl WafEngine {
         ip: &str,
         path: &str,
         query: Option<&str>,
+        headers: &std::collections::HashMap<String, String>,
         user_agent: Option<&str>,
     ) -> WafAction {
         if !self.enabled {
@@ -217,17 +218,48 @@ impl WafEngine {
         // Load rules snapshot once for this inspection (lock-free via ArcSwap)
         let rules = self.rules.load();
 
-        // 2. Bot Protection (User-Agent)
+        // 2. Bot Protection (User-Agent) — two-tier classification
+        // Tier 1: regex pre-check against known attack-tool signatures (zero-alloc, fast DFA).
+        // Tier 2: classify_user_agent for tiered GoodBot/BadBot/Unknown/Human decisions.
+        // Empty/missing UA is not an automatic block — health checks and internal
+        // services often omit it. It accumulates 1 reputation strike for monitoring.
         if let Some(ua) = user_agent {
             if rules.is_malicious_bot(ua) {
                 warn!("WAF Blocked: Malicious Bot User-Agent from {}: {}", ip, ua);
                 self.reputation.add_strike(ip, 5);
                 return WafAction::Block("Malicious Bot Detected".to_string());
             }
+        }
+
+        // Tiered bot classification (GoodBot / BadBot / Unknown / Human)
+        // Falls through to this if the regex quick-check above didn't block.
+        if let Some(ua) = user_agent {
+            if ua.trim().is_empty() {
+                // Explicitly empty UA is as suspicious as a missing one
+                debug!("WAF: Empty User-Agent string from {}", ip);
+                self.reputation.add_strike(ip, 1);
+            } else {
+                match bot::classify_user_agent(ua) {
+                    bot::BotClass::BadBot => {
+                        warn!("WAF Blocked: BadBot classification for {}: {}", ip, ua);
+                        self.reputation.add_strike(ip, 4);
+                        return WafAction::Block("Bad Bot Detected".to_string());
+                    }
+                    bot::BotClass::GoodBot => {
+                        debug!("WAF Allowed: GoodBot from {}: {}", ip, ua);
+                    }
+                    bot::BotClass::Unknown => {
+                        debug!("WAF: Unknown bot UA from {}: {}", ip, ua);
+                        self.reputation.add_strike(ip, 1);
+                    }
+                    bot::BotClass::Human => {}
+                }
+            }
         } else {
-            debug!("WAF Blocked: Empty User-Agent from {}", ip);
+            // Missing User-Agent: suspicious but not an automatic block.
+            // Legitimate health checks and internal services often omit UA.
+            debug!("WAF: Missing User-Agent from {}", ip);
             self.reputation.add_strike(ip, 1);
-            return WafAction::Block("Empty User-Agent".to_string());
         }
 
         // 3. Path & Query Inspection (OWASP Top 10)
@@ -248,8 +280,9 @@ impl WafEngine {
         }
 
         // 4. Declarative Policy Engine (NGINX App Protect-style custom rules)
+        // Policy engine accepts &HashMap directly — no per-request Vec allocation
         let policy = self.policy_engine.load();
-        let policy_violations = policy.evaluate(None, path, query, &[], None);
+        let policy_violations = policy.evaluate(None, path, query, headers, None);
         for v in &policy_violations {
             if matches!(v.action, policy::RuleAction::Block) {
                 warn!(
@@ -265,7 +298,7 @@ impl WafEngine {
     }
 
     /// Inspects the request body (POST/PUT/PATCH payloads) for malicious content.
-    pub fn inspect_body(&self, ip: &str, body: &str) -> WafAction {
+    pub fn inspect_body(&self, ip: &str, body: &str, path: &str, query: Option<&str>) -> WafAction {
         if !self.enabled {
             return WafAction::Allow;
         }
@@ -284,6 +317,20 @@ impl WafEngine {
             return WafAction::Block(format!("WAF Body Rule: {}", violation));
         }
 
+        // Also run the declarative policy engine against the body
+        let policy = self.policy_engine.load();
+        let policy_violations = policy.evaluate(None, path, query, &std::collections::HashMap::new(), Some(body));
+        for v in &policy_violations {
+            if matches!(v.action, policy::RuleAction::Block) {
+                warn!(
+                    "WAF Policy Body Blocked: rule {} '{}' matched for {}",
+                    v.rule_id, v.description, ip
+                );
+                self.reputation.add_strike(ip, 2);
+                return WafAction::Block(format!("Policy Body Rule {}: {}", v.rule_id, v.category));
+            }
+        }
+
         WafAction::Allow
     }
 }
@@ -299,7 +346,8 @@ mod tests {
         // Reload should atomically swap rules without errors
         waf.reload_rules();
         // Verify inspection still works after reload
-        let result = waf.inspect("1.2.3.4", "/safe", None, Some("Mozilla/5.0"));
+        let empty_headers = std::collections::HashMap::new();
+        let result = waf.inspect("1.2.3.4", "/safe", None, &empty_headers, Some("Mozilla/5.0"));
         assert_eq!(result, WafAction::Allow);
     }
 
@@ -310,7 +358,88 @@ mod tests {
         // Reload with missing file should log warning, not panic
         waf.reload_policy("/nonexistent/policy.json");
         // Engine should still work
-        let result = waf.inspect("1.2.3.4", "/safe", None, Some("Mozilla/5.0"));
+        let empty_headers = std::collections::HashMap::new();
+        let result = waf.inspect("1.2.3.4", "/safe", None, &empty_headers, Some("Mozilla/5.0"));
         assert_eq!(result, WafAction::Allow);
+    }
+
+    #[test]
+    fn test_waf_bot_classification_bad_bot_blocked() {
+        let reputation = IpReputationManager::new(100, 60, None);
+        let waf = WafEngine::new(true, reputation.clone());
+        let empty_headers = std::collections::HashMap::new();
+        // sqlmap is classified as BadBot by classify_user_agent
+        let result = waf.inspect("1.2.3.4", "/safe", None, &empty_headers, Some("sqlmap/1.0"));
+        assert!(matches!(result, WafAction::Block(_)));
+    }
+
+    #[test]
+    fn test_waf_bot_classification_badbot_not_in_regex_set() {
+        let reputation = IpReputationManager::new(100, 60, None);
+        let waf = WafEngine::new(true, reputation);
+        let empty_headers = std::collections::HashMap::new();
+        // "burpsuite" is in classify_user_agent's BAD_BOTS but NOT in the regex bot_ua_set
+        let result = waf.inspect("1.2.3.4", "/safe", None, &empty_headers, Some("burpsuite/2024.1"));
+        assert!(matches!(result, WafAction::Block(_)));
+    }
+
+    #[test]
+    fn test_waf_bot_classification_good_bot_allowed() {
+        let reputation = IpReputationManager::new(100, 60, None);
+        let waf = WafEngine::new(true, reputation);
+        let empty_headers = std::collections::HashMap::new();
+        // Googlebot is classified as GoodBot
+        let result = waf.inspect("1.2.3.4", "/safe", None, &empty_headers, Some("Googlebot/2.1"));
+        assert_eq!(result, WafAction::Allow);
+    }
+
+    #[test]
+    fn test_waf_bot_classification_unknown_allowed_with_strike() {
+        let reputation = IpReputationManager::new(100, 60, None);
+        let waf = WafEngine::new(true, reputation.clone());
+        let empty_headers = std::collections::HashMap::new();
+        // curl is classified as Unknown — should be allowed but accumulate strikes
+        let result = waf.inspect("1.2.3.4", "/safe", None, &empty_headers, Some("curl/8.4.0"));
+        assert_eq!(result, WafAction::Allow);
+        assert_eq!(reputation.get_strikes("1.2.3.4"), 1);
+    }
+
+    #[test]
+    fn test_waf_empty_user_agent_not_blocked() {
+        let reputation = IpReputationManager::new(100, 60, None);
+        let waf = WafEngine::new(true, reputation.clone());
+        let empty_headers = std::collections::HashMap::new();
+        // Empty UA should not block (health checks, internal services)
+        let result = waf.inspect("1.2.3.4", "/health", None, &empty_headers, None);
+        assert_eq!(result, WafAction::Allow);
+        // Still accumulates strikes for suspicious behavior
+        assert_eq!(reputation.get_strikes("1.2.3.4"), 1);
+    }
+
+    #[test]
+    fn test_waf_blank_user_agent_string_allowed_with_strike() {
+        let reputation = IpReputationManager::new(100, 60, None);
+        let waf = WafEngine::new(true, reputation.clone());
+        let empty_headers = std::collections::HashMap::new();
+        // Explicitly empty UA string "   " treated same as None
+        let result = waf.inspect("1.2.3.4", "/health", None, &empty_headers, Some("   "));
+        assert_eq!(result, WafAction::Allow);
+        assert_eq!(reputation.get_strikes("1.2.3.4"), 1);
+    }
+
+    #[test]
+    fn test_waf_bot_human_ua_allowed_no_strike() {
+        let reputation = IpReputationManager::new(100, 60, None);
+        let waf = WafEngine::new(true, reputation.clone());
+        let empty_headers = std::collections::HashMap::new();
+        let result = waf.inspect(
+            "1.2.3.4",
+            "/safe",
+            None,
+            &empty_headers,
+            Some("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36"),
+        );
+        assert_eq!(result, WafAction::Allow);
+        assert_eq!(reputation.get_strikes("1.2.3.4"), 0);
     }
 }

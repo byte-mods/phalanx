@@ -1,29 +1,23 @@
-# Build artifacts
-/target/
-/data/
-# rustc spills long generic type names here when building with deep generics
-ai_load_balancer.long-type-*.txt
 
-# Knowledge-graph build output (regenerated via /graphify)
-# Match in any directory — earlier runs accidentally created these under
-# src/graphify-out/ because the python script's CWD wasn't always the repo root.
-graphify-out/
-
-# Logs
-/logs/
-
-# IDE
+__pycache__/
+.claude/state/
+.DS_Store
 .idea/
 .vscode/
-*.swp
-*.swo
-
-# macOS
-.DS_Store
-
-# Node (test helper)
-node_modules/
-
-# Python (test scripts)
-__pycache__/
 *.pyc
+*.swo
+*.swp
+/data/
+/logs/
+/target/
+# Build artifacts
+# IDE
+# Logs
+# macOS
+# Node (test helper)
+# Python (test scripts)
+# rustc spills long generic type names here when building with deep generics
+ai_load_balancer.long-type-*.txt
+node_modules/
+.lens/
+*.md

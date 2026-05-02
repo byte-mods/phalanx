@@ -12,6 +12,7 @@ use std::sync::Arc;
 use std::time::Instant;
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
+use tokio::sync::Semaphore;
 
 /// A geographic data center (point of presence).
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -158,8 +159,8 @@ pub struct GslbRouter {
     data_centers: Arc<RwLock<Vec<DataCenter>>>,
     /// Health status per DC
     health: Arc<RwLock<HashMap<String, DcHealthStatus>>>,
-    /// Routing policy
-    policy: GslbPolicy,
+    /// Routing policy (lock-free reads, mutable via &self on reload)
+    policy: RwLock<GslbPolicy>,
     /// Maximum latency (ms) before a DC is considered unhealthy
     max_latency_ms: f64,
     /// Max consecutive failures before marking DC down
@@ -179,7 +180,7 @@ impl GslbRouter {
         Self {
             data_centers: Arc::new(RwLock::new(Vec::new())),
             health: Arc::new(RwLock::new(HashMap::new())),
-            policy,
+            policy: RwLock::new(policy),
             max_latency_ms,
             max_failures,
             rr_counter: Arc::new(std::sync::atomic::AtomicU64::new(0)),
@@ -212,7 +213,10 @@ impl GslbRouter {
     }
 
     /// Updates health status for a data center.
+    /// NaN latency values are sanitized to `f64::MAX` so they never pass
+    /// the `max_latency_ms` check — a DC reporting NaN is always unhealthy.
     pub fn update_health(&self, dc_id: &str, healthy: bool, latency_ms: f64) {
+        let latency_ms = if latency_ms.is_nan() { f64::MAX } else { latency_ms };
         let mut health = self.health.write();
         if let Some(status) = health.get_mut(dc_id) {
             status.healthy = healthy && latency_ms <= self.max_latency_ms;
@@ -231,7 +235,7 @@ impl GslbRouter {
 
     /// Routes a client to the best data center based on their country code.
     pub fn route(&self, country_code: &str) -> Option<String> {
-        match self.policy {
+        match *self.policy.read() {
             GslbPolicy::Geographic => self.route_geographic(country_code),
             GslbPolicy::LatencyBased => self.route_latency_based(),
             GslbPolicy::WeightedRoundRobin => self.route_weighted_rr(),
@@ -283,6 +287,8 @@ impl GslbRouter {
     }
 
     /// Latency-based routing: pick the DC with lowest latency.
+    /// NaN values are treated as effectively infinite so they never win
+    /// the minimum comparison.
     fn route_latency_based(&self) -> Option<String> {
         let dcs = self.data_centers.read();
         let health = self.health.read();
@@ -294,6 +300,8 @@ impl GslbRouter {
             .min_by(|a, b| {
                 let la = health.get(&a.id).map(|s| s.latency_ms).unwrap_or(f64::MAX);
                 let lb = health.get(&b.id).map(|s| s.latency_ms).unwrap_or(f64::MAX);
+                if la.is_nan() { return std::cmp::Ordering::Greater; }
+                if lb.is_nan() { return std::cmp::Ordering::Less; }
                 la.partial_cmp(&lb).unwrap_or(std::cmp::Ordering::Equal)
             })
             .map(|dc| dc.upstream_pool.clone())
@@ -364,12 +372,12 @@ impl GslbRouter {
 
     /// Returns the configured routing policy.
     pub fn policy(&self) -> GslbPolicy {
-        self.policy
+        *self.policy.read()
     }
 
     /// Replaces the routing policy (e.g., on SIGHUP config reload).
-    pub fn set_policy(&mut self, policy: GslbPolicy) {
-        self.policy = policy;
+    pub fn set_policy(&self, policy: GslbPolicy) {
+        *self.policy.write() = policy;
     }
 
     /// Replaces all data centers with the supplied list, re-initializing health
@@ -410,16 +418,27 @@ impl GslbRouter {
     /// Results are fed into `update_health()`.
     ///
     /// Runs every 30 seconds. Each probe has a 5-second timeout.
+    /// Concurrency is bounded to `max_concurrent_probes` (default 10) to prevent
+    /// task explosion when many data centers are configured.
     pub fn spawn_health_check_loop(
         self: &Arc<Self>,
         upstreams: Arc<crate::routing::UpstreamManager>,
         cancel: tokio_util::sync::CancellationToken,
     ) {
         let router = Arc::clone(self);
+        // Bound on in-flight health probes per tick. Prevents unbounded tokio
+        // task spawn when many DCs are configured.
+        const MAX_CONCURRENT_PROBES: usize = 10;
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(std::time::Duration::from_secs(30));
             // Don't pile up if a round takes longer than 30s
             interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            let semaphore = Arc::new(Semaphore::new(MAX_CONCURRENT_PROBES));
+            // Build a single client for all probes — avoids per-DC allocation
+            let client = reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(5))
+                .build()
+                .unwrap_or_else(|_| reqwest::Client::new());
             loop {
                 tokio::select! {
                     _ = interval.tick() => {}
@@ -458,29 +477,27 @@ impl GslbRouter {
 
                     let dc_id = dc.id.clone();
                     let router_probe = Arc::clone(&router);
+                    let sem_clone = Arc::clone(&semaphore);
+                    let probe_client = client.clone();
+                    // Acquire permit BEFORE spawning via acquire_owned —
+                    // OwnedSemaphorePermit is 'static (holds an Arc<Semaphore>
+                    // internally), so it can be moved into the spawned task.
+                    // This bounds both spawn count and concurrent probe execution.
+                    let permit_guard = sem_clone.acquire_owned().await
+                        .expect("semaphore is never closed");
                     tokio::spawn(async move {
+                        let _permit = permit_guard;
                         let start = Instant::now();
                         let probe_result = tokio::time::timeout(
                             std::time::Duration::from_secs(5),
-                            async {
-                                let url = format!("http://{}{}", addr, health_path);
-                                let client = match reqwest::Client::builder()
-                                    .timeout(std::time::Duration::from_secs(5))
-                                    .build()
-                                {
-                                    Ok(c) => c,
-                                    Err(_) => return Err("failed to build HTTP client".to_string()),
-                                };
-                                client.get(&url).send().await
-                                    .map(|_| ())
-                                    .map_err(|e| e.to_string())
-                            },
+                            probe_client.get(&format!("http://{}{}", addr, health_path))
+                                .send(),
                         )
                         .await;
 
                         let latency_ms = start.elapsed().as_secs_f64() * 1000.0;
                         match probe_result {
-                            Ok(Ok(())) => {
+                            Ok(Ok(_resp)) => {
                                 router_probe.update_health(&dc_id, true, latency_ms);
                             }
                             Ok(Err(e)) => {
@@ -796,5 +813,79 @@ mod tests {
         router.add_data_center(make_dc("us-east", GeoRegion::NorthAmerica, vec!["US"], 100));
         assert_eq!(router.dc_count(), 1);
         assert_eq!(router.healthy_dc_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_gslb_probe_semaphore_bounds_concurrency() {
+        // Proves that a Semaphore(10) bounds concurrent work: with 50 tasks
+        // contending for 10 permits, at most 10 run concurrently.
+        let sem = Arc::new(tokio::sync::Semaphore::new(10));
+        let concurrent = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let max_seen = Arc::new(std::sync::atomic::AtomicU32::new(0));
+
+        let mut handles = vec![];
+        for _ in 0..50 {
+            let s = Arc::clone(&sem);
+            let c = Arc::clone(&concurrent);
+            let m = Arc::clone(&max_seen);
+            handles.push(tokio::spawn(async move {
+                let _permit = s.acquire().await;
+                let cur = c.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+                m.fetch_max(cur, std::sync::atomic::Ordering::SeqCst);
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                c.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+            }));
+        }
+        for h in handles {
+            h.await.unwrap();
+        }
+        let max = max_seen.load(std::sync::atomic::Ordering::SeqCst);
+        assert!(max <= 10, "max concurrent tasks {} exceeded semaphore cap 10", max);
+        assert!(max > 0, "no tasks executed");
+    }
+
+    #[test]
+    fn test_update_health_nan_sanitized() {
+        let router = make_router();
+        // Passing NaN with healthy=true should sanitize to f64::MAX,
+        // which exceeds max_latency_ms (500.0) → DC marked unhealthy.
+        router.update_health("us-east", true, f64::NAN);
+        let statuses = router.health_statuses();
+        let us = statuses.iter().find(|s| s.dc_id == "us-east").unwrap();
+        assert!(!us.healthy, "NaN-latency DC should be marked unhealthy");
+        assert_eq!(us.latency_ms, f64::MAX, "NaN should be sanitized to f64::MAX");
+    }
+
+    #[test]
+    fn test_latency_based_routing_ignores_nan() {
+        // route_latency_based should never select a DC with NaN latency
+        // over one with real (finite) latency, even if NaN is somehow healthy.
+        let router = GslbRouter::new(GslbPolicy::LatencyBased, 500.0, 3);
+        router.add_data_center(make_dc("dc-fine", GeoRegion::NorthAmerica, vec!["US"], 100));
+        router.add_data_center(make_dc("dc-nan", GeoRegion::Europe, vec!["GB"], 100));
+        // Manually set a healthy status with NaN latency (bypassing sanitization
+        // to test the routing comparison itself)
+        {
+            let mut health = router.health.write();
+            if let Some(s) = health.get_mut("dc-nan") {
+                s.healthy = true;
+                s.latency_ms = f64::NAN;
+            }
+        }
+        // dc-fine has 0.0 latency, dc-nan has NaN. dc-fine should win.
+        assert_eq!(router.route("US"), Some("dc-fine-pool".to_string()));
+    }
+
+    #[test]
+    fn test_latency_based_routing_all_nan_returns_none() {
+        // If all DCs have NaN latency and are filtered as unhealthy,
+        // route_latency_based returns None (no healthy candidates).
+        let router = GslbRouter::new(GslbPolicy::LatencyBased, 500.0, 3);
+        router.add_data_center(make_dc("dc-a", GeoRegion::NorthAmerica, vec!["US"], 100));
+        router.add_data_center(make_dc("dc-b", GeoRegion::Europe, vec!["GB"], 100));
+        // NaN sanitized → both unhealthy
+        router.update_health("dc-a", true, f64::NAN);
+        router.update_health("dc-b", true, f64::NAN);
+        assert_eq!(router.route("US"), None);
     }
 }

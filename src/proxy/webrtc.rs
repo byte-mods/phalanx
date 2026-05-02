@@ -28,8 +28,11 @@ use std::sync::{
     Arc,
     atomic::{AtomicU64, Ordering},
 };
+use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::broadcast;
+use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
+use crate::telemetry::bandwidth::BandwidthTracker;
 use webrtc::{
     api::{
         APIBuilder,
@@ -60,6 +63,7 @@ use webrtc::{
         track_remote::TrackRemote,
     },
 };
+use webrtc::util::marshal::Marshal;
 
 // ─── SFU State ───────────────────────────────────────────────────────────────
 
@@ -96,6 +100,19 @@ pub struct SfuRoom {
     pub packets_forwarded: Arc<AtomicU64>,
     /// Publisher peer IDs (subset of peers).
     pub publishers: DashMap<String, ()>,
+    /// Maps publisher peer_id → track SSRCs for cleanup on disconnect (H27).
+    pub publisher_tracks: DashMap<String, Vec<u32>>,
+    /// Cancellation tokens for subscriber track-rx tasks (H28).
+    pub subscriber_tokens: DashMap<String, CancellationToken>,
+    /// JoinHandles for subscriber track-rx tasks (H28 resilience).
+    /// Stored so we can abort+remove on disconnect and detect panics.
+    pub subscriber_handles: DashMap<String, tokio::task::JoinHandle<()>>,
+    /// Cached pre-built WebRTC API for take-and-replenish (C3).
+    /// Avoids rebuilding MediaEngine + interceptor registry on every publish/subscribe.
+    pub cached_api: tokio::sync::Mutex<Option<webrtc::api::API>>,
+    /// Unix epoch seconds of the last signalling activity (publish/subscribe/ICE).
+    /// Used by the housekeeping task to expire idle rooms.
+    pub last_activity: AtomicU64,
 }
 
 impl SfuRoom {
@@ -103,6 +120,10 @@ impl SfuRoom {
     /// The returned `Arc<SfuRoom>` is shared among all signalling handlers.
     pub fn new(id: String) -> Arc<Self> {
         let (track_tx, _) = broadcast::channel(64);
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
         Arc::new(Self {
             id,
             tracks: DashMap::new(),
@@ -111,6 +132,11 @@ impl SfuRoom {
             bytes_forwarded: Arc::new(AtomicU64::new(0)),
             packets_forwarded: Arc::new(AtomicU64::new(0)),
             publishers: DashMap::new(),
+            publisher_tracks: DashMap::new(),
+            subscriber_tokens: DashMap::new(),
+            subscriber_handles: DashMap::new(),
+            cached_api: tokio::sync::Mutex::new(None),
+            last_activity: AtomicU64::new(now),
         })
     }
 
@@ -127,6 +153,15 @@ impl SfuRoom {
     /// Subscriber count (total peers minus publishers).
     pub fn subscriber_count(&self) -> usize {
         self.peers.len().saturating_sub(self.publishers.len())
+    }
+
+    /// Update the last-activity timestamp to now (epoch seconds).
+    pub fn touch(&self) {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        self.last_activity.store(now, Ordering::Relaxed);
     }
 }
 
@@ -170,6 +205,52 @@ impl SfuState {
             })
             .collect()
     }
+
+    /// Spawn a background task that removes rooms with zero peers after
+    /// they have been idle longer than `idle_timeout_secs`. Runs every
+    /// 30 seconds so worst-case a dead room lingers for 30 s past expiry.
+    pub fn start_housekeeping(
+        sfu: Arc<SfuState>,
+        idle_timeout_secs: u64,
+        cancel: CancellationToken,
+    ) {
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(30));
+            loop {
+                tokio::select! {
+                    _ = cancel.cancelled() => {
+                        info!("SFU housekeeping task stopped.");
+                        return;
+                    }
+                    _ = interval.tick() => {}
+                }
+                let now = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0);
+                Self::sweep_expired_rooms(&sfu, now, idle_timeout_secs);
+            }
+        });
+    }
+
+    /// Remove any rooms that have zero peers and whose last-activity
+    /// timestamp is older than `now - idle_timeout_secs`.
+    fn sweep_expired_rooms(sfu: &Arc<SfuState>, now_secs: u64, idle_timeout_secs: u64) {
+        let mut expired: Vec<String> = Vec::new();
+        for entry in sfu.rooms.iter() {
+            let room = entry.value();
+            if room.peers.is_empty() {
+                let last = room.last_activity.load(Ordering::Relaxed);
+                if now_secs.saturating_sub(last) >= idle_timeout_secs {
+                    expired.push(entry.key().clone());
+                }
+            }
+        }
+        for id in &expired {
+            sfu.rooms.remove(id);
+            info!("SFU housekeeping: removed idle room '{}'", id);
+        }
+    }
 }
 
 // ─── WebRTC API Factory ───────────────────────────────────────────────────────
@@ -182,6 +263,36 @@ impl SfuState {
 /// - **Opus** (audio, payload type 111) -- adaptive bitrate voice/music codec.
 ///
 /// Default interceptors (NACK, RTCP, etc.) are registered for reliability.
+/// Acquires a pre-built WebRTC API from the room cache, or builds one fresh.
+///
+/// Uses a take-and-replenish pattern: the cached API is taken (consumed by
+/// `new_peer_connection`), and a background task immediately rebuilds and
+/// stores a replacement so the next caller gets a warm cache hit.
+async fn acquire_api(room: &Arc<SfuRoom>) -> webrtc::error::Result<webrtc::api::API> {
+    let cached = {
+        let mut guard = room.cached_api.lock().await;
+        guard.take()
+    };
+    match cached {
+        Some(api) => {
+            // Replenish in background while caller uses this one
+            let room_bg = Arc::clone(room);
+            tokio::spawn(async move {
+                match build_webrtc_api() {
+                    Ok(fresh) => {
+                        *room_bg.cached_api.lock().await = Some(fresh);
+                    }
+                    Err(e) => {
+                        warn!("Background WebRTC API rebuild failed: {}", e);
+                    }
+                }
+            });
+            Ok(api)
+        }
+        None => build_webrtc_api(),
+    }
+}
+
 fn build_webrtc_api() -> webrtc::error::Result<webrtc::api::API> {
     let mut media_engine = MediaEngine::default();
 
@@ -244,8 +355,22 @@ fn build_webrtc_api() -> webrtc::error::Result<webrtc::api::API> {
     Ok(api)
 }
 
-/// Default ICE server list (STUN only — add TURN as needed)
-fn default_ice_servers() -> Vec<RTCIceServer> {
+/// Build ICE server list from configured URLs, or fall back to public STUN.
+///
+/// Each entry in `configured_urls` becomes one `RTCIceServer` with a
+/// single-element `urls` vec. When empty, Google's public STUN servers are
+/// used so development works without explicit config.
+fn build_ice_servers(configured_urls: &[String]) -> Vec<RTCIceServer> {
+    let valid: Vec<&String> = configured_urls.iter().filter(|u| !u.trim().is_empty()).collect();
+    if !valid.is_empty() {
+        return valid
+            .iter()
+            .map(|url| RTCIceServer {
+                urls: vec![(*url).clone()],
+                ..Default::default()
+            })
+            .collect();
+    }
     vec![RTCIceServer {
         urls: vec![
             "stun:stun.l.google.com:19302".to_owned(),
@@ -272,13 +397,15 @@ pub async fn handle_publish(
     room_id: String,
     peer_id: String,
     offer_sdp: String,
+    bandwidth: Option<Arc<BandwidthTracker>>,
+    ice_servers: &[String],
 ) -> Result<String, String> {
     let room = sfu.get_or_create_room(&room_id);
 
-    let api = build_webrtc_api().map_err(|e| format!("Failed to build WebRTC API: {}", e))?;
+    let api = acquire_api(&room).await.map_err(|e| format!("Failed to build WebRTC API: {}", e))?;
 
     let config = RTCConfiguration {
-        ice_servers: default_ice_servers(),
+        ice_servers: build_ice_servers(ice_servers),
         ..Default::default()
     };
 
@@ -291,15 +418,20 @@ pub async fn handle_publish(
     // Store the peer connection and mark as publisher
     room.peers.insert(peer_id.clone(), Arc::clone(&peer_connection));
     room.publishers.insert(peer_id.clone(), ());
+    room.touch();
 
     // Clone room for the on_track callback
     let room_for_track = Arc::clone(&room);
     let peer_id_for_close = peer_id.clone();
+    let peer_id_for_track = peer_id.clone();
+    let bandwidth_for_track = bandwidth.clone();
 
     // on_track: called when the publisher sends a media track
     peer_connection.on_track(Box::new(
         move |track: Arc<TrackRemote>, _receiver: Arc<RTCRtpReceiver>, _transceiver: Arc<RTCRtpTransceiver>| {
             let room = Arc::clone(&room_for_track);
+            let pid = peer_id_for_track.clone();
+            let bw = bandwidth_for_track.clone();
 
             Box::pin(async move {
                 let ssrc = track.ssrc();
@@ -321,6 +453,8 @@ pub async fn handle_publish(
 
                 // Register track in the room
                 room.tracks.insert(ssrc, sfu_track.clone());
+                // H27: track which publisher owns this SSRC for cleanup on disconnect
+                room.publisher_tracks.entry(pid).or_default().push(ssrc);
 
                 // Broadcast to any subscribers waiting for tracks
                 if let Err(e) = room.track_tx.send(sfu_track) {
@@ -332,14 +466,25 @@ pub async fn handle_publish(
                 loop {
                     match track.read(&mut rtp_buf).await {
                         Ok((packet, _attr)) => {
-                            // Estimate size: 12-byte fixed RTP header + payload
-                            let pkt_len = (packet.payload.len() as u64) + 12;
-                            // Write the buffer content - the packet's payload is stored in rtp_buf
-                            if let Err(e) = local_track.write(&rtp_buf).await {
-                                debug!("RTP write to local track failed (ssrc={}): {}", ssrc, e);
-                            } else {
-                                room.bytes_forwarded.fetch_add(pkt_len, Ordering::Relaxed);
-                                room.packets_forwarded.fetch_add(1, Ordering::Relaxed);
+                            // Marshal the parsed packet back to its exact wire-format
+                            // bytes. The previous code wrote the entire 1500-byte
+                            // rtp_buf (mostly trailing zeros), corrupting streams.
+                            match packet.marshal() {
+                                Ok(pkt_bytes) => {
+                                    let pkt_len = pkt_bytes.len() as u64;
+                                    if let Err(e) = local_track.write(&pkt_bytes).await {
+                                        debug!("RTP write to local track failed (ssrc={}): {}", ssrc, e);
+                                    } else {
+                                        room.bytes_forwarded.fetch_add(pkt_len, Ordering::Relaxed);
+                                        room.packets_forwarded.fetch_add(1, Ordering::Relaxed);
+                                        if let Some(ref bw) = bw {
+                                            bw.protocol("webrtc").add_out(pkt_len);
+                                        }
+                                    }
+                                }
+                                Err(e) => {
+                                    warn!("RTP marshal error for ssrc={}: {}", ssrc, e);
+                                }
                             }
                         }
                         Err(e) => {
@@ -364,6 +509,13 @@ pub async fn handle_publish(
                 || state == RTCPeerConnectionState::Failed
                 || state == RTCPeerConnectionState::Closed
             {
+                // H27: remove all tracks belonging to this publisher
+                if let Some((_, ssrclist)) = room.publisher_tracks.remove(&peer_id) {
+                    for ssrc in &ssrclist {
+                        room.tracks.remove(ssrc);
+                    }
+                    info!("Cleaned up {} tracks for publisher {}", ssrclist.len(), peer_id);
+                }
                 room.peers.remove(&peer_id);
                 room.publishers.remove(&peer_id);
                 info!("Publisher peer {} removed from room.", peer_id);
@@ -423,13 +575,14 @@ pub async fn handle_subscribe(
     room_id: String,
     peer_id: String,
     offer_sdp: String,
+    ice_servers: &[String],
 ) -> Result<String, String> {
     let room = sfu.get_or_create_room(&room_id);
 
-    let api = build_webrtc_api().map_err(|e| format!("Failed to build WebRTC API: {}", e))?;
+    let api = acquire_api(&room).await.map_err(|e| format!("Failed to build WebRTC API: {}", e))?;
 
     let config = RTCConfiguration {
-        ice_servers: default_ice_servers(),
+        ice_servers: build_ice_servers(ice_servers),
         ..Default::default()
     };
 
@@ -440,6 +593,7 @@ pub async fn handle_subscribe(
     );
 
     room.peers.insert(peer_id.clone(), Arc::clone(&peer_connection));
+    room.touch();
 
     // Subscribe to all existing tracks immediately
     let existing_tracks: Vec<SfuTrack> = room.tracks.iter().map(|e| e.value().clone()).collect();
@@ -452,30 +606,65 @@ pub async fn handle_subscribe(
         }
     }
 
+    // H28: create cancellation token so the track-rx task exits on disconnect
+    let sub_cancel = CancellationToken::new();
+    room.subscriber_tokens.insert(peer_id.clone(), sub_cancel.clone());
+
     // Subscribe to future tracks (publishers joining after this subscriber)
     let mut track_rx = room.track_tx.subscribe();
     let pc_for_future = Arc::clone(&peer_connection);
     let peer_id_future = peer_id.clone();
-    tokio::spawn(async move {
-        while let Ok(sfu_track) = track_rx.recv().await {
-            debug!("New track {} available — adding to subscriber {}", sfu_track.ssrc, peer_id_future);
-            if let Err(e) = pc_for_future
-                .add_track(Arc::clone(&sfu_track.local_track) as Arc<dyn webrtc::track::track_local::TrackLocal + Send + Sync>)
-                .await
-            {
-                warn!("Could not add new track to subscriber {}: {}", peer_id_future, e);
+    let sub_token = sub_cancel.clone();
+    let handle = tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                _ = sub_token.cancelled() => {
+                    debug!("Subscriber {} track task cancelled", peer_id_future);
+                    return;
+                }
+                result = track_rx.recv() => {
+                    match result {
+                        Ok(sfu_track) => {
+                            debug!("New track {} available — adding to subscriber {}", sfu_track.ssrc, peer_id_future);
+                            if let Err(e) = pc_for_future
+                                .add_track(Arc::clone(&sfu_track.local_track) as Arc<dyn webrtc::track::track_local::TrackLocal + Send + Sync>)
+                                .await
+                            {
+                                warn!("Could not add new track to subscriber {}: {}", peer_id_future, e);
+                            }
+                        }
+                        Err(broadcast::error::RecvError::Closed) => {
+                            debug!("Subscriber {} track channel closed", peer_id_future);
+                            return;
+                        }
+                        Err(broadcast::error::RecvError::Lagged(n)) => {
+                            debug!("Subscriber {} track channel lagged by {}", peer_id_future, n);
+                            // continue waiting for new tracks
+                        }
+                    }
+                }
             }
         }
     });
+    room.subscriber_handles.insert(peer_id.clone(), handle);
 
-    // on_ice_connection_state_change: cleanup on disconnect
+    // on_ice_connection_state_change: cleanup on disconnect (H28: cancel subscriber token)
     let room_for_state = Arc::clone(&room);
     let peer_id_for_close = peer_id.clone();
     peer_connection.on_ice_connection_state_change(Box::new(move |state: RTCIceConnectionState| {
         let room = Arc::clone(&room_for_state);
         let peer_id = peer_id_for_close.clone();
         Box::pin(async move {
-            if state == RTCIceConnectionState::Disconnected || state == RTCIceConnectionState::Failed {
+            if state == RTCIceConnectionState::Disconnected
+                || state == RTCIceConnectionState::Failed
+                || state == RTCIceConnectionState::Closed
+            {
+                if let Some((_, token)) = room.subscriber_tokens.remove(&peer_id) {
+                    token.cancel();
+                }
+                if let Some((_, handle)) = room.subscriber_handles.remove(&peer_id) {
+                    handle.abort();
+                }
                 room.peers.remove(&peer_id);
                 info!("Subscriber peer {} disconnected from room.", peer_id);
             }
@@ -541,6 +730,7 @@ pub async fn add_ice_candidate(
         .await
         .map_err(|e| format!("add_ice_candidate failed: {}", e))?;
 
+    room.touch();
     Ok(())
 }
 
@@ -571,5 +761,138 @@ mod tests {
         sfu.get_or_create_room("room-b");
         let rooms = sfu.list_rooms();
         assert_eq!(rooms.len(), 2);
+    }
+
+    #[test]
+    fn test_build_ice_servers_empty_returns_google_stun() {
+        let servers = build_ice_servers(&[]);
+        assert_eq!(servers.len(), 1);
+        assert!(servers[0].urls.len() >= 2);
+        assert!(servers[0].urls[0].starts_with("stun:"));
+    }
+
+    #[test]
+    fn test_build_ice_servers_configured_overrides_default() {
+        let configured = vec![
+            "turn:turn.example.com:3478?transport=udp".to_string(),
+        ];
+        let servers = build_ice_servers(&configured);
+        assert_eq!(servers.len(), 1);
+        assert_eq!(servers[0].urls[0], "turn:turn.example.com:3478?transport=udp");
+    }
+
+    #[test]
+    fn test_build_ice_servers_multiple_urls_produce_multiple_servers() {
+        let configured = vec![
+            "stun:stun.custom.com:3478".to_string(),
+            "turn:turn.custom.com:3478?transport=udp".to_string(),
+        ];
+        let servers = build_ice_servers(&configured);
+        assert_eq!(servers.len(), 2);
+        assert_eq!(servers[0].urls[0], "stun:stun.custom.com:3478");
+        assert_eq!(servers[1].urls[0], "turn:turn.custom.com:3478?transport=udp");
+    }
+
+    #[test]
+    fn test_build_ice_servers_empty_string_falls_back_to_google_stun() {
+        let configured = vec!["".to_string()];
+        let servers = build_ice_servers(&configured);
+        assert_eq!(servers.len(), 1);
+        assert!(servers[0].urls.len() >= 2);
+        assert!(servers[0].urls[0].starts_with("stun:"));
+    }
+
+    #[test]
+    fn test_build_ice_servers_whitespace_only_falls_back() {
+        let configured = vec!["   ".to_string()];
+        let servers = build_ice_servers(&configured);
+        assert_eq!(servers.len(), 1);
+        assert!(servers[0].urls[0].starts_with("stun:"));
+    }
+
+    #[test]
+    fn test_build_ice_servers_mixed_valid_and_empty_keeps_valid() {
+        let configured = vec![
+            "".to_string(),
+            "turn:turn.example.com:3478".to_string(),
+            "  ".to_string(),
+        ];
+        let servers = build_ice_servers(&configured);
+        assert_eq!(servers.len(), 1);
+        assert_eq!(servers[0].urls[0], "turn:turn.example.com:3478");
+    }
+
+    #[test]
+    fn test_room_touch_updates_last_activity() {
+        let room = SfuRoom::new("test".into());
+        let before = room.last_activity.load(Ordering::Relaxed);
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        room.touch();
+        let after = room.last_activity.load(Ordering::Relaxed);
+        assert!(after >= before);
+    }
+
+    #[test]
+    fn test_sweep_removes_idle_empty_room() {
+        let sfu = SfuState::new();
+        let room = sfu.get_or_create_room("idle-room");
+        // Room starts with 0 peers (empty). Set last_activity far in the past.
+        let long_ago = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0)
+            .saturating_sub(600);
+        room.last_activity.store(long_ago, Ordering::Relaxed);
+
+        assert_eq!(sfu.rooms.len(), 1);
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        SfuState::sweep_expired_rooms(&sfu, now, 300);
+        assert_eq!(sfu.rooms.len(), 0);
+    }
+
+    #[test]
+    fn test_sweep_keeps_recently_active_empty_room() {
+        let sfu = SfuState::new();
+        let room = sfu.get_or_create_room("active-room");
+        // Room is empty but was just touched (last_activity is recent).
+        room.touch();
+
+        assert_eq!(sfu.rooms.len(), 1);
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        SfuState::sweep_expired_rooms(&sfu, now, 300);
+        assert_eq!(sfu.rooms.len(), 1);
+    }
+
+    #[test]
+    fn test_sweep_room_count_matches_participant_count() {
+        // A room with non-zero participant_count() should have peers and should
+        // not be sweepable. participant_count delegates to peers.len().
+        let room = SfuRoom::new("test".into());
+        assert_eq!(room.participant_count(), 0);
+        assert_eq!(room.publisher_count(), 0);
+        assert_eq!(room.subscriber_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_subscriber_handles_stored_and_removed() {
+        let room = SfuRoom::new("test".into());
+        assert!(room.subscriber_handles.is_empty());
+
+        // Simulate storing a handle (use an already-completed task for the test)
+        let dummy_handle = tokio::spawn(async {});
+        room.subscriber_handles
+            .insert("peer1".into(), dummy_handle);
+        assert_eq!(room.subscriber_handles.len(), 1);
+
+        // Simulate disconnect cleanup
+        let (_, handle) = room.subscriber_handles.remove("peer1").unwrap();
+        handle.abort(); // should be a no-op on already-completed task
+        assert!(room.subscriber_handles.is_empty());
     }
 }

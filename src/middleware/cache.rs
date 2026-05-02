@@ -25,6 +25,8 @@ pub struct AdvancedCache {
     locks: Arc<DashMap<String, Arc<tokio::sync::Mutex<()>>>>,
     /// Vary header tracking: maps base cache key → set of Vary header names
     vary_map: Arc<DashMap<String, Vec<String>>>,
+    /// All active cache keys for prefix-based L1 invalidation.
+    all_keys: Arc<DashMap<String, ()>>,
 }
 
 /// A single cached response entry with full HTTP metadata and freshness tracking.
@@ -102,9 +104,18 @@ impl AdvancedCache {
     /// * `default_ttl_secs` - Default TTL for Moka eviction (minimum 60s).
     /// * `disk_path` - Optional directory for L2 disk cache; created if absent.
     pub fn new(max_capacity: u64, default_ttl_secs: u64, disk_path: Option<&str>) -> Self {
+        let all_keys: Arc<DashMap<String, ()>> = Arc::new(DashMap::new());
+
+        // Eviction listener keeps all_keys in sync with Moka's internal state.
+        // When Moka evicts an entry (capacity or TTL), the key is removed from
+        // all_keys so that purge_prefix only scans live L1 entries.
+        let all_keys_evict = Arc::clone(&all_keys);
         let cache = moka::future::Cache::builder()
             .max_capacity(max_capacity)
             .time_to_live(Duration::from_secs(default_ttl_secs.max(60)))
+            .eviction_listener(move |key: Arc<String>, _value: CacheEntry, _cause| {
+                all_keys_evict.remove(key.as_ref());
+            })
             .build();
 
         let dp = disk_path.map(|p| {
@@ -117,11 +128,26 @@ impl AdvancedCache {
             pb
         });
 
+        let locks: Arc<DashMap<String, Arc<tokio::sync::Mutex<()>>>> = Arc::new(DashMap::new());
+
+        // Background sweeper: periodically evict lock entries that are no longer
+        // contended (only the DashMap holds a reference) to prevent unbounded growth.
+        let locks_sweep = Arc::clone(&locks);
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            handle.spawn(async move {
+                loop {
+                    tokio::time::sleep(Duration::from_secs(600)).await;
+                    locks_sweep.retain(|_k, v| Arc::strong_count(v) > 1);
+                }
+            });
+        }
+
         Self {
             memory: cache,
             disk_path: dp,
-            locks: Arc::new(DashMap::new()),
+            locks,
             vary_map: Arc::new(DashMap::new()),
+            all_keys,
         }
     }
 
@@ -151,6 +177,7 @@ impl AdvancedCache {
     /// Stores an entry in both memory and disk cache.
     pub async fn insert(&self, key: String, entry: CacheEntry) {
         self.memory.insert(key.clone(), entry.clone()).await;
+        self.all_keys.insert(key.clone(), ());
 
         if let Some(ref dp) = self.disk_path {
             self.write_disk(dp, &key, &entry).await;
@@ -163,6 +190,7 @@ impl AdvancedCache {
 
         if self.memory.get(key).await.is_some() {
             self.memory.invalidate(key).await;
+            self.all_keys.remove(key);
             found = true;
         }
 
@@ -176,13 +204,39 @@ impl AdvancedCache {
         found
     }
 
-    /// Purges all entries matching a path prefix.
+    /// Purges all entries matching a path prefix from both L1 memory and L2 disk.
+    ///
+    /// L1 scan uses `all_keys` which is kept in sync with Moka via an eviction
+    /// listener — unlike the old periodic sweep, keys are only removed when Moka
+    /// actually evicts them, so prefix purging covers all live L1 entries.
     pub async fn purge_prefix(&self, prefix: &str) -> u64 {
-        // Memory cache doesn't support prefix iteration efficiently,
-        // but we can track keys separately or accept the limitation.
-        // For disk, we can scan the directory.
         let mut count = 0u64;
 
+        // L1: In-memory — collect keys whose path component starts with the prefix,
+        // then invalidate them in Moka and remove from the tracking set.
+        let matching: Vec<String> = self
+            .all_keys
+            .iter()
+            .filter_map(|entry| {
+                let key = entry.key();
+                // Key format: "METHOD:HOST:/path[?query][:V:vary]"
+                // Match if the path portion starts with the given prefix.
+                if let Some(path_start) = key.find('/') {
+                    if key[path_start..].starts_with(prefix) {
+                        return Some(key.clone());
+                    }
+                }
+                None
+            })
+            .collect();
+
+        for key in &matching {
+            self.memory.invalidate(key).await;
+            self.all_keys.remove(key);
+            count += 1;
+        }
+
+        // L2: Disk directory scan
         if let Some(ref dp) = self.disk_path {
             if let Ok(mut entries) = tokio::fs::read_dir(dp).await {
                 while let Ok(Some(entry)) = entries.next_entry().await {
@@ -237,6 +291,7 @@ impl AdvancedCache {
     pub async fn purge_all(&self) {
         self.memory.invalidate_all();
         self.memory.run_pending_tasks().await;
+        self.all_keys.clear();
 
         if let Some(ref dp) = self.disk_path {
             if let Ok(mut entries) = tokio::fs::read_dir(dp).await {
@@ -259,7 +314,7 @@ impl AdvancedCache {
     async fn read_disk(&self, base: &Path, key: &str) -> Option<CacheEntry> {
         let path = self.disk_entry_path(base, key);
         let data = tokio::fs::read(&path).await.ok()?;
-        deserialize_entry(&data)
+        deserialize_entry(data)
     }
 
     /// Serializes and writes a cache entry to the L2 disk tier.
@@ -289,18 +344,24 @@ fn hex_prefix(key: &str) -> String {
 
 /// Serializes a cache entry to a compact binary format for disk persistence.
 ///
-/// Layout: [status:4][max_age:8][swr:8][sie:8][ct_len:4][ct:..][hdr_len:4][hdr_json:..][body:..]
+/// Layout: [status:4][remaining_max_age:8][remaining_swr:8][remaining_sie:8][ct_len:4][ct:..][hdr_len:4][hdr_json:..][body:..]
+///
+/// Stores remaining TTLs (not absolute values) so that on reload the entry
+/// retains its correct freshness window rather than being reset to full TTL.
 fn serialize_entry(entry: &CacheEntry) -> Option<Vec<u8>> {
-    let max_age_secs = entry.max_age.as_secs();
-    let swr_secs = entry.stale_while_revalidate.as_secs();
-    let sie_secs = entry.stale_if_error.as_secs();
+    let elapsed = entry.created_at.elapsed();
+    let remaining_max_age = entry.max_age.saturating_sub(elapsed).as_secs();
+    // swr window starts after max_age expires
+    let past_max_age = elapsed.saturating_sub(entry.max_age);
+    let remaining_swr = entry.stale_while_revalidate.saturating_sub(past_max_age).as_secs();
+    let remaining_sie = entry.stale_if_error.saturating_sub(past_max_age).as_secs();
     let header_json = serde_json::to_vec(&entry.headers).ok()?;
 
     let mut buf = Vec::new();
     buf.extend_from_slice(&(entry.status as u32).to_le_bytes());
-    buf.extend_from_slice(&max_age_secs.to_le_bytes());
-    buf.extend_from_slice(&swr_secs.to_le_bytes());
-    buf.extend_from_slice(&sie_secs.to_le_bytes());
+    buf.extend_from_slice(&remaining_max_age.to_le_bytes());
+    buf.extend_from_slice(&remaining_swr.to_le_bytes());
+    buf.extend_from_slice(&remaining_sie.to_le_bytes());
     buf.extend_from_slice(&(entry.content_type.len() as u32).to_le_bytes());
     buf.extend_from_slice(entry.content_type.as_bytes());
     buf.extend_from_slice(&(header_json.len() as u32).to_le_bytes());
@@ -312,10 +373,13 @@ fn serialize_entry(entry: &CacheEntry) -> Option<Vec<u8>> {
 
 /// Deserializes a cache entry from the binary disk format produced by `serialize_entry`.
 ///
-/// Returns `None` if the data is too short or any field fails to parse.
-/// The `created_at` timestamp is set to `Instant::now()` since absolute
-/// instants cannot be persisted across process restarts.
-fn deserialize_entry(data: &[u8]) -> Option<CacheEntry> {
+/// Takes ownership of the data `Vec<u8>` and uses `Bytes::from` for the body to avoid
+/// a heap copy (zero-copy via shared backing buffer). Returns `None` if the data is
+/// too short or any field fails to parse.
+///
+/// `created_at` is set to `Instant::now()` — the stored TTLs are *remaining* durations,
+/// so the entry retains its correct freshness window across restarts.
+fn deserialize_entry(data: Vec<u8>) -> Option<CacheEntry> {
     if data.len() < 32 {
         return None;
     }
@@ -323,11 +387,11 @@ fn deserialize_entry(data: &[u8]) -> Option<CacheEntry> {
 
     let status = u32::from_le_bytes(data[pos..pos + 4].try_into().ok()?) as u16;
     pos += 4;
-    let max_age_secs = u64::from_le_bytes(data[pos..pos + 8].try_into().ok()?);
+    let remaining_max_age = u64::from_le_bytes(data[pos..pos + 8].try_into().ok()?);
     pos += 8;
-    let swr_secs = u64::from_le_bytes(data[pos..pos + 8].try_into().ok()?);
+    let remaining_swr = u64::from_le_bytes(data[pos..pos + 8].try_into().ok()?);
     pos += 8;
-    let sie_secs = u64::from_le_bytes(data[pos..pos + 8].try_into().ok()?);
+    let remaining_sie = u64::from_le_bytes(data[pos..pos + 8].try_into().ok()?);
     pos += 8;
 
     let ct_len = u32::from_le_bytes(data[pos..pos + 4].try_into().ok()?) as usize;
@@ -341,7 +405,10 @@ fn deserialize_entry(data: &[u8]) -> Option<CacheEntry> {
         serde_json::from_slice(data.get(pos..pos + hdr_len)?).ok()?;
     pos += hdr_len;
 
-    let body = Bytes::copy_from_slice(data.get(pos..)?);
+    // Zero-copy: Bytes::from takes ownership of the Vec without copying the body bytes.
+    // slice() creates a new Bytes handle sharing the same backing buffer.
+    let bytes = Bytes::from(data);
+    let body = bytes.slice(pos..);
 
     Some(CacheEntry {
         status,
@@ -349,9 +416,9 @@ fn deserialize_entry(data: &[u8]) -> Option<CacheEntry> {
         content_type,
         headers,
         created_at: Instant::now(),
-        max_age: Duration::from_secs(max_age_secs),
-        stale_while_revalidate: Duration::from_secs(swr_secs),
-        stale_if_error: Duration::from_secs(sie_secs),
+        max_age: Duration::from_secs(remaining_max_age),
+        stale_while_revalidate: Duration::from_secs(remaining_swr),
+        stale_if_error: Duration::from_secs(remaining_sie),
     })
 }
 
@@ -470,6 +537,31 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_advanced_cache_purge_prefix_memory() {
+        let cache = AdvancedCache::new(100, 120, None);
+        cache
+            .insert("GET:example.com:/api/users/1".to_string(), fresh_entry())
+            .await;
+        cache
+            .insert("GET:example.com:/api/users/2".to_string(), fresh_entry())
+            .await;
+        cache
+            .insert("GET:example.com:/other".to_string(), fresh_entry())
+            .await;
+
+        // Purge only /api/ prefix
+        let count = cache.purge_prefix("/api/").await;
+        assert!(count >= 2, "expected at least 2 L1 entries purged, got {count}");
+
+        // /api/ entries should be gone
+        assert!(cache.get("GET:example.com:/api/users/1").await.is_none());
+        assert!(cache.get("GET:example.com:/api/users/2").await.is_none());
+
+        // /other should still exist
+        assert!(cache.get("GET:example.com:/other").await.is_some());
+    }
+
+    #[tokio::test]
     async fn test_advanced_cache_vary_tracking() {
         let cache = AdvancedCache::new(100, 120, None);
         cache.record_vary("base-key", vec!["Accept-Encoding".to_string()]);
@@ -493,7 +585,7 @@ mod tests {
     fn test_serialize_deserialize_entry() {
         let entry = fresh_entry();
         let data = serialize_entry(&entry).unwrap();
-        let restored = deserialize_entry(&data).unwrap();
+        let restored = deserialize_entry(data).unwrap();
         assert_eq!(restored.status, 200);
         assert_eq!(restored.body, Bytes::from_static(b"hello"));
         assert_eq!(restored.content_type, "text/plain");
@@ -502,7 +594,51 @@ mod tests {
 
     #[test]
     fn test_deserialize_entry_too_short() {
-        assert!(deserialize_entry(&[0u8; 10]).is_none());
+        assert!(deserialize_entry(vec![0u8; 10]).is_none());
+    }
+
+    /// M48 regression: TTLs must be preserved accurately across serialize/deserialize.
+    /// A stale entry with 10s remaining max_age should reload with ~10s max_age,
+    /// not the full original 60s.
+    #[test]
+    fn test_serialize_deserialize_preserves_remaining_ttl() {
+        let entry = CacheEntry {
+            created_at: Instant::now() - Duration::from_secs(50),
+            max_age: Duration::from_secs(60),
+            stale_while_revalidate: Duration::from_secs(30),
+            stale_if_error: Duration::from_secs(120),
+            ..fresh_entry()
+        };
+        // After 50s elapsed of a 60s max_age, ~10s remains
+        let data = serialize_entry(&entry).unwrap();
+        let restored = deserialize_entry(data).unwrap();
+
+        // Remaining max_age should be close to 10s (allow ±1s for test overhead)
+        let rem = restored.max_age.as_secs();
+        assert!(
+            rem >= 8 && rem <= 12,
+            "expected ~10s remaining max_age after 50s elapsed, got {}s",
+            rem
+        );
+
+        // restored entry is fresh because created_at=now and max_age=remaining(10s)
+        assert!(restored.is_fresh());
+
+        // swr remaining: 30s - max(50-60, 0) = 30s stored
+        let swr = restored.stale_while_revalidate.as_secs();
+        assert!(
+            swr >= 28 && swr <= 32,
+            "expected ~30s remaining swr, got {}s",
+            swr
+        );
+
+        // sie remaining: 120s - max(50-60, 0) = 120s stored
+        let sie = restored.stale_if_error.as_secs();
+        assert!(
+            sie >= 118 && sie <= 122,
+            "expected ~120s remaining sie, got {}s",
+            sie
+        );
     }
 
     #[test]
@@ -511,5 +647,46 @@ mod tests {
         let b = hex_prefix("test-key");
         assert_eq!(a, b);
         assert_ne!(hex_prefix("key-a"), hex_prefix("key-b"));
+    }
+
+    /// M47 regression: purge_prefix must find all live L1 entries.
+    /// The old periodic all_keys sweep cleared the index every 600s,
+    /// making entries inserted before the last sweep invisible to prefix purge.
+    /// With the eviction listener, all_keys stays in sync with Moka.
+    #[tokio::test]
+    async fn test_purge_prefix_finds_entries_independent_of_age() {
+        let cache = AdvancedCache::new(200, 3600, None);
+
+        // Insert entries with a common prefix
+        for i in 0..50 {
+            cache
+                .insert(
+                    format!("GET:example.com:/api/v1/resource/{}", i),
+                    fresh_entry(),
+                )
+                .await;
+        }
+        cache
+            .insert("GET:example.com:/other/path".to_string(), fresh_entry())
+            .await;
+
+        cache.run_pending_tasks().await;
+
+        // purge_prefix should find all 50 /api/ entries regardless of insertion age
+        let count = cache.purge_prefix("/api/").await;
+        assert!(
+            count >= 50,
+            "purge_prefix should purge at least 50 L1 entries, got {}",
+            count
+        );
+
+        // The /other entry should still be present
+        assert!(cache.get("GET:example.com:/other/path").await.is_some());
+
+        // /api/ entries should be gone
+        assert!(cache
+            .get("GET:example.com:/api/v1/resource/0")
+            .await
+            .is_none());
     }
 }

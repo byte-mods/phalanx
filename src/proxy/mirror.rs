@@ -10,9 +10,27 @@
 
 use bytes::Bytes;
 use std::sync::Arc;
-use tracing::{debug, error};
+use tokio::sync::Semaphore;
+use tracing::debug;
 
 use crate::routing::UpstreamManager;
+
+/// Maximum concurrent mirror tasks allowed. Spawns beyond this limit are dropped
+/// to prevent unbounded task growth under high traffic.
+const MAX_CONCURRENT_MIRRORS: usize = 256;
+
+/// Cached `reqwest::Client` shared across all mirror requests. Built once on
+/// first use; subsequent mirror requests reuse the same connection pool.
+fn mirror_client() -> &'static reqwest::Client {
+    use std::sync::OnceLock;
+    static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
+    CLIENT.get_or_init(|| {
+        reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(5))
+            .build()
+            .unwrap_or_else(|_| reqwest::Client::new())
+    })
+}
 
 /// Fires a mirrored (tee'd) copy of the request to a shadow upstream pool.
 ///
@@ -40,10 +58,21 @@ pub fn mirror_request(
     mirror_pool_name: String,
     upstreams: Arc<UpstreamManager>,
 ) {
+    // Backpressure: drop mirror if we're already at max concurrency
+    static SEMAPHORE: std::sync::OnceLock<Arc<Semaphore>> = std::sync::OnceLock::new();
+    let sem = SEMAPHORE.get_or_init(|| Arc::new(Semaphore::new(MAX_CONCURRENT_MIRRORS)));
+    let Ok(permit) = sem.clone().try_acquire_owned() else {
+        debug!("Mirror semaphore full, dropping mirror request");
+        return;
+    };
+
     let method = method.to_string();
     let uri = uri.to_string();
+    let client = mirror_client().clone();
 
     tokio::spawn(async move {
+        let _permit = permit;
+
         let pool = match upstreams.get_pool(&mirror_pool_name) {
             Some(p) => p,
             None => {
@@ -63,17 +92,6 @@ pub fn mirror_request(
         let url = format!("http://{}{}", backend.config.address, uri);
         debug!("Mirroring {} {} to {}", method, uri, url);
 
-        let client = match reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(5))
-            .build()
-        {
-            Ok(c) => c,
-            Err(e) => {
-                error!("Failed to create mirror HTTP client: {}", e);
-                return;
-            }
-        };
-
         let req_method = match method.as_str() {
             "GET" => reqwest::Method::GET,
             "POST" => reqwest::Method::POST,
@@ -87,7 +105,6 @@ pub fn mirror_request(
 
         let mut builder = client.request(req_method, &url);
 
-        // Propagate all original request headers to the mirror backend
         for (key, value) in headers.iter() {
             if let Ok(v) = value.to_str() {
                 builder = builder.header(key.as_str(), v);

@@ -65,6 +65,17 @@ pub fn gzip_compress(body: &[u8]) -> Option<Bytes> {
     }
 }
 
+/// Async wrapper that offloads gzip compression to `spawn_blocking`.
+/// Prevents CPU-intensive compression from stalling Tokio worker threads.
+pub async fn gzip_compress_async(body: Bytes) -> Option<Bytes> {
+    if body.len() < MIN_COMPRESS_SIZE {
+        return None;
+    }
+    tokio::task::spawn_blocking(move || gzip_compress(&body))
+        .await
+        .unwrap_or(None)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

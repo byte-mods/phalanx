@@ -33,7 +33,8 @@ impl WafRules {
     pub fn new() -> Self {
         // OWASP Top 10 - Injection (SQLi)
         let sqli_patterns = vec![
-            r"(?i)(union\s+select|select\s+.*\s+from|insert\s+into|update\s+.*\s+set|drop\s+table)",
+            // Bounded repetitions prevent catastrophic backtracking on long payloads
+            r"(?i)(union\s+select|select\s+.{0,256}?\s+from|insert\s+into|update\s+.{0,256}?\s+set|drop\s+table)",
             r#"(?i)(and|or)\s+[\d'"]+\s*=\s*[\d'"]+"#, // e.g. OR 1=1
             r#"(?i)(\%27)|(')|(\-\-)|(\%23)|(#)"#,     // Basic quotes and comments
             r"(?i)(exec\s+xp_cmdshell|information_schema|waitfor\s+delay)", // Advanced SQLi
@@ -62,8 +63,7 @@ impl WafRules {
 
         // Malicious Scanners & Bots
         let bot_ua_patterns = vec![
-            r"(?i)(sqlmap|nikto|zmap|nmap|masscan|curl|wget|python-requests|go-http-client|java/)",
-            r"(?i)(dirbuster|scan|nuclei|acunetix|nessus)",
+            r"(?i)(sqlmap|nikto|zmap|nmap|masscan|dirbuster|nuclei|acunetix|nessus)",
         ];
 
         Self {
@@ -194,9 +194,39 @@ mod tests {
         assert!(rules.is_malicious_bot(
             "Mozilla/5.0 (compatible; Nmap Scripting Engine; https://nmap.org/book/nse.html)"
         ));
-        assert!(rules.is_malicious_bot("java/1.8.0.212"));
+        assert!(rules.is_malicious_bot("dirbuster/1.0"));
 
-        // Benign UA
+        // Legitimate tools that were previously incorrectly blocked
+        assert!(!rules.is_malicious_bot("curl/8.4.0"));
+        assert!(!rules.is_malicious_bot("Wget/1.21.4"));
+        assert!(!rules.is_malicious_bot("python-requests/2.31.0"));
+        assert!(!rules.is_malicious_bot("Go-http-client/2.0"));
+        assert!(!rules.is_malicious_bot("Java/17.0.2"));
+
+        // Benign browser UA
         assert!(!rules.is_malicious_bot("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"));
+    }
+
+    /// M42 regression: long payloads with `select ... from` or `update ... set`
+    /// must not cause catastrophic backtracking. Bounded quantifiers {0,256}?
+    /// prevent the engine from trying every split point.
+    #[test]
+    fn test_waf_sqli_no_redos() {
+        let rules = WafRules::new();
+        // A very long payload with structure reminiscent of a SQL query but
+        // no actual `from` keyword — the classic ReDoS trigger for unbounded `.*`.
+        let long_no_from = format!(
+            "?q=select{}{}",
+            " x".repeat(5000),
+            " -- no from keyword to match"
+        );
+        let start = std::time::Instant::now();
+        let _result = rules.inspect_payload(&long_no_from);
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed.as_millis() < 500,
+            "ReDoS: unbounded.* caused {}ms eval on 5KB payload",
+            elapsed.as_millis()
+        );
     }
 }

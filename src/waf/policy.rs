@@ -137,6 +137,9 @@ struct CompiledPolicy {
     custom_patterns: Vec<(u32, regex::Regex, RuleTarget, RuleAction)>,
     /// Pre-compiled exclusion patterns for fast path matching.
     exclusion_set: Option<RegexSet>,
+    /// Pre-lowered signature set names to avoid per-request allocations in the
+    /// category-matching hot loop. (original_name, lowered_name, severity, enabled)
+    sig_set_names_lower: Vec<(String, String, Severity, bool)>,
 }
 
 /// A single policy violation detected during request evaluation.
@@ -196,6 +199,12 @@ impl PolicyEngine {
             self.default_policy = Some(name.clone());
         }
 
+        let sig_set_names_lower: Vec<_> = policy
+            .signature_sets
+            .iter()
+            .map(|s| (s.name.clone(), s.name.to_lowercase(), s.severity, s.enabled))
+            .collect();
+
         info!("Loaded WAF policy '{}' with {} custom rules", name, custom_patterns.len());
 
         self.policies.insert(
@@ -204,6 +213,7 @@ impl PolicyEngine {
                 config: policy,
                 custom_patterns,
                 exclusion_set,
+                sig_set_names_lower,
             },
         );
 
@@ -212,17 +222,14 @@ impl PolicyEngine {
 
     /// Evaluates a request against the named policy (or default).
     ///
-    /// `matched_categories` is a list of OWASP category names already detected
-    /// by `WafRules::inspect_payload()` (e.g., "SQL Injection (SQLi)"). These
-    /// are cross-referenced against the policy's enabled signature sets to
-    /// produce violations with the correct severity. Pass an empty slice to
-    /// skip signature set evaluation.
+    /// Accepts `&HashMap` for headers to avoid a per-request Vec allocation
+    /// on the WAF hot path — the caller's existing HashMap is borrowed directly.
     pub fn evaluate(
         &self,
         policy_name: Option<&str>,
         path: &str,
         query: Option<&str>,
-        headers: &[(String, String)],
+        headers: &std::collections::HashMap<String, String>,
         body: Option<&str>,
     ) -> Vec<PolicyViolation> {
         self.evaluate_with_categories(policy_name, path, query, headers, body, &[])
@@ -234,7 +241,7 @@ impl PolicyEngine {
         policy_name: Option<&str>,
         path: &str,
         query: Option<&str>,
-        headers: &[(String, String)],
+        headers: &std::collections::HashMap<String, String>,
         body: Option<&str>,
         matched_categories: &[&str],
     ) -> Vec<PolicyViolation> {
@@ -256,26 +263,28 @@ impl PolicyEngine {
 
         let mut violations = Vec::new();
 
-        // Evaluate enabled signature sets against matched WAF rule categories
-        for category in matched_categories {
-            for sig_set in &compiled.config.signature_sets {
-                if !sig_set.enabled {
+        // Evaluate enabled signature sets against matched WAF rule categories.
+        // Pre-lowered category names (hoisted from inner loop) and pre-computed
+        // sig_set_names_lower (built at policy load time) avoid per-request heap
+        // allocations for every category × signature-set pair.
+        let cat_lower: Vec<String> = matched_categories
+            .iter()
+            .map(|c| c.to_lowercase())
+            .collect();
+        for cat in &cat_lower {
+            for (orig_name, sig_name, severity, enabled) in &compiled.sig_set_names_lower {
+                if !enabled {
                     continue;
                 }
-                // Match category names loosely: "SQL Injection (SQLi)" contains "SQL Injection"
-                let sig_name_lower = sig_set.name.to_lowercase();
-                let cat_lower = category.to_lowercase();
-                if cat_lower.contains(&sig_name_lower)
-                    || sig_name_lower.contains(&cat_lower)
-                {
+                if cat.contains(sig_name.as_str()) || sig_name.contains(cat.as_str()) {
                     violations.push(PolicyViolation {
                         rule_id: 0, // signature-set match, not a numbered rule
-                        category: sig_set.name.clone(),
+                        category: orig_name.clone(),
                         description: format!(
                             "Signature set '{}' matched category '{}'",
-                            sig_set.name, category
+                            orig_name, cat
                         ),
-                        severity: sig_set.severity,
+                        severity: *severity,
                         action: RuleAction::Block,
                     });
                 }
@@ -286,12 +295,12 @@ impl PolicyEngine {
             let matched = match target {
                 RuleTarget::Url => pattern.is_match(path),
                 RuleTarget::QueryString => query.map(|q| pattern.is_match(q)).unwrap_or(false),
-                RuleTarget::Headers => headers.iter().any(|(_, v)| pattern.is_match(v)),
+                RuleTarget::Headers => headers.values().any(|v| pattern.is_match(v)),
                 RuleTarget::Body => body.map(|b| pattern.is_match(b)).unwrap_or(false),
                 RuleTarget::All => {
                     pattern.is_match(path)
                         || query.map(|q| pattern.is_match(q)).unwrap_or(false)
-                        || headers.iter().any(|(_, v)| pattern.is_match(v))
+                        || headers.values().any(|v| pattern.is_match(v))
                         || body.map(|b| pattern.is_match(b)).unwrap_or(false)
                 }
             };
@@ -435,7 +444,7 @@ mod tests {
             Some(&name),
             "/trigger-ssrf",
             Some("127.0.0.1"),
-            &[],
+            &std::collections::HashMap::new(),
             None,
         );
         assert!(
@@ -450,7 +459,7 @@ mod tests {
         engine
             .add_policy(default_owasp_policy())
             .expect("add_policy");
-        let v = engine.evaluate(None, "/x", None, &[], Some("connect to 127.0.0.1"));
+        let v = engine.evaluate(None, "/x", None, &std::collections::HashMap::new(), Some("connect to 127.0.0.1"));
         assert!(
             v.iter().any(|x| x.rule_id == 1001),
             "expected SSRF rule 1001 violation, got {:?}",
@@ -465,7 +474,7 @@ mod tests {
             .add_policy(default_owasp_policy())
             .expect("add_policy");
         let body = r#"<?xml version="1.0"?><!DOCTYPE foo [<!ENTITY xxe SYSTEM "file:///etc/passwd">]><r/>"#;
-        let v = engine.evaluate(None, "/xml", None, &[], Some(body));
+        let v = engine.evaluate(None, "/xml", None, &std::collections::HashMap::new(), Some(body));
         assert!(
             v.iter().any(|x| x.rule_id == 1002),
             "expected XXE rule 1002 violation, got {:?}",
@@ -479,11 +488,14 @@ mod tests {
         engine
             .add_policy(default_owasp_policy())
             .expect("add_policy");
+        let headers: std::collections::HashMap<String, String> = [
+            ("X-Request-Id".to_string(), "abc-123".to_string()),
+        ].into_iter().collect();
         let v = engine.evaluate(
             None,
             "/api/v1/resource",
             Some("page=1&sort=name"),
-            &[("X-Request-Id".to_string(), "abc-123".to_string())],
+            &headers,
             Some(r#"{"ok":true}"#),
         );
         assert!(v.is_empty(), "expected no violations, got {:?}", v);
@@ -499,7 +511,7 @@ mod tests {
             None,
             "/health",
             Some("127.0.0.1"),
-            &[],
+            &std::collections::HashMap::new(),
             None,
         );
         assert!(
@@ -515,7 +527,7 @@ mod tests {
         p.enforcement_mode = EnforcementMode::Transparent;
         let mut engine = PolicyEngine::new();
         engine.add_policy(p).expect("add_policy");
-        let v = engine.evaluate(None, "/x", None, &[], Some("127.0.0.1"));
+        let v = engine.evaluate(None, "/x", None, &std::collections::HashMap::new(), Some("127.0.0.1"));
         assert!(!v.is_empty(), "transparent mode still records violations");
         assert!(
             !engine.should_block(&v, None),
@@ -529,7 +541,7 @@ mod tests {
         engine
             .add_policy(default_owasp_policy())
             .expect("add_policy");
-        let v = engine.evaluate(None, "/x", None, &[], Some("127.0.0.1"));
+        let v = engine.evaluate(None, "/x", None, &std::collections::HashMap::new(), Some("127.0.0.1"));
         assert!(
             engine.should_block(&v, None),
             "blocking mode should block on Block action"
@@ -558,7 +570,7 @@ mod tests {
             Some("url-only"),
             "/prefix/BADURL/suffix",
             None,
-            &[],
+            &std::collections::HashMap::new(),
             Some("BADURL in body should not match Url target"),
         );
         assert_eq!(url_hit.len(), 1);
@@ -568,7 +580,7 @@ mod tests {
             Some("url-only"),
             "/clean/path",
             None,
-            &[],
+            &std::collections::HashMap::new(),
             Some("BADURL"),
         );
         assert!(
@@ -600,13 +612,13 @@ mod tests {
             Some("body-only"),
             "/BADBODY/in/path",
             None,
-            &[],
+            &std::collections::HashMap::new(),
             Some("payload BADBODY here"),
         );
         assert_eq!(body_hit.len(), 1);
         assert_eq!(body_hit[0].rule_id, 9002);
 
-        let url_only = engine.evaluate(Some("body-only"), "/clean", None, &[], None);
+        let url_only = engine.evaluate(Some("body-only"), "/clean", None, &std::collections::HashMap::new(), None);
         assert!(
             url_only.is_empty(),
             "Body target must not match when body absent, got {:?}",
@@ -629,7 +641,7 @@ mod tests {
             None,
             "/api/data",
             None,
-            &[],
+            &std::collections::HashMap::new(),
             None,
             &["SQL Injection (SQLi)"],
         );
@@ -648,7 +660,7 @@ mod tests {
             None,
             "/",
             None,
-            &[],
+            &std::collections::HashMap::new(),
             None,
             &["Cross-Site Scripting (XSS)"],
         );
@@ -674,7 +686,7 @@ mod tests {
             None,
             "/",
             None,
-            &[],
+            &std::collections::HashMap::new(),
             None,
             &["SQL Injection (SQLi)"],
         );
@@ -692,7 +704,7 @@ mod tests {
             None,
             "/",
             None,
-            &[],
+            &std::collections::HashMap::new(),
             None,
             &["Unknown Attack Category"],
         );
@@ -709,7 +721,7 @@ mod tests {
         let mut engine = PolicyEngine::new();
         engine.add_policy(default_owasp_policy()).expect("add_policy");
         // Original evaluate() without categories still works
-        let v = engine.evaluate(None, "/x", None, &[], Some("127.0.0.1"));
+        let v = engine.evaluate(None, "/x", None, &std::collections::HashMap::new(), Some("127.0.0.1"));
         assert!(!v.is_empty(), "SSRF custom rule should still match");
     }
 }

@@ -298,10 +298,10 @@ impl WasmPlugin for PathBlockerPlugin {
 /// `proxy_on_request_body`, `proxy_on_response_headers`, and `proxy_on_log`.
 pub struct WasmtimePlugin {
     name: String,
-    /// The compiled wasmtime module, ready for instantiation.
-    module: wasmtime::Module,
-    /// The wasmtime engine shared across all instances.
-    engine: wasmtime::Engine,
+    /// Cached (Store, Instance) pair — created once at load time and reused
+    /// for every callback invocation, eliminating per-call Store allocation
+    /// and Instance linking overhead on the hot path.
+    state: Arc<parking_lot::Mutex<(wasmtime::Store<()>, wasmtime::Instance)>>,
 }
 
 impl std::fmt::Debug for WasmtimePlugin {
@@ -313,32 +313,35 @@ impl std::fmt::Debug for WasmtimePlugin {
 }
 
 impl WasmtimePlugin {
-    /// Loads a `.wasm` file from disk and compiles it into a wasmtime module.
+    /// Loads a `.wasm` file from disk, compiles it, and pre-instantiates
+    /// a Store + Instance pair so callbacks never pay link/alloc overhead.
     ///
     /// # Errors
-    /// Returns an error if the file cannot be read or if the Wasm module
-    /// is malformed.
+    /// Returns an error if the file cannot be read, compilation fails, or
+    /// the module cannot be instantiated.
     pub fn from_file(name: &str, path: &str) -> Result<Self, String> {
         let engine = wasmtime::Engine::default();
         let wasm_bytes = std::fs::read(path)
             .map_err(|e| format!("Failed to read Wasm file '{}': {}", path, e))?;
         let module = wasmtime::Module::new(&engine, &wasm_bytes)
             .map_err(|e| format!("Failed to compile Wasm module '{}': {}", path, e))?;
+        let mut store = wasmtime::Store::new(&engine, ());
+        let instance = wasmtime::Instance::new(&mut store, &module, &[])
+            .map_err(|e| format!("Failed to instantiate Wasm module '{}': {}", path, e))?;
         info!("Loaded Wasm plugin '{}' from {}", name, path);
         Ok(Self {
             name: name.to_string(),
-            module,
-            engine,
+            state: Arc::new(parking_lot::Mutex::new((store, instance))),
         })
     }
 
-    /// Creates a new wasmtime instance and calls the named export function.
+    /// Calls the named export function on the pre-cached instance.
     /// Returns the i32 result code (0 = Continue, 1 = Pause).
     fn call_export(&self, func_name: &str) -> Option<i32> {
-        let mut store = wasmtime::Store::new(&self.engine, ());
-        let instance = wasmtime::Instance::new(&mut store, &self.module, &[]).ok()?;
-        let func = instance.get_typed_func::<(), i32>(&mut store, func_name).ok()?;
-        func.call(&mut store, ()).ok()
+        let mut guard = self.state.lock();
+        let (store, instance) = &mut *guard;
+        let func = instance.get_typed_func::<(), i32>(&mut *store, func_name).ok()?;
+        func.call(&mut *store, ()).ok()
     }
 }
 
@@ -586,60 +589,71 @@ impl WasmPluginManager {
     /// plugins (those without a `wasm_path`) are preserved if they already exist.
     pub fn reload_from_config(&self, config_path: &str) -> Result<usize, String> {
         let configs = Self::load_config_from_file(config_path)?;
-        let mut plugins = self.plugins.write();
 
-        // Build a set of new plugin names for removal detection
-        let new_names: std::collections::HashSet<String> =
-            configs.iter().map(|c| c.name.clone()).collect();
+        // Phase 1: Compute the diff under the write lock, then release.
+        let (to_compile, to_keep): (Vec<_>, Vec<_>) = {
+            let plugins = self.plugins.read();
+            let new_names: std::collections::HashSet<String> =
+                configs.iter().map(|c| c.name.clone()).collect();
+            let existing_names: std::collections::HashSet<String> =
+                plugins.iter().map(|e| e.config.name.clone()).collect();
 
-        // Remove plugins that are no longer in the config
-        let before = plugins.len();
-        plugins.retain(|e| new_names.contains(&e.config.name));
-        let removed = before - plugins.len();
+            let compile: Vec<_> = configs.iter()
+                .filter(|c| c.enabled && !c.wasm_path.is_empty()
+                    && std::path::Path::new(&c.wasm_path).exists()
+                    && !existing_names.contains(&c.name))
+                .cloned()
+                .collect();
 
-        // Track existing plugin names for add-vs-update detection
-        let existing_names: std::collections::HashSet<String> =
-            plugins.iter().map(|e| e.config.name.clone()).collect();
+            let keep: Vec<_> = plugins.iter()
+                .filter(|e| new_names.contains(&e.config.name))
+                .map(|e| (e.plugin.clone(), e.config.clone()))
+                .collect();
 
+            (compile, keep)
+        };
+
+        // Phase 2: Compile new/changed plugins OUTSIDE the lock.
+        let mut compiled = Vec::new();
         let mut added = 0usize;
         let mut errors = Vec::new();
 
-        for cfg in configs {
-            if !cfg.enabled {
-                continue;
-            }
-            if existing_names.contains(&cfg.name) {
-                // Update: remove old and re-add
-                plugins.retain(|e| e.config.name != cfg.name);
-            }
-            if !cfg.wasm_path.is_empty() && std::path::Path::new(&cfg.wasm_path).exists() {
-                match WasmtimePlugin::from_file(&cfg.name, &cfg.wasm_path) {
-                    Ok(plugin) => {
-                        info!("Wasm plugin (re)loaded: {} from {}", cfg.name, cfg.wasm_path);
-                        plugins.push(PluginEntry {
-                            plugin: Arc::new(plugin),
-                            config: cfg,
-                        });
-                        added += 1;
-                    }
-                    Err(e) => {
-                        errors.push(format!("Failed to reload plugin '{}': {}", cfg.name, e));
-                    }
+        for cfg in &to_compile {
+            match WasmtimePlugin::from_file(&cfg.name, &cfg.wasm_path) {
+                Ok(plugin) => {
+                    info!("Wasm plugin compiled: {} from {}", cfg.name, cfg.wasm_path);
+                    compiled.push((Arc::new(plugin), cfg.clone()));
+                    added += 1;
+                }
+                Err(e) => {
+                    errors.push(format!("Failed to compile plugin '{}': {}", cfg.name, e));
                 }
             }
         }
 
-        plugins.sort_by_key(|e| e.config.priority);
+        // Phase 3: Re-acquire write lock and apply.
+        let total_plugins = {
+            let mut plugins = self.plugins.write();
+            plugins.clear();
+            for (plugin, config) in &to_keep {
+                plugins.push(PluginEntry { plugin: plugin.clone(), config: config.clone() });
+            }
+            for (plugin, config) in &compiled {
+                plugins.push(PluginEntry { plugin: plugin.clone(), config: config.clone() });
+            }
+            plugins.sort_by_key(|e| e.config.priority);
+            plugins.len()
+        };
 
         if !errors.is_empty() {
             tracing::warn!("Wasm reload had {} errors: {:?}", errors.len(), errors);
         }
 
         info!(
-            "Wasm plugin reload complete: {} added/updated, {} removed",
-            added, removed
+            "Wasm plugin reload complete: {} added/updated, {} total plugins",
+            added, total_plugins
         );
-        Ok(added + removed)
+        Ok(added)
     }
 }
 

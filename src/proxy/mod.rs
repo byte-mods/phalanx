@@ -225,6 +225,14 @@ fn error_response(
 }
 
 /// Returns true if the Accept header indicates the client wants JSON responses.
+/// Convert Hyper HeaderMap to a plain HashMap for WAF policy evaluation.
+fn headers_to_hashmap(header_map: &hyper::HeaderMap) -> std::collections::HashMap<String, String> {
+    header_map
+        .iter()
+        .map(|(k, v)| (k.as_str().to_string(), v.to_str().unwrap_or("").to_string()))
+        .collect()
+}
+
 fn client_accepts_json(headers: &hyper::HeaderMap) -> bool {
     headers
         .get(hyper::header::ACCEPT)
@@ -250,8 +258,39 @@ fn html_response(
         .expect("Response::builder is infallible for Full<Bytes> body")
 }
 
+/// Logs a rejected request to the access log so security events (WAF blocks,
+/// rate limits, auth denials) are visible — they previously returned before
+/// the success-path `access_logger.log()` call at the end of the handler.
+fn log_rejected(
+    logger: &AccessLogger,
+    ip: &str,
+    method: &str,
+    path: &str,
+    status: u16,
+    start_time: std::time::Instant,
+    user_agent: &str,
+    referer: &str,
+    trace_id: &str,
+    bytes_sent: u64,
+) {
+    logger.log(AccessLogEntry {
+        timestamp: chrono_timestamp(),
+        client_ip: ip.to_string(),
+        method: method.to_string(),
+        path: path.to_string(),
+        status,
+        latency_ms: start_time.elapsed().as_millis() as u64,
+        backend: String::new(),
+        pool: String::new(),
+        bytes_sent,
+        referer: referer.to_string(),
+        user_agent: user_agent.to_string(),
+        trace_id: trace_id.to_string(),
+    });
+}
+
 /// Decodes a single URL-encoded form component (percent-decoding + `+` to space).
-fn decode_form_component(input: &str) -> String {
+pub(crate) fn decode_form_component(input: &str) -> String {
     let mut out = Vec::with_capacity(input.len());
     let bytes = input.as_bytes();
     let mut i = 0;
@@ -275,7 +314,7 @@ fn decode_form_component(input: &str) -> String {
 }
 
 /// Parses an `application/x-www-form-urlencoded` body into a key-value map.
-fn parse_urlencoded_form(bytes: &[u8]) -> std::collections::HashMap<String, String> {
+pub(crate) fn parse_urlencoded_form(bytes: &[u8]) -> std::collections::HashMap<String, String> {
     let mut out = std::collections::HashMap::new();
     let raw = String::from_utf8_lossy(bytes);
     for pair in raw.split('&') {
@@ -292,7 +331,7 @@ fn parse_urlencoded_form(bytes: &[u8]) -> std::collections::HashMap<String, Stri
 }
 
 /// Reconstructs the original URL (path + query string) for post-CAPTCHA redirect.
-fn build_return_to(path: &str, query: Option<&str>) -> String {
+pub(crate) fn build_return_to(path: &str, query: Option<&str>) -> String {
     match query {
         Some(q) if !q.is_empty() => format!("{}?{}", path, q),
         _ => path.to_string(),
@@ -416,6 +455,7 @@ pub async fn start_proxy(
     bandwidth: Arc<crate::telemetry::bandwidth::BandwidthTracker>,
     shutdown: CancellationToken,
     oidc_sessions: crate::auth::oidc::OidcSessionStore,
+    dynamic_routes: Arc<dashmap::DashMap<String, crate::config::RouteConfig>>,
 ) {
     let addr: SocketAddr = match bind_addr.parse() {
         Ok(a) => a,
@@ -472,6 +512,7 @@ pub async fn start_proxy(
         let k8s_clone = Arc::clone(&k8s_controller);
         let bw_clone = Arc::clone(&bandwidth);
         let oidc_clone = Arc::clone(&oidc_sessions);
+        let dynamic_routes_clone = Arc::clone(&dynamic_routes);
 
         // Spawn a new green thread per connection (Tokio task)
         tokio::spawn(async move {
@@ -554,6 +595,7 @@ pub async fn start_proxy(
                 Protocol::Http1 => {
                     let io = TokioIo::new(peekable_stream);
                     let oidc_h1 = Arc::clone(&oidc_clone);
+                    let dynamic_routes_h1 = Arc::clone(&dynamic_routes_clone);
                     let svc = service_fn(move |req| {
                         let upts = Arc::clone(&upstreams_clone);
                         let cfg = Arc::clone(&config_clone);
@@ -573,6 +615,7 @@ pub async fn start_proxy(
                         let k8s_svc = Arc::clone(&k8s_clone);
                         let bw_svc = Arc::clone(&bw_clone);
                         let oidc_svc = Arc::clone(&oidc_h1);
+                        let dynamic_routes_svc = Arc::clone(&dynamic_routes_h1);
                         async move {
                             handle_http_request(
                                 req,
@@ -595,6 +638,7 @@ pub async fn start_proxy(
                                 k8s_svc,
                                 bw_svc,
                                 oidc_svc,
+                                dynamic_routes_svc,
                             )
                             .await
                         }
@@ -608,6 +652,7 @@ pub async fn start_proxy(
                 Protocol::Http2 => {
                     let io = TokioIo::new(peekable_stream);
                     let oidc_h2 = Arc::clone(&oidc_clone);
+                    let dynamic_routes_h2 = Arc::clone(&dynamic_routes_clone);
                     let svc = service_fn(move |req| {
                         let upts = Arc::clone(&upstreams_clone);
                         let cfg = Arc::clone(&config_clone);
@@ -627,6 +672,7 @@ pub async fn start_proxy(
                         let k8s_svc = Arc::clone(&k8s_clone);
                         let bw_svc = Arc::clone(&bw_clone);
                         let oidc_svc = Arc::clone(&oidc_h2);
+                        let dynamic_routes_svc = Arc::clone(&dynamic_routes_h2);
                         async move {
                             handle_http2_request(
                                 req,
@@ -649,6 +695,7 @@ pub async fn start_proxy(
                                 k8s_svc,
                                 bw_svc,
                                 oidc_svc,
+                                dynamic_routes_svc,
                             )
                             .await
                         }
@@ -677,6 +724,7 @@ pub async fn start_proxy(
 
                                 if is_h2 {
                                     let oidc_tls_h2 = Arc::clone(&oidc_clone);
+                                    let dynamic_routes_tls_h2 = Arc::clone(&dynamic_routes_clone);
                                     let svc = service_fn(move |req| {
                                         let upts = Arc::clone(&upstreams_clone);
                                         let cfg = Arc::clone(&config_clone);
@@ -696,6 +744,7 @@ pub async fn start_proxy(
                                         let k8s_svc = Arc::clone(&k8s_clone);
                                         let bw_svc = Arc::clone(&bw_clone);
                                         let oidc_svc = Arc::clone(&oidc_tls_h2);
+                                        let dynamic_routes_svc = Arc::clone(&dynamic_routes_tls_h2);
                                         async move {
                                             handle_http2_request(
                                                 req,
@@ -718,6 +767,7 @@ pub async fn start_proxy(
                                                 k8s_svc,
                                                 bw_svc,
                                                 oidc_svc,
+                                                dynamic_routes_svc,
                                             )
                                             .await
                                         }
@@ -732,6 +782,7 @@ pub async fn start_proxy(
                                     }
                                 } else {
                                     let oidc_tls_h1 = Arc::clone(&oidc_clone);
+                                    let dynamic_routes_tls_h1 = Arc::clone(&dynamic_routes_clone);
                                     let svc = service_fn(move |req| {
                                         let upts = Arc::clone(&upstreams_clone);
                                         let cfg = Arc::clone(&config_clone);
@@ -751,6 +802,7 @@ pub async fn start_proxy(
                                         let k8s_svc = Arc::clone(&k8s_clone);
                                         let bw_svc = Arc::clone(&bw_clone);
                                         let oidc_svc = Arc::clone(&oidc_tls_h1);
+                                        let dynamic_routes_svc = Arc::clone(&dynamic_routes_tls_h1);
                                         async move {
                                             handle_http_request(
                                                 req,
@@ -773,6 +825,7 @@ pub async fn start_proxy(
                                                 k8s_svc,
                                                 bw_svc,
                                                 oidc_svc,
+                                                dynamic_routes_svc,
                                             )
                                             .await
                                         }
@@ -878,6 +931,7 @@ async fn handle_http_request(
     k8s_controller: Arc<Option<crate::k8s::IngressController>>,
     bandwidth: Arc<crate::telemetry::bandwidth::BandwidthTracker>,
     oidc_sessions: crate::auth::oidc::OidcSessionStore,
+    dynamic_routes: Arc<dashmap::DashMap<String, crate::config::RouteConfig>>,
 ) -> Result<Response<BoxBody<Bytes, hyper::Error>>, hyper::Error> {
     let app_config = app_config.load_full();
 
@@ -886,16 +940,30 @@ async fn handle_http_request(
 
     debug!("Handling HTTP request: {}", path);
     let start_time = std::time::Instant::now();
+    let is_websocket = is_websocket_upgrade(&req);
+    let bw_proto = if is_websocket { "ws" } else { "http1" };
+    bandwidth.protocol(bw_proto).inc_requests();
     let method_str = req.method().to_string();
     let req_accepts_json = client_accepts_json(req.headers());
     // Generate a request-scoped trace ID for correlation across logs/errors
-    let (req_trace_id, _req_span_id) = generate_trace_context_ids();
+    let (req_trace_id, req_span_id) = generate_trace_context_ids();
 
     // ── Step 0: Resolve Real Client IP ────────────────────────────────────────
     // Respects X-Forwarded-For from trusted proxies, falls back to socket peer
     let trusted_proxies = realip::TrustedProxies::from_cidrs(&app_config.trusted_proxies);
     let real_ip = realip::resolve_client_ip(&_peer, req.headers(), &trusted_proxies);
     let ip_str = real_ip.to_string();
+    let user_agent = req
+        .headers()
+        .get(hyper::header::USER_AGENT)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string);
+    let referer = req
+        .headers()
+        .get(hyper::header::REFERER)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string)
+        .unwrap_or_default();
 
     // ── HookContext shared snapshots (P2): build Arc<str> once per request ──
     // and Arc::clone (atomic increment, no heap alloc) at each phase site.
@@ -913,6 +981,11 @@ async fn handle_http_request(
     // RAII guard: releases the slot automatically on any exit path
     let _zone_guard = {
         if !zone_limiter.acquire_connection(&ip_str) {
+            log_rejected(
+                &access_logger, &ip_str, &method_str, &path,
+                503, start_time, user_agent.as_deref().unwrap_or(""),
+                &referer, &req_trace_id, 0,
+            );
             return Ok(error_response(
                 hyper::StatusCode::SERVICE_UNAVAILABLE,
                 "Server at capacity",
@@ -1018,11 +1091,7 @@ async fn handle_http_request(
     }
 
     // ── Step 4: WAF + Bot Detection + CAPTCHA ─────────────────────────────────
-    let query = req.uri().query();
-    let user_agent = req
-        .headers()
-        .get(hyper::header::USER_AGENT)
-        .and_then(|v| v.to_str().ok());
+    let query = req.uri().query().map(String::from);
 
     // Capture Accept-Encoding before WAF check (needed later for compression)
     let accept_encoding = req
@@ -1034,29 +1103,46 @@ async fn handle_http_request(
 
     let waf_enabled = app_config.waf_enabled.unwrap_or(false);
     if let Some(manager) = captcha_manager.as_ref() {
-        match manager.evaluate(&ip_str, user_agent.unwrap_or("")) {
+        match manager.evaluate(&ip_str, user_agent.as_deref().unwrap_or("")) {
             crate::waf::bot::CaptchaAction::Allow => {}
             crate::waf::bot::CaptchaAction::Block => {
                 metrics
                     .waf_blocks_total
                     .with_label_values(&["captcha_bot_block"])
                     .inc();
+                log_rejected(
+                    &access_logger, &ip_str, &method_str, &path,
+                    403, start_time, user_agent.as_deref().unwrap_or(""),
+                    &referer, &req_trace_id, 0,
+                );
                 return Ok(empty_response(hyper::StatusCode::FORBIDDEN));
             }
             crate::waf::bot::CaptchaAction::Challenge => {
-                let return_to = build_return_to(&path, query);
+                let return_to = build_return_to(&path, query.as_deref());
+                let challenge_html = manager.challenge_html_for(&ip_str, &return_to);
+                log_rejected(
+                    &access_logger, &ip_str, &method_str, &path,
+                    403, start_time, user_agent.as_deref().unwrap_or(""),
+                    &referer, &req_trace_id, challenge_html.len() as u64,
+                );
                 return Ok(html_response(
                     hyper::StatusCode::FORBIDDEN,
-                    manager.challenge_html_for(&ip_str, &return_to),
+                    challenge_html,
                 ));
             }
         }
     }
     if waf_enabled {
-        if let crate::waf::WafAction::Block(reason) = waf.inspect(&ip_str, &path, query, user_agent)
+        let req_headers_map = headers_to_hashmap(req.headers());
+        if let crate::waf::WafAction::Block(reason) = waf.inspect(&ip_str, &path, query.as_deref(), &req_headers_map, user_agent.as_deref())
         {
             warn!("WAF blocked request from {}: {}", ip_str, reason);
             metrics.waf_blocks_total.with_label_values(&[&reason]).inc();
+            log_rejected(
+                &access_logger, &ip_str, &method_str, &path,
+                403, start_time, user_agent.as_deref().unwrap_or(""),
+                &referer, &req_trace_id, 0,
+            );
             return Ok(empty_response(hyper::StatusCode::FORBIDDEN));
         }
     }
@@ -1067,6 +1153,11 @@ async fn handle_http_request(
         if let Some(geo_result) = db.lookup(&real_ip) {
             if !geo_policy.is_allowed(&geo_result.country_code) {
                 warn!("GeoIP blocked request from {} (country: {})", ip_str, geo_result.country_code);
+                log_rejected(
+                    &access_logger, &ip_str, &method_str, &path,
+                    403, start_time, user_agent.as_deref().unwrap_or(""),
+                    &referer, &req_trace_id, 0,
+                );
                 return Ok(empty_response(hyper::StatusCode::FORBIDDEN));
             }
             crate::geo::inject_geo_headers(req.headers_mut(), &geo_result);
@@ -1079,7 +1170,7 @@ async fn handle_http_request(
     }
 
     // ── Step 7: WebSocket Upgrade Detection ───────────────────────────────────
-    let is_websocket = is_websocket_upgrade(&req);
+    // is_websocket was already computed at the top of the handler for bandwidth counting.
     // If it's a WebSocket upgrade, we must extract the `OnUpgrade` future from the hyper request
     // before the request body is consumed and sent to the backend.
     let client_upgrade = if is_websocket {
@@ -1093,6 +1184,10 @@ async fn handle_http_request(
     // Apply rewrite rules for the matched route BEFORE final dispatch.
     // Supports: break (stop, forward with new URI), last (restart routing),
     //           redirect (302), permanent (301).
+    // A hard limit on `last`-flag restarts prevents infinite loops from
+    // mutually-referencing rewrite rules.
+    const MAX_REWRITE_ITERATIONS: u32 = 10;
+    let mut rewrite_iterations: u32 = 0;
     'rewrite: loop {
         let mut best_match: Option<(&String, &crate::config::RouteConfig)> = None;
         let mut best_len = 0usize;
@@ -1131,6 +1226,17 @@ async fn handle_http_request(
                         new_uri,
                         restart_routing: true,
                     } => {
+                        rewrite_iterations += 1;
+                        if rewrite_iterations > MAX_REWRITE_ITERATIONS {
+                            error!(
+                                "Rewrite loop detected after {} iterations — \
+                                 possible mutually-referencing rules. Last URI: {}",
+                                MAX_REWRITE_ITERATIONS, new_uri
+                            );
+                            return Ok(empty_response(
+                                hyper::StatusCode::INTERNAL_SERVER_ERROR,
+                            ));
+                        }
                         debug!("Rewrite (last): {} -> {}", path, new_uri);
                         path = new_uri;
                         continue 'rewrite; // restart route matching loop
@@ -1182,9 +1288,27 @@ async fn handle_http_request(
         None
     };
 
+    // Dynamic route match storage (owned, so refs outlive the lookup block)
+    let mut dyn_h1_key: Option<String> = None;
+    let mut dyn_h1_cfg: Option<crate::config::RouteConfig> = None;
+
     let route = {
         let mut best_match = None;
         let mut best_len = 0;
+
+        // Check admin API CRUD routes first — app_config.routes can override
+        for entry in dynamic_routes.iter() {
+            let (r_path, r_config) = entry.pair();
+            if path.starts_with(r_path) && r_path.len() > best_len {
+                dyn_h1_key = Some(r_path.clone());
+                dyn_h1_cfg = Some(r_config.clone());
+                best_len = r_path.len();
+            }
+        }
+        if let (Some(k), Some(c)) = (&dyn_h1_key, &dyn_h1_cfg) {
+            best_match = Some((k, c));
+        }
+
         for (r_path, r_config) in &app_config.routes {
             if path.starts_with(r_path.as_str()) && r_path.len() > best_len {
                 best_match = Some((r_path, r_config));
@@ -1264,12 +1388,12 @@ async fn handle_http_request(
                 AuthResult::Allowed => {}
                 AuthResult::Denied(status, msg) => {
                     debug!("Basic auth denied from {}: {}", ip_str, msg);
-                    let mut resp = Response::new(
-                        http_body_util::Full::new(Bytes::from(msg))
-                            .map_err(|_| unreachable!())
-                            .boxed(),
+                    log_rejected(
+                        &access_logger, &ip_str, &method_str, &path,
+                        status.as_u16(), start_time, user_agent.as_deref().unwrap_or(""),
+                        &referer, &req_trace_id, msg.len() as u64,
                     );
-                    *resp.status_mut() = status;
+                    let mut resp = error_response(status, &msg, &req_trace_id, req_accepts_json);
                     resp.headers_mut().insert(
                         hyper::header::WWW_AUTHENTICATE,
                         hyper::header::HeaderValue::from_static("Bearer"),
@@ -1298,12 +1422,12 @@ async fn handle_http_request(
                 }
                 AuthResult::Denied(status, msg) => {
                     debug!("JWT auth denied from {}: {}", ip_str, msg);
-                    let mut resp = Response::new(
-                        http_body_util::Full::new(Bytes::from(msg))
-                            .map_err(|_| unreachable!())
-                            .boxed(),
+                    log_rejected(
+                        &access_logger, &ip_str, &method_str, &path,
+                        status.as_u16(), start_time, user_agent.as_deref().unwrap_or(""),
+                        &referer, &req_trace_id, msg.len() as u64,
                     );
-                    *resp.status_mut() = status;
+                    let mut resp = error_response(status, &msg, &req_trace_id, req_accepts_json);
                     resp.headers_mut().insert(
                         hyper::header::WWW_AUTHENTICATE,
                         hyper::header::HeaderValue::from_static("Bearer"),
@@ -1339,12 +1463,12 @@ async fn handle_http_request(
                 }
                 AuthResult::Denied(status, msg) => {
                     debug!("OAuth auth denied from {}: {}", ip_str, msg);
-                    let mut resp = Response::new(
-                        http_body_util::Full::new(Bytes::from(msg))
-                            .map_err(|_| unreachable!())
-                            .boxed(),
+                    log_rejected(
+                        &access_logger, &ip_str, &method_str, &path,
+                        status.as_u16(), start_time, user_agent.as_deref().unwrap_or(""),
+                        &referer, &req_trace_id, msg.len() as u64,
                     );
-                    *resp.status_mut() = status;
+                    let mut resp = error_response(status, &msg, &req_trace_id, req_accepts_json);
                     resp.headers_mut().insert(
                         hyper::header::WWW_AUTHENTICATE,
                         hyper::header::HeaderValue::from_static("Bearer"),
@@ -1585,7 +1709,7 @@ async fn handle_http_request(
         };
         if waf_enabled && !body_bytes.is_empty() {
             let body_text = String::from_utf8_lossy(&body_bytes);
-            if let crate::waf::WafAction::Block(reason) = waf.inspect_body(&ip_str, &body_text) {
+            if let crate::waf::WafAction::Block(reason) = waf.inspect_body(&ip_str, &body_text, &path, query.as_deref()) {
                 warn!("WAF blocked request body from {}: {}", ip_str, reason);
                 metrics.waf_blocks_total.with_label_values(&[&reason]).inc();
                 return Ok(empty_response(hyper::StatusCode::FORBIDDEN));
@@ -1596,8 +1720,8 @@ async fn handle_http_request(
         mirror_req_body = body_bytes.clone();
 
         if is_grpc_web_req {
-            let req_full = grpc_web::translate_request(Request::from_parts(parts, Full::new(body_bytes)));
-            let (parts, body) = req_full.into_parts();
+            let (parts, body_bytes) = grpc_web::translate_request(parts, body_bytes);
+            let body = Full::new(body_bytes);
             Request::from_parts(parts, body.map_err(|never| match never {}).boxed())
         } else {
             Request::from_parts(
@@ -1721,6 +1845,11 @@ async fn handle_http_request(
         }
         _ => pool_name,
     };
+
+    // Per-pool request counter — counted here (after pool resolution) so that
+    // auth denials, connection failures, and other post-route rejections are
+    // included alongside successful responses.
+    bandwidth.pool(&pool_name).inc_requests();
 
     // ── Resolve gzip + brotli + cache + mirror flags from matched route config ──
     let (route_gzip, route_gzip_min, route_cache, route_cache_ttl, route_brotli, route_mirror) = match route {
@@ -1881,8 +2010,7 @@ async fn handle_http_request(
             }
         }
     }
-    let (trace_id, span_id) = generate_trace_context_ids();
-    crate::telemetry::otel::inject_trace_context(req.headers_mut(), &trace_id, &span_id, true);
+    crate::telemetry::otel::inject_trace_context(req.headers_mut(), &req_trace_id, &req_span_id, true);
 
     // ── Resolve timeout + retry settings: route -> global -> hardcoded defaults ──
     let connect_timeout = std::time::Duration::from_secs({
@@ -2007,6 +2135,7 @@ async fn handle_http_request(
                         .with_label_values(&[&current_backend.config.address, &pool_name, &phase])
                         .inc();
                     current_backend.active_connections.fetch_sub(1, Ordering::Relaxed);
+                    metrics.active_connections.dec();
                     return Ok(error_response(hyper::StatusCode::SERVICE_UNAVAILABLE, "Backend HTTP/2 handshake failed", &req_trace_id, req_accepts_json));
                 }
             };
@@ -2338,12 +2467,12 @@ async fn handle_http_request(
 
             // ── Compression: prefer Brotli > Gzip ──
             let (final_body, content_encoding) = if should_brotli {
-                match crate::middleware::brotli::brotli_compress(&body_bytes, 6) {
+                match crate::middleware::brotli::brotli_compress_async(body_bytes.clone(), 6).await {
                     Some(compressed) => (compressed, "br"),
                     None => (body_bytes, ""),
                 }
             } else if should_compress {
-                match compression::gzip_compress(&body_bytes) {
+                match compression::gzip_compress_async(body_bytes.clone()).await {
                     Some(compressed) => (compressed, "gzip"),
                     None => (body_bytes, ""),
                 }
@@ -2435,12 +2564,10 @@ async fn handle_http_request(
             // Bandwidth tracking: record bytes in/out for this protocol
             let bw_proto = if is_websocket { "ws" } else { "http1" };
             let bw_stats = bandwidth.protocol(bw_proto);
-            bw_stats.inc_requests();
             bw_stats.add_out(body_len as u64);
 
-            // Per-pool bandwidth tracking
+            // Per-pool bandwidth tracking (inc_requests already called at pool resolution)
             let pool_bw = bandwidth.pool(&pool_name);
-            pool_bw.inc_requests();
             pool_bw.add_out(body_len as u64);
 
             // Wasm OnResponseHeaders: execute plugins on response
@@ -2478,8 +2605,8 @@ async fn handle_http_request(
                 backend: backend_addr,
                 pool: pool_name.clone(),
                 bytes_sent: body_len as u64,
-                referer: String::new(),
-                user_agent: String::new(),
+                referer: referer.to_string(),
+                user_agent: user_agent.clone().unwrap_or_default(),
                 trace_id: req_trace_id.clone(),
             });
 
@@ -2542,8 +2669,8 @@ async fn handle_http_request(
                 backend: backend_addr,
                 pool: pool_name,
                 bytes_sent: 0,
-                referer: String::new(),
-                user_agent: String::new(),
+                referer: referer.to_string(),
+                user_agent: user_agent.clone().unwrap_or_default(),
                 trace_id: req_trace_id.clone(),
             });
 
@@ -2593,6 +2720,7 @@ async fn handle_http2_request(
     k8s_controller: Arc<Option<crate::k8s::IngressController>>,
     bandwidth: Arc<crate::telemetry::bandwidth::BandwidthTracker>,
     oidc_sessions: crate::auth::oidc::OidcSessionStore,
+    dynamic_routes: Arc<dashmap::DashMap<String, crate::config::RouteConfig>>,
 ) -> Result<Response<BoxBody<Bytes, hyper::Error>>, hyper::Error> {
     let app_config = app_config.load_full();
 
@@ -2605,6 +2733,9 @@ async fn handle_http2_request(
         .map(|ct| ct.starts_with("application/grpc"))
         .unwrap_or(false);
 
+    let bw_proto = if is_grpc { "grpc" } else { "http2" };
+    bandwidth.protocol(bw_proto).inc_requests();
+
     if is_grpc {
         debug!("gRPC request detected: {}", path);
     } else {
@@ -2614,7 +2745,7 @@ async fn handle_http2_request(
     let start_time = std::time::Instant::now();
     let method_str = req.method().to_string();
     let req_accepts_json = client_accepts_json(req.headers());
-    let (req_trace_id, _req_span_id) = generate_trace_context_ids();
+    let (req_trace_id, req_span_id) = generate_trace_context_ids();
 
     // ── Step 0: Real IP resolution (parity with HTTP/1) ──
     let trusted_proxies = realip::TrustedProxies::from_cidrs(&app_config.trusted_proxies);
@@ -2644,6 +2775,12 @@ async fn handle_http2_request(
         .get(hyper::header::USER_AGENT)
         .and_then(|v| v.to_str().ok())
         .map(str::to_string);
+    let referer_str = req
+        .headers()
+        .get(hyper::header::REFERER)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string)
+        .unwrap_or_default();
 
     let accept_encoding_str = req
         .headers()
@@ -2756,7 +2893,8 @@ async fn handle_http2_request(
         }
     }
     if waf_enabled {
-        if let crate::waf::WafAction::Block(reason) = waf.inspect(&ip_str, &path, query_str.as_deref(), user_agent_str.as_deref())
+        let req_headers_map = headers_to_hashmap(req.headers());
+        if let crate::waf::WafAction::Block(reason) = waf.inspect(&ip_str, &path, query_str.as_deref(), &req_headers_map, user_agent_str.as_deref())
         {
             warn!("WAF blocked HTTP/2 request from {}: {}", ip_str, reason);
             metrics.waf_blocks_total.with_label_values(&[&reason]).inc();
@@ -2776,6 +2914,8 @@ async fn handle_http2_request(
     }
 
     // ── Rewrite Engine (parity with HTTP/1) ──
+    const MAX_REWRITE_ITERATIONS_H2: u32 = 10;
+    let mut rewrite_iterations_h2: u32 = 0;
     'rewrite: loop {
         let mut best_match: Option<(&String, &crate::config::RouteConfig)> = None;
         let mut best_len = 0usize;
@@ -2812,6 +2952,16 @@ async fn handle_http2_request(
                         new_uri,
                         restart_routing: true,
                     } => {
+                        rewrite_iterations_h2 += 1;
+                        if rewrite_iterations_h2 > MAX_REWRITE_ITERATIONS_H2 {
+                            error!(
+                                "Rewrite loop detected in H2 after {} iterations. Last URI: {}",
+                                MAX_REWRITE_ITERATIONS_H2, new_uri
+                            );
+                            return Ok(empty_response(
+                                hyper::StatusCode::INTERNAL_SERVER_ERROR,
+                            ));
+                        }
                         path = new_uri;
                         continue 'rewrite;
                     }
@@ -2856,9 +3006,27 @@ async fn handle_http2_request(
         None
     };
 
+    // Dynamic route match storage (owned, so refs outlive the lookup block)
+    let mut dyn_h2_key: Option<String> = None;
+    let mut dyn_h2_cfg: Option<crate::config::RouteConfig> = None;
+
     let route = {
         let mut best_match = None;
         let mut best_len = 0;
+
+        // Check admin API CRUD routes first — app_config.routes can override
+        for entry in dynamic_routes.iter() {
+            let (r_path, r_config) = entry.pair();
+            if path.starts_with(r_path) && r_path.len() > best_len {
+                dyn_h2_key = Some(r_path.clone());
+                dyn_h2_cfg = Some(r_config.clone());
+                best_len = r_path.len();
+            }
+        }
+        if let (Some(k), Some(c)) = (&dyn_h2_key, &dyn_h2_cfg) {
+            best_match = Some((k, c));
+        }
+
         for (r_path, r_config) in &app_config.routes {
             if path.starts_with(r_path) && r_path.len() > best_len {
                 best_match = Some((r_path, r_config));
@@ -3229,7 +3397,7 @@ async fn handle_http2_request(
         };
         if !body_bytes.is_empty() {
             let body_text = String::from_utf8_lossy(&body_bytes);
-            if let crate::waf::WafAction::Block(reason) = waf.inspect_body(&ip_str, &body_text) {
+            if let crate::waf::WafAction::Block(reason) = waf.inspect_body(&ip_str, &body_text, &path, query_str.as_deref()) {
                 warn!(
                     "WAF blocked HTTP/2 request body from {}: {}",
                     ip_str, reason
@@ -3350,6 +3518,11 @@ async fn handle_http2_request(
         }
         _ => pool_name,
     };
+
+    // Per-pool request counter — counted here (after pool resolution) so that
+    // auth denials, connection failures, and other post-route rejections are
+    // included alongside successful responses.
+    bandwidth.pool(&pool_name).inc_requests();
 
     // ── PreUpstream Hooks ──
     if hook_engine.has_hooks(crate::scripting::HookPhase::PreUpstream) {
@@ -3488,8 +3661,7 @@ async fn handle_http2_request(
             }
         }
     }
-    let (trace_id, span_id) = generate_trace_context_ids();
-    crate::telemetry::otel::inject_trace_context(req.headers_mut(), &trace_id, &span_id, true);
+    crate::telemetry::otel::inject_trace_context(req.headers_mut(), &req_trace_id, &req_span_id, true);
 
     // ── Resolve timeout settings: route -> global -> hardcoded defaults ──
     let h2_connect_timeout = std::time::Duration::from_secs({
@@ -3512,18 +3684,20 @@ async fn handle_http2_request(
     };
     let pool_ref = Arc::clone(pool_ref);
 
-    let stream = match tokio::time::timeout(h2_connect_timeout, pool_ref.connection_pool.acquire(&backend.config.address)).await {
+    let stream = match tokio::time::timeout(h2_connect_timeout, pool_ref.connection_pool.acquire_pooled(&backend.config.address)).await {
         Ok(Ok(s)) => s,
         Ok(Err(e)) => {
             error!("Failed to connect to backend {}: {}", backend.config.address, e);
             metrics.backend_errors_total.with_label_values(&[&backend.config.address, &pool_name, &"connect".to_string()]).inc();
             backend.active_connections.fetch_sub(1, Ordering::Relaxed);
+            metrics.active_connections.dec();
             return Ok(error_response(hyper::StatusCode::SERVICE_UNAVAILABLE, "Failed to connect to backend", &req_trace_id, req_accepts_json));
         }
         Err(_) => {
             warn!("Connect timeout to backend {} after {:?}", backend.config.address, h2_connect_timeout);
             metrics.backend_errors_total.with_label_values(&[&backend.config.address, &pool_name, &"timeout".to_string()]).inc();
             backend.active_connections.fetch_sub(1, Ordering::Relaxed);
+            metrics.active_connections.dec();
             backend.record_failure();
             return Ok(error_response(hyper::StatusCode::GATEWAY_TIMEOUT, "Backend connect timeout", &req_trace_id, req_accepts_json));
         }
@@ -3538,6 +3712,7 @@ async fn handle_http2_request(
                 error!("HTTP/2 Handshake failed with backend {}: {}", backend.config.address, e);
                 metrics.backend_errors_total.with_label_values(&[&backend.config.address, &pool_name, &"handshake".to_string()]).inc();
                 backend.active_connections.fetch_sub(1, Ordering::Relaxed);
+                metrics.active_connections.dec();
                 return Ok(error_response(hyper::StatusCode::SERVICE_UNAVAILABLE, "HTTP/2 handshake failed with backend", &req_trace_id, req_accepts_json));
             }
         };
@@ -3554,10 +3729,12 @@ async fn handle_http2_request(
             warn!("Read timeout from backend {} after {:?}", backend.config.address, h2_read_timeout);
             backend.record_failure();
             backend.active_connections.fetch_sub(1, Ordering::Relaxed);
+            metrics.active_connections.dec();
             return Ok(error_response(hyper::StatusCode::GATEWAY_TIMEOUT, "Backend read timeout", &req_trace_id, req_accepts_json));
         }
     };
     backend.active_connections.fetch_sub(1, Ordering::Relaxed);
+    metrics.active_connections.dec();
 
     let backend_addr = backend.config.address.clone();
 
@@ -3759,12 +3936,12 @@ async fn handle_http2_request(
                 && body_len >= crate::middleware::brotli::MIN_BROTLI_SIZE;
 
             let (final_body, content_encoding) = if should_brotli {
-                match crate::middleware::brotli::brotli_compress(&body_bytes, 6) {
+                match crate::middleware::brotli::brotli_compress_async(body_bytes.clone(), 6).await {
                     Some(compressed) => (compressed, "br"),
                     None => (body_bytes, ""),
                 }
             } else if should_compress {
-                match compression::gzip_compress(&body_bytes) {
+                match compression::gzip_compress_async(body_bytes.clone()).await {
                     Some(compressed) => (compressed, "gzip"),
                     None => (body_bytes, ""),
                 }
@@ -3824,12 +4001,10 @@ async fn handle_http2_request(
             // Bandwidth tracking
             let bw_proto = if is_grpc { "grpc" } else { "http2" };
             let bw_stats = bandwidth.protocol(bw_proto);
-            bw_stats.inc_requests();
             bw_stats.add_out(body_len as u64);
 
-            // Per-pool bandwidth tracking
+            // Per-pool bandwidth tracking (inc_requests already called at pool resolution)
             let pool_bw = bandwidth.pool(&pool_name);
-            pool_bw.inc_requests();
             pool_bw.add_out(body_len as u64);
 
             // Wasm OnResponseHeaders
@@ -3870,8 +4045,8 @@ async fn handle_http2_request(
                 backend: backend_addr,
                 pool: pool_name.clone(),
                 bytes_sent: body_len as u64,
-                referer: String::new(),
-                user_agent: String::new(),
+                referer: referer_str.clone(),
+                user_agent: user_agent_str.clone().unwrap_or_default(),
                 trace_id: req_trace_id.clone(),
             });
 
@@ -3931,8 +4106,8 @@ async fn handle_http2_request(
                 backend: backend_addr,
                 pool: pool_name,
                 bytes_sent: 0,
-                referer: String::new(),
-                user_agent: String::new(),
+                referer: referer_str.clone(),
+                user_agent: user_agent_str.clone().unwrap_or_default(),
                 trace_id: req_trace_id.clone(),
             });
 
@@ -3955,7 +4130,7 @@ async fn handle_http2_request(
 /// - `span_id` is a 16-character hex string (64-bit random).
 ///
 /// These are injected into the `traceparent` header on upstream requests.
-fn generate_trace_context_ids() -> (String, String) {
+pub(crate) fn generate_trace_context_ids() -> (String, String) {
     let mut trace = [0u8; 16];
     let mut span = [0u8; 8];
     let mut rng = rand::rng();
@@ -3988,27 +4163,27 @@ pub fn chrono_timestamp() -> String {
 /// 4. Verify the canonical path still starts with the canonical `base`.
 ///
 /// Returns `None` if the file does not exist or the path escapes the base.
-fn sanitize_path(base: &std::path::Path, requested: &str) -> Option<std::path::PathBuf> {
-    // Remove leading slash and query params
+async fn sanitize_path(base: &std::path::Path, requested: &str) -> Option<std::path::PathBuf> {
     let req_path = requested
         .trim_start_matches('/')
         .split('?')
         .next()
         .unwrap_or("");
     let full_path = base.join(req_path);
+    let base_path = base.to_path_buf();
 
-    // Canonicalize to resolve symlinks and ../
-    match full_path.canonicalize() {
-        Ok(canon) => {
-            // Ensure the canonicalized path starts with the base directory
-            if canon.starts_with(base.canonicalize().unwrap_or_else(|_| base.to_path_buf())) {
-                Some(canon)
-            } else {
-                None // Traversal attempt!
+    tokio::task::spawn_blocking(move || {
+        match full_path.canonicalize() {
+            Ok(canon) => {
+                if canon.starts_with(base_path.canonicalize().unwrap_or_else(|_| base_path.clone())) {
+                    Some(canon)
+                } else {
+                    None
+                }
             }
+            Err(_) => None,
         }
-        Err(_) => None, // File does not exist or unreadable
-    }
+    }).await.unwrap_or(None)
 }
 
 // ── Static File Server ──────────────────────────────────────────────────────
@@ -4042,6 +4217,16 @@ async fn serve_static_file<T>(
     ip_str: &str,
 ) -> Result<Response<BoxBody<Bytes, hyper::Error>>, hyper::Error> {
     let start_time = std::time::Instant::now();
+    let static_user_agent = _req
+        .headers()
+        .get(hyper::header::USER_AGENT)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    let static_referer = _req
+        .headers()
+        .get(hyper::header::REFERER)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
     let base_path = std::path::Path::new(&root_dir);
 
     // Only allow GET or HEAD requests for static files
@@ -4062,11 +4247,11 @@ async fn serve_static_file<T>(
 
     // Attempt to safely resolve the file path mapping
     // E.g. root: /var/www/html, rel: /css/style.css -> /var/www/html/css/style.css
-    let safe_path = match sanitize_path(base_path, relative_path) {
+    let safe_path = match sanitize_path(base_path, relative_path).await {
         Some(p) => {
             if p.is_dir() {
                 // Try serving index.html if it's a directory
-                match sanitize_path(base_path, &format!("{}/index.html", relative_path)) {
+                match sanitize_path(base_path, &format!("{}/index.html", relative_path)).await {
                     Some(idx) => idx,
                     None => return Ok(empty_response(hyper::StatusCode::FORBIDDEN)),
                 }
@@ -4085,8 +4270,8 @@ async fn serve_static_file<T>(
                 backend: "static_files".to_string(),
                 pool: format!("root:{}", root_dir),
                 bytes_sent: 0,
-                referer: String::new(),
-                user_agent: String::new(),
+                referer: static_referer.to_string(),
+                user_agent: static_user_agent.to_string(),
                 trace_id: String::new(),
             });
             return Ok(empty_response(hyper::StatusCode::NOT_FOUND));
@@ -4122,8 +4307,8 @@ async fn serve_static_file<T>(
         backend: "static_files".to_string(),
         pool: format!("root:{}", root_dir),
         bytes_sent: file_size,
-        referer: String::new(),
-        user_agent: String::new(),
+        referer: static_referer.to_string(),
+        user_agent: static_user_agent.to_string(),
         trace_id: String::new(),
     });
 

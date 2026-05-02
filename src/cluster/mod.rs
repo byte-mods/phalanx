@@ -37,16 +37,38 @@ pub struct ClusterState {
     gossip_state: Option<Arc<GossipState>>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub enum ClusterBackend {
-    /// etcd v3 API endpoint
-    Etcd { endpoints: Vec<String> },
-    /// Redis connection URL
-    Redis { url: String },
+    /// etcd v3 API endpoint with lazily-initialized persistent client.
+    Etcd {
+        endpoints: Vec<String>,
+        #[allow(clippy::type_complexity)]
+        client: Arc<tokio::sync::Mutex<Option<etcd_client::Client>>>,
+    },
+    /// Redis connection URL with lazily-initialized persistent client.
+    Redis {
+        url: String,
+        client: Arc<tokio::sync::Mutex<Option<redis::Client>>>,
+    },
     /// Gossip-based peer-to-peer sync (no external dependencies)
     Gossip { bind_addr: String, seed_peers: Vec<String> },
     /// Single-node mode (no-op)
     Standalone,
+}
+
+impl std::fmt::Debug for ClusterBackend {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Etcd { endpoints, .. } => f.debug_struct("Etcd").field("endpoints", endpoints).finish(),
+            Self::Redis { url, .. } => f.debug_struct("Redis").field("url", url).finish(),
+            Self::Gossip { bind_addr, seed_peers } => f
+                .debug_struct("Gossip")
+                .field("bind_addr", bind_addr)
+                .field("seed_peers", seed_peers)
+                .finish(),
+            Self::Standalone => write!(f, "Standalone"),
+        }
+    }
 }
 
 /// A key-value entry stored in the cluster state with metadata for conflict resolution.
@@ -106,40 +128,50 @@ impl ClusterState {
         };
 
         match &self.backend {
-            ClusterBackend::Etcd { endpoints } => {
-                let endpoint = endpoints.first().ok_or("No etcd endpoints")?;
-                let mut client = etcd_client::Client::connect([endpoint.as_str()], None)
-                    .await
-                    .map_err(|e| format!("etcd connect error: {}", e))?;
+            ClusterBackend::Etcd { endpoints, client } => {
+                let mut guard = client.lock().await;
+                if guard.is_none() {
+                    let endpoint = endpoints.first().ok_or("No etcd endpoints")?;
+                    *guard = Some(
+                        etcd_client::Client::connect([endpoint.as_str()], None)
+                            .await
+                            .map_err(|e| format!("etcd connect error: {}", e))?,
+                    );
+                }
+                let c = guard.as_mut().unwrap();
 
                 let serialized =
                     serde_json::to_string(&entry).map_err(|e| format!("serialize: {}", e))?;
 
                 if let Some(ttl) = ttl_secs {
-                    let lease = client
+                    let lease = c
                         .lease_grant(ttl as i64, None)
                         .await
                         .map_err(|e| format!("lease grant: {}", e))?;
-                    client
-                        .put(
-                            key,
-                            serialized,
-                            Some(etcd_client::PutOptions::new().with_lease(lease.id())),
-                        )
-                        .await
-                        .map_err(|e| format!("etcd put: {}", e))?;
+                    c.put(
+                        key,
+                        serialized,
+                        Some(etcd_client::PutOptions::new().with_lease(lease.id())),
+                    )
+                    .await
+                    .map_err(|e| format!("etcd put: {}", e))?;
                 } else {
-                    client
-                        .put(key, serialized, None)
+                    c.put(key, serialized, None)
                         .await
                         .map_err(|e| format!("etcd put: {}", e))?;
                 }
                 Ok(())
             }
-            ClusterBackend::Redis { url } => {
-                let client = redis::Client::open(url.as_str())
-                    .map_err(|e| format!("Redis connect error: {}", e))?;
-                let mut con = client
+            ClusterBackend::Redis { url, client } => {
+                let mut guard = client.lock().await;
+                if guard.is_none() {
+                    *guard = Some(
+                        redis::Client::open(url.as_str())
+                            .map_err(|e| format!("Redis connect error: {}", e))?,
+                    );
+                }
+                let c = guard.as_ref().unwrap();
+                let mut con = c
                     .get_multiplexed_async_connection()
                     .await
                     .map_err(|e| format!("Redis connection error: {}", e))?;
@@ -179,13 +211,19 @@ impl ClusterState {
     /// Retrieves a value from the cluster KV store.
     pub async fn get(&self, key: &str) -> Result<Option<ClusterEntry>, String> {
         match &self.backend {
-            ClusterBackend::Etcd { endpoints } => {
-                let endpoint = endpoints.first().ok_or("No etcd endpoints")?;
-                let mut client = etcd_client::Client::connect([endpoint.as_str()], None)
-                    .await
-                    .map_err(|e| format!("etcd connect: {}", e))?;
+            ClusterBackend::Etcd { endpoints, client } => {
+                let mut guard = client.lock().await;
+                if guard.is_none() {
+                    let endpoint = endpoints.first().ok_or("No etcd endpoints")?;
+                    *guard = Some(
+                        etcd_client::Client::connect([endpoint.as_str()], None)
+                            .await
+                            .map_err(|e| format!("etcd connect: {}", e))?,
+                    );
+                }
+                let c = guard.as_mut().unwrap();
 
-                let resp = client
+                let resp = c
                     .get(key, None)
                     .await
                     .map_err(|e| format!("etcd get: {}", e))?;
@@ -199,10 +237,16 @@ impl ClusterState {
                     Ok(None)
                 }
             }
-            ClusterBackend::Redis { url } => {
-                let client = redis::Client::open(url.as_str())
-                    .map_err(|e| format!("Redis connect error: {}", e))?;
-                let mut con = client
+            ClusterBackend::Redis { url, client } => {
+                let mut guard = client.lock().await;
+                if guard.is_none() {
+                    *guard = Some(
+                        redis::Client::open(url.as_str())
+                            .map_err(|e| format!("Redis connect error: {}", e))?,
+                    );
+                }
+                let c = guard.as_ref().unwrap();
+                let mut con = c
                     .get_multiplexed_async_connection()
                     .await
                     .map_err(|e| format!("Redis connection error: {}", e))?;
@@ -240,21 +284,32 @@ impl ClusterState {
     /// Deletes a key from the cluster KV store.
     pub async fn delete(&self, key: &str) -> Result<(), String> {
         match &self.backend {
-            ClusterBackend::Etcd { endpoints } => {
-                let endpoint = endpoints.first().ok_or("No etcd endpoints")?;
-                let mut client = etcd_client::Client::connect([endpoint.as_str()], None)
-                    .await
-                    .map_err(|e| format!("etcd connect: {}", e))?;
-                client
-                    .delete(key, None)
+            ClusterBackend::Etcd { endpoints, client } => {
+                let mut guard = client.lock().await;
+                if guard.is_none() {
+                    let endpoint = endpoints.first().ok_or("No etcd endpoints")?;
+                    *guard = Some(
+                        etcd_client::Client::connect([endpoint.as_str()], None)
+                            .await
+                            .map_err(|e| format!("etcd connect: {}", e))?,
+                    );
+                }
+                let c = guard.as_mut().unwrap();
+                c.delete(key, None)
                     .await
                     .map_err(|e| format!("etcd delete: {}", e))?;
                 Ok(())
             }
-            ClusterBackend::Redis { url } => {
-                let client = redis::Client::open(url.as_str())
-                    .map_err(|e| format!("Redis connect error: {}", e))?;
-                let mut con = client
+            ClusterBackend::Redis { url, client } => {
+                let mut guard = client.lock().await;
+                if guard.is_none() {
+                    *guard = Some(
+                        redis::Client::open(url.as_str())
+                            .map_err(|e| format!("Redis connect error: {}", e))?,
+                    );
+                }
+                let c = guard.as_ref().unwrap();
+                let mut con = c
                     .get_multiplexed_async_connection()
                     .await
                     .map_err(|e| format!("Redis connection error: {}", e))?;
@@ -321,6 +376,48 @@ impl ClusterState {
     pub fn node_id(&self) -> &str {
         &self.node_id
     }
+
+    /// Returns the list of known cluster nodes with their health status.
+    /// In gossip mode, reads from the live membership table.
+    /// In standalone mode, returns only this node.
+    pub fn list_nodes(&self) -> Vec<NodeInfo> {
+        if let Some(ref gs) = self.gossip_state {
+            gs.snapshot_members()
+                .into_iter()
+                .map(|p| NodeInfo {
+                    node_id: p.node_id,
+                    status: match p.state {
+                        gossip::NodeState::Alive => "healthy",
+                        gossip::NodeState::Suspect => "suspect",
+                        gossip::NodeState::Dead => "dead",
+                    }
+                    .to_string(),
+                    last_seen_secs: SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_secs()
+                        .saturating_sub(p.last_seen),
+                    addr: p.addr.to_string(),
+                })
+                .collect()
+        } else {
+            vec![NodeInfo {
+                node_id: self.node_id.clone(),
+                status: "healthy".to_string(),
+                last_seen_secs: 0,
+                addr: String::new(),
+            }]
+        }
+    }
+}
+
+/// Public summary of a cluster node for the admin dashboard.
+#[derive(Debug, Clone, Serialize)]
+pub struct NodeInfo {
+    pub node_id: String,
+    pub status: String,
+    pub last_seen_secs: u64,
+    pub addr: String,
 }
 
 #[cfg(test)]
@@ -378,14 +475,14 @@ mod tests {
 
     #[test]
     fn test_redis_backend_debug() {
-        let backend = ClusterBackend::Redis { url: "redis://localhost".to_string() };
+        let backend = ClusterBackend::Redis { url: "redis://localhost".to_string(), client: Arc::new(tokio::sync::Mutex::new(None)) };
         let debug_str = format!("{:?}", backend);
         assert!(debug_str.contains("Redis"));
     }
 
     #[test]
     fn test_etcd_backend_debug() {
-        let backend = ClusterBackend::Etcd { endpoints: vec!["http://localhost:2379".to_string()] };
+        let backend = ClusterBackend::Etcd { endpoints: vec!["http://localhost:2379".to_string()], client: Arc::new(tokio::sync::Mutex::new(None)) };
         let debug_str = format!("{:?}", backend);
         assert!(debug_str.contains("Etcd"));
     }

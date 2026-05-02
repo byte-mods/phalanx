@@ -47,6 +47,15 @@ pub mod linux {
     use std::os::unix::io::OwnedFd;
     use tokio::net::TcpStream;
 
+    /// Convert a nix::Error to std::io::Error by extracting the real OS errno.
+    /// The `e as i32` cast gives the enum discriminant, NOT the errno code.
+    fn nix_to_io(e: nix::Error) -> std::io::Error {
+        match e.as_errno() {
+            Some(errno) => std::io::Error::from(errno),
+            None => std::io::Error::new(std::io::ErrorKind::Other, e),
+        }
+    }
+
     /// Splice data in one direction: `src` socket -> kernel pipe -> `dst` socket.
     ///
     /// Runs in a loop until `src` reaches EOF (returns 0 from splice).
@@ -78,7 +87,7 @@ pub mod linux {
                         65536,
                         SpliceFFlags::SPLICE_F_MOVE | SpliceFFlags::SPLICE_F_NONBLOCK,
                     )
-                    .map_err(|e| std::io::Error::from_raw_os_error(e as i32))
+                    .map_err(nix_to_io)
                 });
 
                 match res {
@@ -106,7 +115,7 @@ pub mod linux {
                         65536,
                         SpliceFFlags::SPLICE_F_MOVE | SpliceFFlags::SPLICE_F_NONBLOCK,
                     )
-                    .map_err(|e| std::io::Error::from_raw_os_error(e as i32))
+                    .map_err(nix_to_io)
                 });
 
                 match res {

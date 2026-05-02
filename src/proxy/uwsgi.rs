@@ -18,9 +18,13 @@ use http_body_util::combinators::BoxBody;
 use http_body_util::{BodyExt, StreamBody};
 use hyper::{Request, Response, StatusCode};
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tracing::error;
+
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+const EXEC_TIMEOUT: Duration = Duration::from_secs(30);
 
 use crate::proxy::chrono_timestamp;
 use crate::telemetry::access_log::{AccessLogEntry, AccessLogger};
@@ -70,10 +74,32 @@ where
 {
     let start_time = std::time::Instant::now();
 
-    let stream = match TcpStream::connect(&uwsgi_pass).await {
-        Ok(s) => s,
-        Err(e) => {
+    let stream = match tokio::time::timeout(CONNECT_TIMEOUT, TcpStream::connect(&uwsgi_pass)).await {
+        Ok(Ok(s)) => s,
+        Ok(Err(e)) => {
             error!("Failed to connect to uWSGI server {}: {}", uwsgi_pass, e);
+            access_logger.log(AccessLogEntry {
+                timestamp: chrono_timestamp(),
+                client_ip: ip_str.to_string(),
+                method: method_str.to_string(),
+                path: req_path.to_string(),
+                status: 502,
+                latency_ms: start_time.elapsed().as_millis() as u64,
+                backend: "uwsgi".to_string(),
+                pool: uwsgi_pass,
+                bytes_sent: 0,
+                referer: String::new(),
+                user_agent: String::new(),
+                trace_id: String::new(),
+            });
+            return Ok(empty_response(StatusCode::BAD_GATEWAY));
+        }
+        Err(_elapsed) => {
+            error!(
+                "Timeout connecting to uWSGI server {} ({}s)",
+                uwsgi_pass,
+                CONNECT_TIMEOUT.as_secs()
+            );
             access_logger.log(AccessLogEntry {
                 timestamp: chrono_timestamp(),
                 client_ip: ip_str.to_string(),
@@ -162,24 +188,33 @@ where
     let mut cgi_headers_done = false;
     let mut first_body_chunk = None;
 
-    let mut buf = [0; 4096];
-    while let Ok(n) = rx.read(&mut buf).await {
-        if n == 0 {
-            break;
-        }
-
-        let chunk = &buf[..n];
-        if !cgi_headers_done {
-            header_buf.extend_from_slice(chunk);
-            if let Some(pos) = header_buf.windows(4).position(|w| w == b"\r\n\r\n") {
-                let body_start = header_buf.split_off(pos + 4);
-                if !body_start.is_empty() {
-                    first_body_chunk = Some(Bytes::from(body_start));
+    let header_read = tokio::time::timeout(EXEC_TIMEOUT, async {
+        let mut buf = [0; 4096];
+        loop {
+            match rx.read(&mut buf).await {
+                Ok(0) => break,
+                Ok(n) => {
+                    let chunk = &buf[..n];
+                    if !cgi_headers_done {
+                        header_buf.extend_from_slice(chunk);
+                        if let Some(pos) = header_buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                            let body_start = header_buf.split_off(pos + 4);
+                            if !body_start.is_empty() {
+                                first_body_chunk = Some(Bytes::from(body_start));
+                            }
+                            cgi_headers_done = true;
+                            break;
+                        }
+                    }
                 }
-                cgi_headers_done = true;
-                break;
+                Err(_) => break,
             }
         }
+    }).await;
+
+    if header_read.is_err() {
+        error!("uWSGI response header read timeout ({}s)", EXEC_TIMEOUT.as_secs());
+        return Ok(empty_response(StatusCode::GATEWAY_TIMEOUT));
     }
 
     if !cgi_headers_done {

@@ -20,9 +20,13 @@ use http_body_util::combinators::BoxBody;
 use http_body_util::{BodyExt, StreamBody};
 use hyper::{Request, Response, StatusCode};
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::net::TcpStream;
 use tokio_util::io::StreamReader;
 use tracing::error;
+
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+const EXEC_TIMEOUT: Duration = Duration::from_secs(30);
 
 use crate::proxy::chrono_timestamp;
 use crate::telemetry::access_log::{AccessLogEntry, AccessLogger};
@@ -73,12 +77,34 @@ where
 {
     let start_time = std::time::Instant::now();
 
-    let stream = match TcpStream::connect(&fastcgi_pass).await {
-        Ok(s) => s,
-        Err(e) => {
+    let stream = match tokio::time::timeout(CONNECT_TIMEOUT, TcpStream::connect(&fastcgi_pass)).await {
+        Ok(Ok(s)) => s,
+        Ok(Err(e)) => {
             error!(
                 "Failed to connect to FastCGI server {}: {}",
                 fastcgi_pass, e
+            );
+            access_logger.log(AccessLogEntry {
+                timestamp: chrono_timestamp(),
+                client_ip: ip_str.to_string(),
+                method: method_str.to_string(),
+                path: req_path.to_string(),
+                status: 502,
+                latency_ms: start_time.elapsed().as_millis() as u64,
+                backend: "fastcgi".to_string(),
+                pool: fastcgi_pass,
+                bytes_sent: 0,
+                referer: String::new(),
+                user_agent: String::new(),
+                trace_id: String::new(),
+            });
+            return Ok(empty_response(StatusCode::BAD_GATEWAY));
+        }
+        Err(_elapsed) => {
+            error!(
+                "Timeout connecting to FastCGI server {} ({}s)",
+                fastcgi_pass,
+                CONNECT_TIMEOUT.as_secs()
             );
             access_logger.log(AccessLogEntry {
                 timestamp: chrono_timestamp(),
@@ -131,11 +157,15 @@ where
     let fcgi_req = FcgiRequest::new(params, &mut body_reader);
     let client = Client::new(stream);
 
-    let mut fcgi_res_stream = match client.execute_once_stream(fcgi_req).await {
-        Ok(s) => s,
-        Err(e) => {
+    let mut fcgi_res_stream = match tokio::time::timeout(EXEC_TIMEOUT, client.execute_once_stream(fcgi_req)).await {
+        Ok(Ok(s)) => s,
+        Ok(Err(e)) => {
             error!("FastCGI stream execute error: {}", e);
             return Ok(empty_response(StatusCode::INTERNAL_SERVER_ERROR));
+        }
+        Err(_elapsed) => {
+            error!("FastCGI execute timeout ({}s)", EXEC_TIMEOUT.as_secs());
+            return Ok(empty_response(StatusCode::GATEWAY_TIMEOUT));
         }
     };
 

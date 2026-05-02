@@ -166,7 +166,7 @@ async fn introspect_token(
     client_id: &str,
     client_secret: &str,
 ) -> Result<IntrospectResponse, String> {
-    let client = reqwest_client()?;
+    let client = reqwest_client();
 
     // Build HTTP Basic auth header for the client credentials
     let credentials = STANDARD.encode(format!("{client_id}:{client_secret}"));
@@ -197,12 +197,15 @@ async fn introspect_token(
         .map_err(|e| format!("Failed to parse introspection response: {e}"))
 }
 
-/// Build a minimal `reqwest` HTTP client.
-fn reqwest_client() -> Result<reqwest::Client, String> {
-    reqwest::Client::builder()
-        .timeout(Duration::from_secs(5))
-        .build()
-        .map_err(|e| format!("Failed to build HTTP client: {e}"))
+/// Build a minimal `reqwest` HTTP client, cached globally for reuse.
+fn reqwest_client() -> &'static reqwest::Client {
+    static CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
+    CLIENT.get_or_init(|| {
+        reqwest::Client::builder()
+            .timeout(Duration::from_secs(5))
+            .build()
+            .unwrap_or_else(|_| reqwest::Client::new())
+    })
 }
 
 /// URL-encode a token string (percent-encode special characters).

@@ -19,6 +19,7 @@ use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::TcpStream;
+use tokio_util::sync::CancellationToken;
 use tracing::debug;
 
 /// A pooled connection with its insertion timestamp for idle timeout tracking.
@@ -41,6 +42,8 @@ pub struct ConnectionPool {
     /// Per-backend idle queue. The outer `DashMap` shards on the address hash;
     /// modifications to *different* shards proceed in parallel.
     idle: Arc<DashMap<String, VecDeque<PooledConnection>>>,
+    /// Signalled on drop to shut down the background reaper task.
+    cancel: CancellationToken,
 }
 
 impl ConnectionPool {
@@ -52,18 +55,21 @@ impl ConnectionPool {
 
     /// Create a new pool with explicit idle timeout.
     pub fn with_idle_timeout(max_idle: u32, idle_timeout: Duration) -> Self {
+        let cancel = CancellationToken::new();
         let pool = Self {
             max_idle,
             idle_timeout,
             idle: Arc::new(DashMap::new()),
+            cancel: cancel.clone(),
         };
 
         // Spawn background reaper task to clean stale connections every 30s
         if max_idle > 0 {
             let idle_map = Arc::clone(&pool.idle);
             let timeout = pool.idle_timeout;
+            let cancel_token = cancel;
             tokio::spawn(async move {
-                Self::reaper_loop(idle_map, timeout).await;
+                Self::reaper_loop(idle_map, timeout, cancel_token).await;
             });
         }
 
@@ -244,13 +250,21 @@ impl Drop for PooledStream {
 
 impl ConnectionPool {
     /// Background task that periodically removes expired idle connections.
+    /// Exits when the `cancel` token is signalled (pool is dropped).
     async fn reaper_loop(
         idle: Arc<DashMap<String, VecDeque<PooledConnection>>>,
         timeout: Duration,
+        cancel: CancellationToken,
     ) {
         let interval = Duration::from_secs(30);
         loop {
-            tokio::time::sleep(interval).await;
+            tokio::select! {
+                _ = cancel.cancelled() => {
+                    debug!("Connection pool reaper: shutting down");
+                    return;
+                }
+                _ = tokio::time::sleep(interval) => {}
+            }
             let mut total_reaped = 0usize;
             // iter_mut() yields per-shard write guards; reaping one backend
             // does not block another backend's shard.
@@ -266,6 +280,12 @@ impl ConnectionPool {
                 debug!("Connection pool reaper: removed {} expired connections", total_reaped);
             }
         }
+    }
+}
+
+impl Drop for ConnectionPool {
+    fn drop(&mut self) {
+        self.cancel.cancel();
     }
 }
 
@@ -366,6 +386,22 @@ mod tests {
             1,
             "PooledStream::Drop must re-pool the inner TcpStream"
         );
+    }
+
+    /// H46: Dropping a ConnectionPool must cancel the background reaper task.
+    /// Without the CancellationToken, the reaper holds an `Arc` to the idle
+    /// DashMap and runs forever, leaking the task and its memory.
+    #[tokio::test]
+    async fn pool_drop_cancels_reaper() {
+        let pool = ConnectionPool::with_idle_timeout(4, Duration::from_secs(60));
+        // Trigger the reaper spawn by having max_idle > 0.
+        assert!(pool.max_idle > 0);
+        // Drop the pool — the CancellationToken is signalled, and the
+        // reaper task should exit on the next `select!` poll cycle.
+        drop(pool);
+        // Yield to the Tokio runtime so the reaper task gets a chance to
+        // observe the cancelled token and cleanly exit.
+        tokio::task::yield_now().await;
     }
 
     /// `take_stream` must short-circuit the auto-release: the inner stream

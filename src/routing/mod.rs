@@ -110,7 +110,7 @@ impl BackendNode {
     /// immediately marked DOWN — without waiting for the active health check interval.
     pub fn record_failure(&self) {
         let now = now_secs();
-        let last = self.last_fail_at.load(Ordering::Relaxed);
+        let last = self.last_fail_at.load(Ordering::Acquire);
 
         // Reset the counter if the previous failure is outside the fail_timeout window
         if now.saturating_sub(last) > self.config.fail_timeout_secs {
@@ -637,6 +637,7 @@ impl UpstreamManager {
     pub fn new(
         config: &crate::config::AppConfig,
         discovery: Arc<crate::discovery::ServiceDiscovery>,
+        cancel: tokio_util::sync::CancellationToken,
     ) -> Self {
         let manager = Self {
             pools: DashMap::new(),
@@ -686,6 +687,7 @@ impl UpstreamManager {
                             Arc::clone(&pool),
                             resolver_addr.clone(),
                             backend.clone(),
+                            cancel.clone(),
                         );
                     }
                 }
@@ -709,6 +711,7 @@ impl UpstreamManager {
         &self,
         config: &crate::config::AppConfig,
         discovery: Arc<crate::discovery::ServiceDiscovery>,
+        cancel: tokio_util::sync::CancellationToken,
     ) {
         let desired_names: HashSet<String> = config.upstreams.keys().cloned().collect();
         let existing_names: Vec<String> = self.pools.iter().map(|e| e.key().clone()).collect();
@@ -764,6 +767,7 @@ impl UpstreamManager {
                             Arc::clone(&pool),
                             resolver_addr.clone(),
                             backend.clone(),
+                            cancel.clone(),
                         );
                     }
                 }
@@ -790,14 +794,35 @@ impl UpstreamManager {
 // ─── Helper: is the address an IP literal? ───────────────────────────────────
 
 /// Returns `true` if `addr` is an IPv4 or IPv6 address (not a hostname).
+/// Handles bracketed IPv6 literals like `[::1]:8080` and `[::1]`.
 fn is_ip_literal(addr: &str) -> bool {
-    let host = addr.split(':').next().unwrap_or(addr);
+    let host = if addr.starts_with('[') {
+        // IPv6 bracketed: extract the address between [ and ]
+        match addr.find(']') {
+            Some(end) => &addr[1..end],
+            None => return false,
+        }
+    } else {
+        addr.split(':').next().unwrap_or(addr)
+    };
     host.parse::<std::net::IpAddr>().is_ok()
 }
 
 /// Splits `"hostname:port"` into `("hostname", "port")`.
 /// Defaults port to "80" if not present.
+/// Handles bracketed IPv6 like `[::1]:8080` and `[::1]`.
 fn split_host_port(addr: &str) -> (String, String) {
+    if addr.starts_with('[') {
+        // IPv6 bracketed: address is [addr] or [addr]:port
+        if let Some(bracket_end) = addr.find(']') {
+            let host = &addr[..=bracket_end]; // includes brackets
+            if addr.len() > bracket_end + 1 && addr.as_bytes()[bracket_end + 1] == b':' {
+                let port = &addr[bracket_end + 2..];
+                return (host.to_string(), port.to_string());
+            }
+            return (host.to_string(), "80".to_string());
+        }
+    }
     if let Some(colon) = addr.rfind(':') {
         (addr[..colon].to_string(), addr[colon + 1..].to_string())
     } else {
@@ -827,6 +852,11 @@ async fn health_check_loop(
         "Starting health check loop for pool: {} (interval: {}s, timeout: {}s)",
         pool_name, interval.as_secs(), _timeout.as_secs()
     );
+
+    let client = reqwest::Client::builder()
+        .timeout(_timeout)
+        .build()
+        .unwrap_or_else(|_| reqwest::Client::new());
 
     loop {
         sleep(interval).await;
@@ -871,7 +901,7 @@ async fn health_check_loop(
                 let probe_ok = if let Some(ref path) = backend.config.health_check_path {
                     let url = format!("http://{}{}", address, path);
                     let expected = backend.config.health_check_status;
-                    match reqwest_health_get(&url, expected, _timeout).await {
+                    match reqwest_health_get(&client, &url, expected).await {
                         Ok(true) => true,
                         Ok(false) => {
                             warn!(
@@ -916,7 +946,7 @@ async fn health_check_loop(
                 let still_ok = if let Some(ref path) = backend.config.health_check_path {
                     let url = format!("http://{}{}", address, path);
                     let expected = backend.config.health_check_status;
-                    matches!(reqwest_health_get(&url, expected, _timeout).await, Ok(true))
+                    matches!(reqwest_health_get(&client, &url, expected).await, Ok(true))
                 } else {
                     matches!(
                         tokio::time::timeout(_timeout, TcpStream::connect(address)).await,
@@ -935,11 +965,7 @@ async fn health_check_loop(
 }
 
 /// Perform an HTTP GET to `url`; return `Ok(true)` if status matches `expected`.
-async fn reqwest_health_get(url: &str, expected_status: u16, timeout: Duration) -> Result<bool, String> {
-    let client = reqwest::Client::builder()
-        .timeout(timeout)
-        .build()
-        .map_err(|e| e.to_string())?;
+async fn reqwest_health_get(client: &reqwest::Client, url: &str, expected_status: u16) -> Result<bool, String> {
     let resp = client.get(url).send().await.map_err(|e| e.to_string())?;
     Ok(resp.status().as_u16() == expected_status)
 }
@@ -1158,10 +1184,23 @@ mod tests {
 
     #[test]
     fn test_is_ip_literal_ipv6_brackets() {
-        // IPv6 addresses with brackets are NOT correctly detected by this function
-        // (this is a known limitation - the function uses split(':') which breaks IPv6)
-        // The function only works for plain IPv4 addresses
-        assert!(!is_ip_literal("[::1]:8080"));
+        assert!(is_ip_literal("[::1]:8080"));
+        assert!(is_ip_literal("[::1]"));
+        assert!(is_ip_literal("[2001:db8::1]:8080"));
+    }
+
+    #[test]
+    fn test_split_host_port_ipv6_bracketed() {
+        let (host, port) = split_host_port("[::1]:8080");
+        assert_eq!(host, "[::1]");
+        assert_eq!(port, "8080");
+    }
+
+    #[test]
+    fn test_split_host_port_ipv6_bracketed_no_port() {
+        let (host, port) = split_host_port("[::1]");
+        assert_eq!(host, "[::1]");
+        assert_eq!(port, "80");
     }
 
     #[test]

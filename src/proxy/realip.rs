@@ -108,9 +108,20 @@ impl CidrRange {
     }
 }
 
+/// Returns `true` if the IP is unsuitable as a real client address.
+/// Rejects loopback, multicast, unspecified (0.0.0.0 / ::), and broadcast
+/// (255.255.255.255) addresses that a misconfigured or malicious proxy
+/// might inject into forwarding headers.
+fn is_bogus_ip(ip: &IpAddr) -> bool {
+    ip.is_loopback() || ip.is_multicast() || ip.is_unspecified()
+        || *ip == IpAddr::V4(std::net::Ipv4Addr::BROADCAST)
+}
+
 /// Determines the real client IP from request headers, respecting trusted proxies.
 ///
 /// Priority: `X-Real-IP` > `X-Forwarded-For` (rightmost untrusted) > socket address.
+/// Bogus IPs (loopback, multicast, unspecified, broadcast) are silently skipped
+/// when encountered in forwarding headers.
 pub fn resolve_client_ip(
     peer: &SocketAddr,
     headers: &hyper::HeaderMap,
@@ -129,17 +140,23 @@ pub fn resolve_client_ip(
         .and_then(|v| v.to_str().ok())
         .and_then(|s| s.trim().parse::<IpAddr>().ok())
     {
-        debug!("Real IP from X-Real-IP: {}", real_ip);
-        return real_ip;
+        if !is_bogus_ip(&real_ip) {
+            debug!("Real IP from X-Real-IP: {}", real_ip);
+            return real_ip;
+        }
+        debug!("Ignoring bogus X-Real-IP: {}", real_ip);
     }
 
-    // 2. X-Forwarded-For — walk from right to find the first non-trusted IP
+    // 2. X-Forwarded-For — walk from right to find the first non-trusted IP.
+    // Cap the number of parsed hops to prevent resource exhaustion from
+    // maliciously long XFF chains.
+    const MAX_XFF_HOPS: usize = 20;
     if let Some(xff) = headers.get("x-forwarded-for").and_then(|v| v.to_str().ok()) {
-        let addrs: Vec<&str> = xff.split(',').map(str::trim).collect();
+        let addrs: Vec<&str> = xff.split(',').map(str::trim).take(MAX_XFF_HOPS).collect();
         // Walk from the right (closest to us) and skip trusted proxies
         for addr_str in addrs.iter().rev() {
             if let Ok(ip) = addr_str.parse::<IpAddr>() {
-                if !trusted.is_trusted(&ip) {
+                if !is_bogus_ip(&ip) && !trusted.is_trusted(&ip) {
                     debug!("Real IP from X-Forwarded-For: {}", ip);
                     return ip;
                 }
@@ -191,10 +208,12 @@ pub fn inject_forwarding_headers(
 
     // X-Forwarded-Proto
     let proto = if is_tls { "https" } else { "http" };
-    headers.insert(
-        hyper::header::HeaderName::from_static("x-forwarded-proto"),
-        proto.parse().unwrap(),
-    );
+    if let Ok(val) = proto.parse() {
+        headers.insert(
+            hyper::header::HeaderName::from_static("x-forwarded-proto"),
+            val,
+        );
+    }
 }
 
 /// Parses the HAProxy PROXY protocol v1 header from a byte buffer.
@@ -264,5 +283,79 @@ mod tests {
         assert_eq!(addr.ip(), "203.0.113.50".parse::<IpAddr>().unwrap());
         assert_eq!(addr.port(), 56789);
         assert!(offset > 0);
+    }
+
+    #[test]
+    fn test_inject_forwarding_headers_no_panics() {
+        let mut headers = hyper::HeaderMap::new();
+        let client_ip: IpAddr = "203.0.113.50".parse().unwrap();
+        // Should not panic — proto.parse() is fallible but values are hardcoded
+        inject_forwarding_headers(&mut headers, &client_ip, true);
+        assert_eq!(
+            headers.get("x-forwarded-proto").unwrap().to_str().unwrap(),
+            "https"
+        );
+        inject_forwarding_headers(&mut headers, &client_ip, false);
+        assert_eq!(
+            headers.get("x-forwarded-proto").unwrap().to_str().unwrap(),
+            "http"
+        );
+    }
+
+    #[test]
+    fn test_resolve_client_ip_rejects_loopback() {
+        let trusted = TrustedProxies::from_cidrs(&["10.0.0.0/8".to_string()]);
+        let peer: SocketAddr = "10.0.0.1:80".parse().unwrap();
+        // X-Real-IP set to 127.0.0.1 — should be skipped
+        let mut headers = hyper::HeaderMap::new();
+        headers.insert("x-real-ip", "127.0.0.1".parse().unwrap());
+        let resolved = resolve_client_ip(&peer, &headers, &trusted);
+        // Falls back to socket addr since 127.0.0.1 is bogus
+        assert_eq!(resolved, peer.ip());
+    }
+
+    #[test]
+    fn test_resolve_client_ip_rejects_multicast() {
+        let trusted = TrustedProxies::from_cidrs(&["10.0.0.0/8".to_string()]);
+        let peer: SocketAddr = "10.0.0.1:80".parse().unwrap();
+        let mut headers = hyper::HeaderMap::new();
+        headers.insert("x-real-ip", "224.0.0.1".parse().unwrap());
+        let resolved = resolve_client_ip(&peer, &headers, &trusted);
+        assert_eq!(resolved, peer.ip());
+    }
+
+    #[test]
+    fn test_resolve_client_ip_rejects_unspecified() {
+        let trusted = TrustedProxies::from_cidrs(&["10.0.0.0/8".to_string()]);
+        let peer: SocketAddr = "10.0.0.1:80".parse().unwrap();
+        let mut headers = hyper::HeaderMap::new();
+        headers.insert("x-real-ip", "0.0.0.0".parse().unwrap());
+        let resolved = resolve_client_ip(&peer, &headers, &trusted);
+        assert_eq!(resolved, peer.ip());
+    }
+
+    #[test]
+    fn test_resolve_client_ip_rejects_broadcast() {
+        let trusted = TrustedProxies::from_cidrs(&["10.0.0.0/8".to_string()]);
+        let peer: SocketAddr = "10.0.0.1:80".parse().unwrap();
+        let mut headers = hyper::HeaderMap::new();
+        headers.insert("x-real-ip", "255.255.255.255".parse().unwrap());
+        let resolved = resolve_client_ip(&peer, &headers, &trusted);
+        assert_eq!(resolved, peer.ip());
+    }
+
+    #[test]
+    fn test_resolve_client_ip_xff_skips_bogus() {
+        let trusted = TrustedProxies::from_cidrs(&["10.0.0.0/8".to_string()]);
+        let peer: SocketAddr = "10.0.0.1:80".parse().unwrap();
+        let mut headers = hyper::HeaderMap::new();
+        // XFF chain: real client, loopback proxy, trusted proxy
+        // The loopback should be skipped, returning the real client
+        headers.insert(
+            "x-forwarded-for",
+            "203.0.113.50, 127.0.0.1, 10.0.0.2".parse().unwrap(),
+        );
+        let resolved = resolve_client_ip(&peer, &headers, &trusted);
+        assert_eq!(resolved, "203.0.113.50".parse::<IpAddr>().unwrap());
     }
 }

@@ -8,12 +8,11 @@
 //! This is useful for protocols like DNS, QUIC (when not using HTTP/3 mode),
 //! gaming, and VoIP where the proxy must maintain per-client affinity.
 
-use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+use dashmap::DashMap;
 use tokio::net::UdpSocket;
-use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info};
 
@@ -75,8 +74,8 @@ pub async fn start_udp_proxy(
 
     info!("UDP Proxy listening on udp://{}", addr);
 
-    let sessions: Arc<Mutex<HashMap<SocketAddr, UdpSession>>> =
-        Arc::new(Mutex::new(HashMap::new()));
+    let sessions: Arc<DashMap<SocketAddr, UdpSession>> =
+        Arc::new(DashMap::new());
 
     // Spawn a reaper task to clean up expired sessions
     let sessions_reaper = Arc::clone(&sessions);
@@ -86,8 +85,7 @@ pub async fn start_udp_proxy(
         loop {
             tokio::select! {
                 _ = tokio::time::sleep(Duration::from_secs(30)) => {
-                    let mut map = sessions_reaper.lock().await;
-                    map.retain(|_client, session| {
+                    sessions_reaper.retain(|_client, session| {
                         session.last_active.elapsed() < reaper_timeout
                     });
                 }
@@ -117,14 +115,12 @@ pub async fn start_udp_proxy(
 
         let data = buf[..len].to_vec();
 
-        let mut map = sessions.lock().await;
-
-        // Reuse existing session or create a new one
-        if let Some(session) = map.get_mut(&client_addr) {
+        // Reuse existing session or create a new one (lock-free via DashMap)
+        if let Some(mut session) = sessions.get_mut(&client_addr) {
             session.last_active = Instant::now();
             let backend_sock = Arc::clone(&session.backend_socket);
             let backend_addr = session.backend_addr;
-            drop(map);
+            drop(session);
 
             if let Err(e) = backend_sock.send_to(&data, backend_addr).await {
                 debug!("UDP forward to {} failed: {}", backend_addr, e);
@@ -166,13 +162,11 @@ pub async fn start_udp_proxy(
                 continue;
             }
 
-            let session = UdpSession {
+            sessions.insert(client_addr, UdpSession {
                 backend_socket: Arc::clone(&backend_socket),
                 backend_addr,
                 last_active: Instant::now(),
-            };
-            map.insert(client_addr, session);
-            drop(map);
+            });
 
             // Spawn a receiver task for backend → client responses
             let frontend = Arc::clone(&socket);
@@ -192,11 +186,8 @@ pub async fn start_udp_proxy(
                                 debug!("UDP reply to {} failed: {}", client_addr, e);
                                 break;
                             }
-                            {
-                                let mut guard = sessions_rx.lock().await;
-                                if let Some(s) = guard.get_mut(&client_addr) {
-                                    s.last_active = Instant::now();
-                                }
+                            if let Some(mut s) = sessions_rx.get_mut(&client_addr) {
+                                s.last_active = Instant::now();
                             }
                         }
                         Err(e) => {

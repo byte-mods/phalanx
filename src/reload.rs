@@ -53,6 +53,7 @@ pub fn spawn_reload_handler(
     hook_engine: Arc<crate::scripting::HookEngine>,
     zone_limiter: Arc<crate::middleware::connlimit::ZoneLimiter>,
     gslb_router: Arc<Option<crate::gslb::GslbRouter>>,
+    cancel: tokio_util::sync::CancellationToken,
 ) {
     tokio::spawn(async move {
         #[cfg(unix)]
@@ -88,8 +89,14 @@ pub fn spawn_reload_handler(
                 );
 
                 // ── Core: TLS + Upstreams ──
-                let new_tls = crate::proxy::tls::reload_tls_acceptor(new_config.as_ref());
-                upstreams.reload_from_config(new_config.as_ref(), Arc::clone(&discovery));
+                let new_tls = crate::proxy::tls::reload_tls_acceptor(new_config.as_ref()).await;
+                // Only swap the TLS acceptor if the new one loaded successfully.
+                // reload_tls_acceptor returns None when certs are malformed or missing —
+                // keeping the previous acceptor in place avoids dropping all TLS traffic.
+                if new_tls.is_some() {
+                    tls_acceptor.store(Arc::new(new_tls));
+                }
+                upstreams.reload_from_config(new_config.as_ref(), Arc::clone(&discovery), cancel.clone());
 
                 // ── Rate limiter ──
                 rate_limiter.reload(
@@ -127,25 +134,15 @@ pub fn spawn_reload_handler(
 
                 // ── GSLB router ──
                 if let Some(ref router) = *gslb_router {
-                    if let Some(ref _policy_str) = new_config.gslb_policy {
-                        // Policy struct is not directly modifiable through shared ref,
-                        // but data centers can be reloaded. The policy was set at
-                        // construction time and changing it requires the router to be
-                        // behind a mutable reference or ArcSwap itself.
-                        // For now, reload data centers if the GSLB config is present.
-                        // Full policy swap would require wrapping GslbRouter in ArcSwap
-                        // (future enhancement).
-                        let dcs = router.data_centers();
-                        if !dcs.is_empty() {
-                            // Preserve existing DC list on reload (health is preserved)
-                            router.reload_data_centers(dcs);
-                        }
+                    if let Some(ref policy_str) = new_config.gslb_policy {
+                        let new_policy = crate::gslb::GslbPolicy::from_str(policy_str);
+                        router.set_policy(new_policy);
+                        info!("GSLB policy reloaded: {:?}", new_policy);
                     }
                 }
 
                 // ── Swap config pointer last (after all subsystems are updated) ──
                 config.store(Arc::clone(&new_config));
-                tls_acceptor.store(Arc::new(new_tls));
                 let _ = config_updates.send(Arc::clone(&new_config));
                 info!(
                     "Configuration swap complete — all reloadable subsystems updated."

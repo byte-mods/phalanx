@@ -39,6 +39,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         cfg_snapshot.otel_service_name.as_deref(),
     );
 
+    println!(
+        "\n  ╔══════════════════════════════════════════╗\n  ║                                          ║\n  ║     P H A L A N X                       ║\n  ║     ─────────────────────               ║\n  ║     AI Load Balancer & API Gateway      ║\n  ║     v{}                               ║\n  ║                                          ║\n  ╚══════════════════════════════════════════╝\n",
+        env!("CARGO_PKG_VERSION")
+    );
+
     tracing::info!(
         "Starting AI Load Balancer with {} worker threads... (Config: {})",
         cfg_snapshot.workers,
@@ -72,12 +77,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         )));
 
         // Service Discovery: RocksDB-backed persistent backend registry.
-        let discovery = Arc::new(discovery::ServiceDiscovery::new("data/discovery.db"));
+        let discovery = Arc::new(discovery::ServiceDiscovery::new("data/discovery.db").expect("Failed to open RocksDB for service discovery"));
 
         // State & Routing: Manages backend health and load balancing algorithms.
         let upstreams = Arc::new(routing::UpstreamManager::new(
             &cfg_snapshot,
             discovery.clone(),
+            shutdown_token.clone(),
         ));
         let (config_updates_tx, config_updates_rx) = watch::channel(Arc::clone(&cfg_snapshot));
 
@@ -91,6 +97,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             0,
             cfg_snapshot.redis_url.as_deref().and_then(|url| redis::Client::open(url).ok()),
         );
+        keyval.spawn_background_tasks();
 
         // Response Cache: L1 in-memory (Moka LFU) + optional L2 disk cache.
         let cache = Arc::new(middleware::cache::AdvancedCache::new(
@@ -197,7 +204,59 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let bandwidth_tracker = telemetry::bandwidth::BandwidthTracker::new();
         let alert_engine = admin::alerts::AlertEngine::new(Arc::clone(&bandwidth_tracker));
         // Start background alert polling every 30 seconds
-        Arc::clone(&alert_engine).spawn_background_check(30);
+        Arc::clone(&alert_engine).spawn_background_check(30, shutdown_token.clone());
+
+        // H32: shared dynamic route/cert DashMaps consulted by both admin API and proxy
+        let dynamic_routes: Arc<dashmap::DashMap<String, config::RouteConfig>> =
+            Arc::new(dashmap::DashMap::new());
+        let dynamic_certs: Arc<dashmap::DashMap<String, admin::api::SslCertEntry>> =
+            Arc::new(dashmap::DashMap::new());
+
+        // ClusterState: shared KV across Phalanx nodes via Redis or etcd.
+        // Created before AdminState so the dashboard can serve cluster node status.
+        let node_id = cfg_snapshot
+            .node_id
+            .clone()
+            .unwrap_or_else(|| {
+                std::env::var("HOSTNAME")
+                    .unwrap_or_else(|_| "phalanx-node-1".to_string())
+            });
+        let cluster_state: std::sync::Arc<cluster::ClusterState> = std::sync::Arc::new({
+            use cluster::{ClusterBackend, ClusterState};
+            let backend = if let Some(ref gossip_addr) = cfg_snapshot.gossip_bind {
+                let seed_peers: Vec<String> = cfg_snapshot
+                    .gossip_seed_peers
+                    .as_deref()
+                    .map(|s| s.split(',').map(|p| p.trim().to_string()).collect())
+                    .unwrap_or_default();
+                ClusterBackend::Gossip {
+                    bind_addr: gossip_addr.clone(),
+                    seed_peers,
+                }
+            } else if let Some(endpoints_str) = cfg_snapshot.etcd_endpoints.as_deref() {
+                let endpoints: Vec<String> = endpoints_str
+                    .split(',')
+                    .map(|s| s.trim().to_string())
+                    .collect();
+                ClusterBackend::Etcd { endpoints, client: Arc::new(tokio::sync::Mutex::new(None)) }
+            } else if let Some(redis_url) = cfg_snapshot.redis_url.as_deref() {
+                ClusterBackend::Redis { url: redis_url.to_string(), client: Arc::new(tokio::sync::Mutex::new(None)) }
+            } else {
+                ClusterBackend::Standalone
+            };
+            ClusterState::new(backend, node_id)
+        });
+
+        let sfu_state = crate::proxy::webrtc::SfuState::new();
+
+        // Start SFU room housekeeping (periodic cleanup of idle zero-peer rooms).
+        if cfg_snapshot.room_idle_timeout_secs > 0 {
+            crate::proxy::webrtc::SfuState::start_housekeeping(
+                sfu_state.clone(),
+                cfg_snapshot.room_idle_timeout_secs,
+                shutdown_token.clone(),
+            );
+        }
 
         let admin_state = admin::AdminState {
             metrics: Arc::clone(&metrics),
@@ -209,6 +268,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             rate_limiter: Arc::clone(&rate_limiter),
             bandwidth: Arc::clone(&bandwidth_tracker),
             alert_engine: Arc::clone(&alert_engine),
+            dynamic_routes: Arc::clone(&dynamic_routes),
+            dynamic_certs: Arc::clone(&dynamic_certs),
+            config_path: config_path.clone(),
+            cluster_state: Arc::clone(&cluster_state),
+            sfu_state: Arc::clone(&sfu_state),
+            ice_servers: cfg_snapshot.ice_servers.clone(),
         };
 
         // GeoIP Database (opt-in: requires `geoip_db_path` in phalanx.conf)
@@ -256,7 +321,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     "Kubernetes Ingress controller enabled (class: {})",
                     ingress_class
                 );
-                Some(controller)
+                // H33: start the watcher so K8s resources are actually discovered
+                let ctrl_arc = Arc::new(controller);
+                ctrl_arc.clone().spawn_ingress_watcher(shutdown_token.clone());
+                Some((*ctrl_arc).clone())
             } else {
                 None
             },
@@ -361,41 +429,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             shutdown_token.clone(),
         );
 
-        // ClusterState: shared KV across Phalanx nodes via Redis or etcd.
-        // Enables distributed rate limiting, sticky sessions, and leader election.
-        let node_id = cfg_snapshot
-            .node_id
-            .clone()
-            .unwrap_or_else(|| {
-                std::env::var("HOSTNAME")
-                    .unwrap_or_else(|_| "phalanx-node-1".to_string())
-            });
-        let cluster_state = std::sync::Arc::new({
-            use cluster::{ClusterBackend, ClusterState};
-            let backend = if let Some(ref gossip_addr) = cfg_snapshot.gossip_bind {
-                let seed_peers: Vec<String> = cfg_snapshot
-                    .gossip_seed_peers
-                    .as_deref()
-                    .map(|s| s.split(',').map(|p| p.trim().to_string()).collect())
-                    .unwrap_or_default();
-                ClusterBackend::Gossip {
-                    bind_addr: gossip_addr.clone(),
-                    seed_peers,
-                }
-            } else if let Some(endpoints_str) = cfg_snapshot.etcd_endpoints.as_deref() {
-                let endpoints: Vec<String> = endpoints_str
-                    .split(',')
-                    .map(|s| s.trim().to_string())
-                    .collect();
-                ClusterBackend::Etcd { endpoints }
-            } else if let Some(redis_url) = cfg_snapshot.redis_url.as_deref() {
-                ClusterBackend::Redis { url: redis_url.to_string() }
-            } else {
-                ClusterBackend::Standalone
-            };
-            ClusterState::new(backend, node_id)
-        });
-
         // Spawn cluster heartbeat (30s interval, 90s TTL = 3× interval)
         Arc::clone(&cluster_state).spawn_heartbeat(30);
 
@@ -450,6 +483,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             Arc::clone(&hook_engine),
             Arc::clone(&zone_limiter),
             Arc::clone(&gslb_router),
+            shutdown_token.clone(),
         );
 
         let mut supervisor_handles: Vec<JoinHandle<()>> = Vec::new();
@@ -477,6 +511,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             Arc::clone(&bandwidth_tracker),
             shutdown_token.clone(),
             Arc::clone(&oidc_sessions),
+            Arc::clone(&dynamic_routes),
         )));
         supervisor_handles.push(tokio::spawn(supervise_admin_listener(
             config_updates_rx.clone(),
@@ -614,6 +649,7 @@ async fn supervise_proxy_listener(
     bandwidth: Arc<telemetry::bandwidth::BandwidthTracker>,
     shutdown: CancellationToken,
     oidc_sessions: auth::oidc::OidcSessionStore,
+    dynamic_routes: Arc<dashmap::DashMap<String, config::RouteConfig>>,
 ) {
     let start = |bind_addr: String| {
         let listener_shutdown = shutdown.child_token();
@@ -638,6 +674,7 @@ async fn supervise_proxy_listener(
         let k8s_controller = Arc::clone(&k8s_controller);
         let bandwidth = Arc::clone(&bandwidth);
         let oidc_sessions = Arc::clone(&oidc_sessions);
+        let dynamic_routes = Arc::clone(&dynamic_routes);
         let handle = tokio::spawn(async move {
             proxy::start_proxy(
                 &bind_addr,
@@ -662,6 +699,7 @@ async fn supervise_proxy_listener(
                 bandwidth,
                 task_shutdown,
                 oidc_sessions,
+                dynamic_routes,
             )
             .await;
         });
@@ -1016,12 +1054,13 @@ async fn supervise_mail_listener(
             .mail_upstream_pool
             .clone()
             .unwrap_or_else(|| "default".to_string());
+        let starttls = cfg.tls_cert_path.is_some() && cfg.tls_key_path.is_some();
         Some(mail::MailProxyConfig {
             protocol,
             bind_addr,
             upstream_pool,
             banner: None,
-            starttls: false,
+            starttls,
             tls_cert_path: cfg.tls_cert_path.clone(),
             tls_key_path: cfg.tls_key_path.clone(),
         })
@@ -1234,9 +1273,8 @@ async fn supervise_http3_listener(
                 }
                 let next_cfg = config_rx.borrow().clone();
                 let next_bind = next_cfg.quic_bind.clone();
-                let should_restart = next_bind.is_some() && next_bind == current_bind;
 
-                if next_bind != current_bind || should_restart {
+                if next_bind != current_bind {
                     info!(
                         "HTTP/3 listener changed: {:?} -> {:?}. Restarting listener.",
                         current_bind,
@@ -1299,5 +1337,46 @@ mod tests {
         assert_eq!(listener_restart_backoff(2).as_secs(), 4);
         assert_eq!(listener_restart_backoff(5).as_secs(), 32);
         assert_eq!(listener_restart_backoff(10).as_secs(), 32);
+    }
+
+    /// M1 regression: the H3 supervisor must only restart when the QUIC bind
+    /// address actually changes — not on every config reload. This test
+    /// exercises the exact watch-channel + comparison pattern used in
+    /// `supervise_http3_listener`.
+    #[tokio::test]
+    async fn test_http3_no_restart_on_unchanged_config() {
+        use std::sync::Arc;
+        use crate::config::AppConfig;
+        let default_cfg = Arc::new(AppConfig::default());
+        let (tx, mut rx) = tokio::sync::watch::channel(Arc::clone(&default_cfg));
+        let mut current_bind: Option<String> = rx.borrow().quic_bind.clone();
+
+        // Simulate config reload — same quic_bind, different unrelated field
+        let mut cfg2 = AppConfig::default();
+        cfg2.quic_bind = None; // unchanged
+        cfg2.workers = 8; // unrelated change
+        tx.send(Arc::new(cfg2)).unwrap();
+        rx.changed().await.unwrap();
+        let next_bind = rx.borrow().quic_bind.clone();
+        // Bind unchanged → must NOT restart
+        assert_eq!(next_bind, current_bind, "should NOT restart when bind unchanged");
+
+        // Simulate config reload — different quic_bind
+        let mut cfg3 = AppConfig::default();
+        cfg3.quic_bind = Some("0.0.0.0:8443".to_string());
+        tx.send(Arc::new(cfg3)).unwrap();
+        rx.changed().await.unwrap();
+        current_bind = next_bind;
+        let next_bind = rx.borrow().quic_bind.clone();
+        // Bind changed → MUST restart
+        assert_ne!(next_bind, current_bind, "should restart when bind changed");
+        current_bind = next_bind;
+
+        // Simulate config reload — bind set to None (listener disabled)
+        let cfg4 = AppConfig::default();
+        tx.send(Arc::new(cfg4)).unwrap();
+        rx.changed().await.unwrap();
+        let next_bind = rx.borrow().quic_bind.clone();
+        assert_ne!(next_bind, current_bind, "should restart when bind changed to None");
     }
 }

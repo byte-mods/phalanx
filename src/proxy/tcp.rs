@@ -75,13 +75,14 @@ pub async fn start_tcp_proxy(
 
         // Spawn a green thread for each connection
         tokio::spawn(async move {
-            // ── PROXY Protocol v2 detection ──
-            // Peek at the first bytes to detect a PP2 header. If present, extract
-            // the real client address and strip the header before forwarding.
-            let mut pp2_buf = [0u8; 232]; // max PP2 header size (16 + 216 TLV)
-            let real_peer = match client_stream.peek(&mut pp2_buf).await {
+            // ── PROXY Protocol detection ──
+            // Peek at the first bytes to detect a PROXY protocol header (v2 first,
+            // then v1 as fallback). If present, extract the real client address and
+            // strip the header before forwarding.
+            let mut pp_buf = [0u8; 232]; // max PP2 header size (16 + 216 TLV); PP1 fits within
+            let real_peer = match client_stream.peek(&mut pp_buf).await {
                 Ok(n) if n >= 16 => {
-                    match crate::proxy::proxy_proto_v2::parse_v2_header(&pp2_buf[..n]) {
+                    match crate::proxy::proxy_proto_v2::parse_v2_header(&pp_buf[..n]) {
                         Ok((hdr, consumed)) => {
                             // Consume the PP2 header bytes from the stream
                             let mut discard = vec![0u8; consumed];
@@ -92,7 +93,20 @@ pub async fn start_tcp_proxy(
                             debug!("TCP proxy: PP2 real client IP: {}", addr);
                             addr
                         }
-                        Err(crate::proxy::proxy_proto_v2::ParseError::NotProxyProtocol) => peer,
+                        Err(crate::proxy::proxy_proto_v2::ParseError::NotProxyProtocol) => {
+                            // PP2 magic didn't match — try PROXY protocol v1
+                            match crate::proxy::realip::parse_proxy_protocol_v1(&pp_buf[..n]) {
+                                Some((addr, consumed)) => {
+                                    let mut discard = vec![0u8; consumed];
+                                    let _ = tokio::io::AsyncReadExt::read_exact(
+                                        &mut client_stream, &mut discard,
+                                    ).await;
+                                    debug!("TCP proxy: PP1 real client IP: {}", addr);
+                                    addr
+                                }
+                                None => peer,
+                            }
+                        }
                         Err(_) => peer,
                     }
                 }

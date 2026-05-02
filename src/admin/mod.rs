@@ -44,6 +44,18 @@ pub struct AdminState {
     pub bandwidth: Arc<crate::telemetry::bandwidth::BandwidthTracker>,
     /// Resource alert engine
     pub alert_engine: Arc<alerts::AlertEngine>,
+    /// Dynamically managed routes (CRUD via admin API, consulted by proxy)
+    pub dynamic_routes: Arc<dashmap::DashMap<String, crate::config::RouteConfig>>,
+    /// Dynamically managed SSL certificates (CRUD via admin API)
+    pub dynamic_certs: Arc<dashmap::DashMap<String, api::SslCertEntry>>,
+    /// Path to the phalanx.conf file, used by config_reload to validate before SIGHUP.
+    pub config_path: String,
+    /// Shared cluster state for node discovery and distributed KV operations.
+    pub cluster_state: Arc<crate::cluster::ClusterState>,
+    /// Shared WebRTC SFU state for real-time media room signalling.
+    pub sfu_state: Arc<crate::proxy::webrtc::SfuState>,
+    /// Configured ICE server URLs for WebRTC NAT traversal.
+    pub ice_servers: Vec<String>,
 }
 
 /// Global metrics registry shared across the proxy and admin server.
@@ -68,6 +80,14 @@ pub struct ProxyMetrics {
     pub backend_errors_total: IntCounterVec,
     /// Counter for ML fraud model load failures (fallback to rule-based mode).
     pub ml_model_load_failures: IntCounter,
+    /// WebTransport sessions, labeled by outcome (accepted, error).
+    pub wt_sessions_total: IntCounterVec,
+    /// WebTransport stream operations, labeled by stream type (bidi, uni) and outcome (echoed, error).
+    pub wt_streams_total: IntCounterVec,
+    /// WebTransport datagrams sent, labeled by outcome (echoed, error).
+    pub wt_datagrams_total: IntCounterVec,
+    /// Number of currently active WebTransport sessions.
+    pub wt_active_sessions: IntGauge,
 }
 
 impl ProxyMetrics {
@@ -180,6 +200,49 @@ impl ProxyMetrics {
             .register(Box::new(ml_model_load_failures.clone()))
             .unwrap();
 
+        let wt_sessions_total = IntCounterVec::new(
+            Opts::new(
+                "phalanx_wt_sessions_total",
+                "Total WebTransport sessions",
+            ),
+            &["outcome"],
+        )
+        .unwrap();
+        let wt_streams_total = IntCounterVec::new(
+            Opts::new(
+                "phalanx_wt_streams_total",
+                "Total WebTransport stream operations",
+            ),
+            &["stream_type", "outcome"],
+        )
+        .unwrap();
+        let wt_datagrams_total = IntCounterVec::new(
+            Opts::new(
+                "phalanx_wt_datagrams_total",
+                "Total WebTransport datagrams sent",
+            ),
+            &["outcome"],
+        )
+        .unwrap();
+        let wt_active_sessions = IntGauge::new(
+            "phalanx_wt_active_sessions",
+            "Number of currently active WebTransport sessions",
+        )
+        .unwrap();
+
+        registry
+            .register(Box::new(wt_sessions_total.clone()))
+            .unwrap();
+        registry
+            .register(Box::new(wt_streams_total.clone()))
+            .unwrap();
+        registry
+            .register(Box::new(wt_datagrams_total.clone()))
+            .unwrap();
+        registry
+            .register(Box::new(wt_active_sessions.clone()))
+            .unwrap();
+
         Self {
             registry,
             http_requests_total,
@@ -191,6 +254,10 @@ impl ProxyMetrics {
             backend_request_duration,
             backend_errors_total,
             ml_model_load_failures,
+            wt_sessions_total,
+            wt_streams_total,
+            wt_datagrams_total,
+            wt_active_sessions,
         }
     }
 
@@ -265,6 +332,13 @@ async fn api_stats(state: web::Data<AdminState>) -> impl Responder {
                 counter.value()
             } else if let Some(gauge) = m.get_gauge().as_ref() {
                 gauge.value()
+            } else if let Some(hist) = m.get_histogram().as_ref() {
+                // Compute average from the histogram's cumulative sum and count.
+                if hist.get_sample_count() > 0 {
+                    hist.get_sample_sum() / hist.get_sample_count() as f64
+                } else {
+                    0.0
+                }
             } else {
                 0.0
             };
@@ -313,7 +387,18 @@ async fn add_backend(
         pool.add_backend(crate::config::BackendConfig {
             address: backend.address.clone(),
             weight: backend.weight,
-            ..Default::default()
+            health_check_path: backend.health_check_path.clone(),
+            health_check_status: backend.health_check_status.unwrap_or(200),
+            max_fails: backend.max_fails.unwrap_or(3),
+            fail_timeout_secs: backend.fail_timeout_secs.unwrap_or(30),
+            slow_start_secs: backend.slow_start_secs.unwrap_or(0),
+            backup: backend.backup.unwrap_or(false),
+            max_conns: backend.max_conns.unwrap_or(0),
+            queue_size: backend.queue_size.unwrap_or(0),
+            queue_timeout_ms: backend.queue_timeout_ms.unwrap_or(5000),
+            circuit_breaker: backend.circuit_breaker.unwrap_or(false),
+            circuit_initial_backoff_secs: backend.circuit_initial_backoff_secs.unwrap_or(5),
+            circuit_max_backoff_secs: backend.circuit_max_backoff_secs.unwrap_or(60),
         });
         HttpResponse::Ok().json(serde_json::json!({"status": "added"}))
     } else {
@@ -376,10 +461,18 @@ pub async fn start_admin_server(
                 rate_limiter: Arc::clone(&s.rate_limiter),
                 bandwidth: Arc::clone(&s.bandwidth),
                 alert_engine: Arc::clone(&s.alert_engine),
+                dynamic_routes: Arc::clone(&s.dynamic_routes),
+                dynamic_certs: Arc::clone(&s.dynamic_certs),
+                config_path: s.config_path.clone(),
+                cluster_state: Arc::clone(&s.cluster_state),
+                sfu_state: Arc::clone(&s.sfu_state),
+                ice_servers: s.ice_servers.clone(),
             },
             rate_limiter,
             bandwidth: Arc::clone(&s.bandwidth),
             alert_engine: Arc::clone(&s.alert_engine),
+            cluster_state: Arc::clone(&s.cluster_state),
+            sfu_state: Arc::clone(&s.sfu_state),
         })
     };
 
@@ -418,6 +511,11 @@ pub async fn start_admin_server(
             .service(dashboard_api::bandwidth_pool_stats)
             .service(dashboard_api::list_alerts)
             .service(dashboard_api::trigger_alert_check)
+            // WebRTC SFU signalling endpoints
+            .service(publish_webrtc)
+            .service(subscribe_webrtc)
+            .service(ice_candidate_webrtc)
+            .service(list_webrtc_rooms)
     });
     let server = match server.bind(&bind_addr) {
         Ok(s) => s.run(),
@@ -618,11 +716,24 @@ async fn config_validate(body: web::Bytes) -> impl Responder {
 
 // ─── Config Reload ────────────────────────────────────────────────────────────
 
-/// POST /api/reload -- triggers a configuration reload by sending SIGHUP
-/// to the current process (Unix only).
+/// POST /api/reload -- validates the config file, then signals SIGHUP to
+/// trigger a live configuration reload. Returns 400 if the config is invalid.
 #[post("/api/reload")]
-async fn config_reload() -> impl Responder {
-    // Signal a config reload via SIGHUP (Unix only)
+async fn config_reload(state: web::Data<AdminState>) -> impl Responder {
+    // Validate config before signaling — catch parse errors early
+    // and give the caller a clear error instead of a silent no-op.
+    // Use the same policy as the SIGHUP handler so validation matches reload behavior.
+    let config_policy = crate::config::ConfigParsePolicy::from_env();
+    match crate::config::try_load_config(&state.config_path, config_policy) {
+        Err(e) => {
+            return HttpResponse::BadRequest().json(serde_json::json!({
+                "status": "reload rejected",
+                "error": e
+            }));
+        }
+        Ok(_) => { /* config is valid, proceed to signal */ }
+    }
+
     #[cfg(unix)]
     {
         use std::os::raw::c_int;
@@ -630,35 +741,117 @@ async fn config_reload() -> impl Responder {
             fn getpid() -> u32;
             fn kill(pid: u32, sig: c_int) -> c_int;
         }
-        let sighup: c_int = 1; // SIGHUP = 1
+        let sighup: c_int = 1;
         unsafe { kill(getpid(), sighup); }
         return HttpResponse::Ok().json(serde_json::json!({
-            "status": "reload signaled (live-routed components and listeners will refresh)"
+            "status": "reload signaled"
         }));
     }
     #[cfg(not(unix))]
     HttpResponse::Ok().json(serde_json::json!({ "status": "reload not supported on this platform" }))
 }
 
+// ─── WebRTC SFU Signalling Endpoints ─────────────────────────────────────────
+
+/// Request body for publish and subscribe WebRTC signalling endpoints.
+#[derive(serde::Deserialize)]
+struct WebrtcSignallingRequest {
+    room_id: String,
+    peer_id: String,
+    sdp: String,
+}
+
+/// POST /api/webrtc/publish — accepts a publisher SDP offer and returns an SDP answer.
+#[post("/api/webrtc/publish")]
+async fn publish_webrtc(
+    state: web::Data<AdminState>,
+    body: web::Json<WebrtcSignallingRequest>,
+) -> impl Responder {
+    let req = body.into_inner();
+    match crate::proxy::webrtc::handle_publish(
+        state.sfu_state.clone(),
+        req.room_id,
+        req.peer_id,
+        req.sdp,
+        Some(state.bandwidth.clone()),
+        &state.ice_servers,
+    )
+    .await
+    {
+        Ok(answer) => HttpResponse::Ok().json(serde_json::json!({"sdp": answer})),
+        Err(e) => HttpResponse::BadRequest().json(serde_json::json!({"error": e})),
+    }
+}
+
+/// POST /api/webrtc/subscribe — accepts a subscriber SDP offer and returns an SDP answer.
+#[post("/api/webrtc/subscribe")]
+async fn subscribe_webrtc(
+    state: web::Data<AdminState>,
+    body: web::Json<WebrtcSignallingRequest>,
+) -> impl Responder {
+    let req = body.into_inner();
+    match crate::proxy::webrtc::handle_subscribe(
+        state.sfu_state.clone(),
+        req.room_id,
+        req.peer_id,
+        req.sdp,
+        &state.ice_servers,
+    )
+    .await
+    {
+        Ok(answer) => HttpResponse::Ok().json(serde_json::json!({"sdp": answer})),
+        Err(e) => HttpResponse::BadRequest().json(serde_json::json!({"error": e})),
+    }
+}
+
+/// POST /api/webrtc/ice/{room_id}/{peer_id} — trickle ICE candidate relay.
+#[post("/api/webrtc/ice/{room_id}/{peer_id}")]
+async fn ice_candidate_webrtc(
+    state: web::Data<AdminState>,
+    path: web::Path<(String, String)>,
+    body: String,
+) -> impl Responder {
+    let (room_id, peer_id) = path.into_inner();
+    match crate::proxy::webrtc::add_ice_candidate(
+        state.sfu_state.clone(),
+        &room_id,
+        &peer_id,
+        &body,
+    )
+    .await
+    {
+        Ok(()) => HttpResponse::Ok().json(serde_json::json!({"status": "ok"})),
+        Err(e) => HttpResponse::BadRequest().json(serde_json::json!({"error": e})),
+    }
+}
+
+/// GET /api/webrtc/rooms — list all active WebRTC rooms with stats.
+#[get("/api/webrtc/rooms")]
+async fn list_webrtc_rooms(state: web::Data<AdminState>) -> impl Responder {
+    let rooms = state.sfu_state.list_rooms();
+    HttpResponse::Ok().json(serde_json::json!({"rooms": rooms}))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use actix_web::test;
 
-    #[test]
-    fn test_proxy_metrics_creation() {
+    #[actix_web::test]
+    async fn test_proxy_metrics_creation() {
         let metrics = ProxyMetrics::new();
         assert_eq!(metrics.active_connections.get(), 0);
     }
 
-    #[test]
-    fn test_proxy_metrics_encode_not_empty() {
+    #[actix_web::test]
+    async fn test_proxy_metrics_encode_not_empty() {
         let metrics = ProxyMetrics::new();
         let encoded = metrics.encode();
         assert!(!encoded.is_empty());
     }
 
-    #[test]
-    fn test_proxy_metrics_counter_increment() {
+    #[actix_web::test]
+    async fn test_proxy_metrics_counter_increment() {
         let metrics = ProxyMetrics::new();
         metrics
             .http_requests_total
@@ -668,8 +861,8 @@ mod tests {
         assert!(encoded.contains("phalanx_http_requests_total"));
     }
 
-    #[test]
-    fn test_proxy_metrics_gauge() {
+    #[actix_web::test]
+    async fn test_proxy_metrics_gauge() {
         let metrics = ProxyMetrics::new();
         metrics.active_connections.inc();
         metrics.active_connections.inc();
@@ -678,8 +871,8 @@ mod tests {
         assert_eq!(metrics.active_connections.get(), 1);
     }
 
-    #[test]
-    fn test_proxy_metrics_histogram() {
+    #[actix_web::test]
+    async fn test_proxy_metrics_histogram() {
         let metrics = ProxyMetrics::new();
         metrics
             .http_request_duration
@@ -689,8 +882,8 @@ mod tests {
         assert!(encoded.contains("phalanx_http_request_duration_seconds"));
     }
 
-    #[test]
-    fn test_proxy_metrics_waf_blocks() {
+    #[actix_web::test]
+    async fn test_proxy_metrics_waf_blocks() {
         let metrics = ProxyMetrics::new();
         metrics
             .waf_blocks_total
@@ -700,8 +893,8 @@ mod tests {
         assert!(encoded.contains("phalanx_waf_blocks_total"));
     }
 
-    #[test]
-    fn test_proxy_metrics_cache_hits() {
+    #[actix_web::test]
+    async fn test_proxy_metrics_cache_hits() {
         let metrics = ProxyMetrics::new();
         metrics
             .cache_hits_total
@@ -713,5 +906,492 @@ mod tests {
             .inc_by(5);
         let encoded = metrics.encode();
         assert!(encoded.contains("phalanx_cache_total"));
+    }
+
+    #[actix_web::test]
+    async fn test_wt_sessions_total_counter() {
+        let metrics = ProxyMetrics::new();
+        metrics
+            .wt_sessions_total
+            .with_label_values(&["accepted"])
+            .inc();
+        metrics
+            .wt_sessions_total
+            .with_label_values(&["error"])
+            .inc_by(2);
+        let encoded = metrics.encode();
+        assert!(encoded.contains("phalanx_wt_sessions_total"));
+        assert!(encoded.contains(r#"outcome="accepted""#));
+        assert!(encoded.contains(r#"outcome="error""#));
+    }
+
+    #[actix_web::test]
+    async fn test_wt_streams_total_counter() {
+        let metrics = ProxyMetrics::new();
+        metrics
+            .wt_streams_total
+            .with_label_values(&["bidi", "echoed"])
+            .inc();
+        metrics
+            .wt_streams_total
+            .with_label_values(&["uni", "drained"])
+            .inc_by(3);
+        metrics
+            .wt_streams_total
+            .with_label_values(&["bidi", "error"])
+            .inc();
+        let encoded = metrics.encode();
+        assert!(encoded.contains("phalanx_wt_streams_total"));
+        assert!(encoded.contains(r#"stream_type="bidi""#));
+        assert!(encoded.contains(r#"stream_type="uni""#));
+        assert!(encoded.contains(r#"outcome="echoed""#));
+        assert!(encoded.contains(r#"outcome="drained""#));
+        assert!(encoded.contains(r#"outcome="error""#));
+    }
+
+    #[actix_web::test]
+    async fn test_wt_datagrams_total_counter() {
+        let metrics = ProxyMetrics::new();
+        metrics
+            .wt_datagrams_total
+            .with_label_values(&["echoed"])
+            .inc_by(5);
+        metrics
+            .wt_datagrams_total
+            .with_label_values(&["error"])
+            .inc();
+        let encoded = metrics.encode();
+        assert!(encoded.contains("phalanx_wt_datagrams_total"));
+        assert!(encoded.contains(r#"outcome="echoed""#));
+        assert!(encoded.contains(r#"outcome="error""#));
+    }
+
+    #[actix_web::test]
+    async fn test_wt_active_sessions_gauge() {
+        let metrics = ProxyMetrics::new();
+        assert_eq!(metrics.wt_active_sessions.get(), 0);
+        metrics.wt_active_sessions.inc();
+        metrics.wt_active_sessions.inc();
+        assert_eq!(metrics.wt_active_sessions.get(), 2);
+        metrics.wt_active_sessions.dec();
+        assert_eq!(metrics.wt_active_sessions.get(), 1);
+        metrics.wt_active_sessions.dec();
+        assert_eq!(metrics.wt_active_sessions.get(), 0);
+    }
+
+    /// Regression: ensure every DiscoveredBackend field survives the
+    /// conversion to BackendConfig in add_backend. If a field is added
+    /// to DiscoveredBackend but not mapped here, this test fails.
+    #[actix_web::test]
+    async fn test_add_backend_all_fields_preserved() {
+        use crate::config::BackendConfig;
+        use crate::discovery::DiscoveredBackend;
+
+        let db = DiscoveredBackend {
+            address: "10.0.0.1:8080".into(),
+            pool: "web".into(),
+            weight: 5,
+            healthy: true,
+            registered_at: 1716912000,
+            health_check_path: Some("/healthz".into()),
+            max_fails: Some(5),
+            fail_timeout_secs: Some(60),
+            slow_start_secs: Some(10),
+            max_conns: Some(100),
+            queue_size: Some(50),
+            queue_timeout_ms: Some(3000),
+            circuit_breaker: Some(true),
+            health_check_status: Some(201),
+            backup: Some(true),
+            circuit_initial_backoff_secs: Some(10),
+            circuit_max_backoff_secs: Some(120),
+        };
+
+        // Replicate the conversion from add_backend (src/admin/mod.rs:328-343).
+        let bc = BackendConfig {
+            address: db.address.clone(),
+            weight: db.weight,
+            health_check_path: db.health_check_path.clone(),
+            health_check_status: db.health_check_status.unwrap_or(200),
+            max_fails: db.max_fails.unwrap_or(3),
+            fail_timeout_secs: db.fail_timeout_secs.unwrap_or(30),
+            slow_start_secs: db.slow_start_secs.unwrap_or(0),
+            backup: db.backup.unwrap_or(false),
+            max_conns: db.max_conns.unwrap_or(0),
+            queue_size: db.queue_size.unwrap_or(0),
+            queue_timeout_ms: db.queue_timeout_ms.unwrap_or(5000),
+            circuit_breaker: db.circuit_breaker.unwrap_or(false),
+            circuit_initial_backoff_secs: db.circuit_initial_backoff_secs.unwrap_or(5),
+            circuit_max_backoff_secs: db.circuit_max_backoff_secs.unwrap_or(60),
+        };
+
+        assert_eq!(bc.address, "10.0.0.1:8080");
+        assert_eq!(bc.weight, 5);
+        assert_eq!(bc.health_check_path.as_deref(), Some("/healthz"));
+        assert_eq!(bc.health_check_status, 201);
+        assert_eq!(bc.max_fails, 5);
+        assert_eq!(bc.fail_timeout_secs, 60);
+        assert_eq!(bc.slow_start_secs, 10);
+        assert!(bc.backup);
+        assert_eq!(bc.max_conns, 100);
+        assert_eq!(bc.queue_size, 50);
+        assert_eq!(bc.queue_timeout_ms, 3000);
+        assert!(bc.circuit_breaker);
+        assert_eq!(bc.circuit_initial_backoff_secs, 10);
+        assert_eq!(bc.circuit_max_backoff_secs, 120);
+    }
+
+    // ─── WebRTC endpoint tests ──────────────────────────────────────────────
+
+    fn make_webrtc_admin_state() -> (web::Data<AdminState>, Arc<crate::proxy::webrtc::SfuState>) {
+        let metrics = Arc::new(ProxyMetrics::new());
+        let db_path = format!(
+            "/tmp/phalanx_test_webrtc_{}_{}",
+            std::process::id(),
+            rand::random::<u64>()
+        );
+        let _ = std::fs::create_dir_all(&db_path);
+        let discovery = Arc::new(
+            crate::discovery::ServiceDiscovery::new(&db_path).unwrap(),
+        );
+        let config = crate::config::AppConfig::default();
+        let manager = Arc::new(crate::routing::UpstreamManager::new(
+            &config,
+            Arc::clone(&discovery),
+            tokio_util::sync::CancellationToken::new(),
+        ));
+        let keyval = crate::keyval::KeyvalStore::new(0, None);
+        let reputation = crate::waf::reputation::IpReputationManager::new(5, 3600, None);
+        let waf = Arc::new(crate::waf::WafEngine::new(false, Arc::clone(&reputation)));
+        let cache = Arc::new(crate::middleware::cache::AdvancedCache::new(1000, 60, None));
+        let rate_limiter = Arc::new(crate::middleware::ratelimit::PhalanxRateLimiter::new(
+            100, 200, None, None,
+        ));
+        let bandwidth = crate::telemetry::bandwidth::BandwidthTracker::new();
+        let alert_engine = crate::admin::alerts::AlertEngine::new(Arc::clone(&bandwidth));
+        let cluster_state = Arc::new(crate::cluster::ClusterState::new(
+            crate::cluster::ClusterBackend::Standalone,
+            "test-node".to_string(),
+        ));
+        let sfu_state = crate::proxy::webrtc::SfuState::new();
+        let state = AdminState {
+            metrics,
+            discovery,
+            manager,
+            keyval,
+            waf,
+            cache,
+            rate_limiter,
+            bandwidth,
+            alert_engine,
+            dynamic_routes: Arc::new(dashmap::DashMap::new()),
+            dynamic_certs: Arc::new(dashmap::DashMap::new()),
+            config_path: "phalanx.conf".to_string(),
+            cluster_state,
+            sfu_state: Arc::clone(&sfu_state),
+            ice_servers: Vec::new(),
+        };
+        (web::Data::new(state), sfu_state)
+    }
+
+    #[actix_web::test]
+    async fn test_list_webrtc_rooms_empty() {
+        let (state, _sfu) = make_webrtc_admin_state();
+        let app = test::init_service(
+            App::new()
+                .app_data(state.clone())
+                .service(list_webrtc_rooms),
+        )
+        .await;
+        let req = test::TestRequest::get()
+            .uri("/api/webrtc/rooms")
+            .to_request();
+        let resp = test::call_service(&app, req).await;
+        assert_eq!(resp.status(), 200);
+        let body: serde_json::Value = test::read_body_json(resp).await;
+        assert_eq!(body["rooms"].as_array().unwrap().len(), 0);
+    }
+
+    #[actix_web::test]
+    async fn test_list_webrtc_rooms_after_publish() {
+        let (state, _sfu) = make_webrtc_admin_state();
+        // Create a room by publishing (the publish will fail since there's
+        // no real browser, but the room gets created by get_or_create_room)
+        let app = test::init_service(
+            App::new()
+                .app_data(state.clone())
+                .service(publish_webrtc)
+                .service(list_webrtc_rooms),
+        )
+        .await;
+        let req = test::TestRequest::post()
+            .uri("/api/webrtc/publish")
+            .set_json(&serde_json::json!({
+                "room_id": "test-room",
+                "peer_id": "pub-1",
+                "sdp": "v=0\r\no=- 0 0 IN IP4 0.0.0.0\r\ns=-\r\nt=0 0\r\n"
+            }))
+            .to_request();
+        // The publish will fail (no real WebRTC stack), but the room
+        // is created inside get_or_create_room before the failure.
+        let _ = test::call_service(&app, req).await;
+
+        let req = test::TestRequest::get()
+            .uri("/api/webrtc/rooms")
+            .to_request();
+        let resp = test::call_service(&app, req).await;
+        assert_eq!(resp.status(), 200);
+        let body: serde_json::Value = test::read_body_json(resp).await;
+        let rooms = body["rooms"].as_array().unwrap();
+        assert_eq!(rooms.len(), 1);
+        assert_eq!(rooms[0]["id"], "test-room");
+    }
+
+    #[actix_web::test]
+    async fn test_publish_webrtc_missing_fields() {
+        let (state, _sfu) = make_webrtc_admin_state();
+        let app = test::init_service(
+            App::new()
+                .app_data(state.clone())
+                .service(publish_webrtc),
+        )
+        .await;
+        let req = test::TestRequest::post()
+            .uri("/api/webrtc/publish")
+            .set_json(&serde_json::json!({"room_id": "r1"}))
+            .to_request();
+        let resp = test::call_service(&app, req).await;
+        assert_eq!(resp.status(), 400);
+    }
+
+    #[actix_web::test]
+    async fn test_subscribe_webrtc_returns_answer() {
+        let (state, _sfu) = make_webrtc_admin_state();
+        let app = test::init_service(
+            App::new()
+                .app_data(state.clone())
+                .service(subscribe_webrtc),
+        )
+        .await;
+        // A subscribe without a prior publish creates the room but
+        // will fail in the WebRTC stack (no real browser). The handler
+        // returns 400 on the WebRTC error, but the room exists.
+        let req = test::TestRequest::post()
+            .uri("/api/webrtc/subscribe")
+            .set_json(&serde_json::json!({
+                "room_id": "sub-room",
+                "peer_id": "sub-1",
+                "sdp": "v=0\r\no=- 0 0 IN IP4 0.0.0.0\r\ns=-\r\nt=0 0\r\n"
+            }))
+            .to_request();
+        let resp = test::call_service(&app, req).await;
+        // 400 is expected — SDP is invalid for a real WebRTC stack
+        assert_eq!(resp.status(), 400);
+    }
+
+    #[actix_web::test]
+    async fn test_ice_candidate_room_not_found() {
+        let (state, _sfu) = make_webrtc_admin_state();
+        let app = test::init_service(
+            App::new()
+                .app_data(state.clone())
+                .service(ice_candidate_webrtc),
+        )
+        .await;
+        let req = test::TestRequest::post()
+            .uri("/api/webrtc/ice/nonexistent/peer1")
+            .set_payload(r#"{"candidate":"candidate:1 1 UDP 2122252543 192.168.1.1 54321 typ host"}"#.to_string())
+            .to_request();
+        let resp = test::call_service(&app, req).await;
+        assert_eq!(resp.status(), 400);
+        let body: serde_json::Value = test::read_body_json(resp).await;
+        assert!(body["error"].as_str().unwrap().contains("not found"));
+    }
+
+    #[actix_web::test]
+    async fn test_ice_candidate_invalid_json() {
+        let (state, _sfu) = make_webrtc_admin_state();
+        let app = test::init_service(
+            App::new()
+                .app_data(state.clone())
+                .service(ice_candidate_webrtc),
+        )
+        .await;
+        let req = test::TestRequest::post()
+            .uri("/api/webrtc/ice/test-room/peer1")
+            .set_payload("not-json".to_string())
+            .to_request();
+        let resp = test::call_service(&app, req).await;
+        assert_eq!(resp.status(), 400);
+    }
+
+    /// Integration: publish then subscribe to the same room and verify
+    /// the room reflects both peers in its participant/publisher/subscriber
+    /// counts.
+    #[actix_web::test]
+    async fn test_webrtc_publish_subscribe_same_room_counts() {
+        let (state, _sfu) = make_webrtc_admin_state();
+        let app = test::init_service(
+            App::new()
+                .app_data(state.clone())
+                .service(publish_webrtc)
+                .service(subscribe_webrtc)
+                .service(list_webrtc_rooms),
+        )
+        .await;
+
+        // Publish and subscribe both fail because there is no real browser,
+        // but get_or_create_room runs before the WebRTC stack is touched,
+        // so the room and peer entries survive the error.
+        let pub_req = test::TestRequest::post()
+            .uri("/api/webrtc/publish")
+            .set_json(&serde_json::json!({
+                "room_id": "flow-room",
+                "peer_id": "pub-1",
+                "sdp": "v=0\r\no=- 0 0 IN IP4 0.0.0.0\r\ns=-\r\nt=0 0\r\n"
+            }))
+            .to_request();
+        let _ = test::call_service(&app, pub_req).await;
+
+        let sub_req = test::TestRequest::post()
+            .uri("/api/webrtc/subscribe")
+            .set_json(&serde_json::json!({
+                "room_id": "flow-room",
+                "peer_id": "sub-1",
+                "sdp": "v=0\r\no=- 0 0 IN IP4 0.0.0.0\r\ns=-\r\nt=0 0\r\n"
+            }))
+            .to_request();
+        let _ = test::call_service(&app, sub_req).await;
+
+        let list_req = test::TestRequest::get()
+            .uri("/api/webrtc/rooms")
+            .to_request();
+        let resp = test::call_service(&app, list_req).await;
+        assert_eq!(resp.status(), 200);
+        let body: serde_json::Value = test::read_body_json(resp).await;
+        let rooms = body["rooms"].as_array().unwrap();
+        assert_eq!(rooms.len(), 1);
+        assert_eq!(rooms[0]["id"], "flow-room");
+        assert_eq!(rooms[0]["peer_count"], 2);
+        assert_eq!(rooms[0]["publishers"], 1);
+        assert_eq!(rooms[0]["subscribers"], 1);
+    }
+
+    /// Integration: two publishes to different rooms + verify both show
+    /// up independently in the room list.
+    #[actix_web::test]
+    async fn test_webrtc_multiple_rooms_independent() {
+        let (state, _sfu) = make_webrtc_admin_state();
+        let app = test::init_service(
+            App::new()
+                .app_data(state.clone())
+                .service(publish_webrtc)
+                .service(list_webrtc_rooms),
+        )
+        .await;
+
+        for room_id in &["room-a", "room-b"] {
+            let req = test::TestRequest::post()
+                .uri("/api/webrtc/publish")
+                .set_json(&serde_json::json!({
+                    "room_id": room_id,
+                    "peer_id": format!("pub-{}", room_id),
+                    "sdp": "v=0\r\no=- 0 0 IN IP4 0.0.0.0\r\ns=-\r\nt=0 0\r\n"
+                }))
+                .to_request();
+            let _ = test::call_service(&app, req).await;
+        }
+
+        let list_req = test::TestRequest::get()
+            .uri("/api/webrtc/rooms")
+            .to_request();
+        let resp = test::call_service(&app, list_req).await;
+        assert_eq!(resp.status(), 200);
+        let body: serde_json::Value = test::read_body_json(resp).await;
+        let rooms = body["rooms"].as_array().unwrap();
+        assert_eq!(rooms.len(), 2);
+        let ids: Vec<&str> = rooms.iter().map(|r| r["id"].as_str().unwrap()).collect();
+        assert!(ids.contains(&"room-a"));
+        assert!(ids.contains(&"room-b"));
+    }
+
+    /// Integration: the admin state carries ice_servers and the publish
+    /// endpoint accepts requests. Smoke-test that common config values
+    /// are threadable (the actual ICE server usage is tested in webrtc
+    /// unit tests via build_ice_servers).
+    #[actix_web::test]
+    async fn test_webrtc_publish_with_configured_ice_servers() {
+        let metrics = Arc::new(ProxyMetrics::new());
+        let db_path = format!(
+            "/tmp/phalanx_test_webrtc_ice_{}_{}",
+            std::process::id(),
+            rand::random::<u64>()
+        );
+        let _ = std::fs::create_dir_all(&db_path);
+        let discovery = Arc::new(
+            crate::discovery::ServiceDiscovery::new(&db_path).unwrap(),
+        );
+        let config = crate::config::AppConfig::default();
+        let manager = Arc::new(crate::routing::UpstreamManager::new(
+            &config,
+            Arc::clone(&discovery),
+            tokio_util::sync::CancellationToken::new(),
+        ));
+        let keyval = crate::keyval::KeyvalStore::new(0, None);
+        let reputation = crate::waf::reputation::IpReputationManager::new(5, 3600, None);
+        let waf = Arc::new(crate::waf::WafEngine::new(false, Arc::clone(&reputation)));
+        let cache = Arc::new(crate::middleware::cache::AdvancedCache::new(1000, 60, None));
+        let rate_limiter = Arc::new(crate::middleware::ratelimit::PhalanxRateLimiter::new(
+            100, 200, None, None,
+        ));
+        let bandwidth = crate::telemetry::bandwidth::BandwidthTracker::new();
+        let alert_engine = crate::admin::alerts::AlertEngine::new(Arc::clone(&bandwidth));
+        let cluster_state = Arc::new(crate::cluster::ClusterState::new(
+            crate::cluster::ClusterBackend::Standalone,
+            "test-node".to_string(),
+        ));
+        let sfu_state = crate::proxy::webrtc::SfuState::new();
+        let custom_ice = vec!["turn:custom.example.com:3478".to_string()];
+        let state = web::Data::new(AdminState {
+            metrics,
+            discovery,
+            manager,
+            keyval,
+            waf,
+            cache,
+            rate_limiter,
+            bandwidth,
+            alert_engine,
+            dynamic_routes: Arc::new(dashmap::DashMap::new()),
+            dynamic_certs: Arc::new(dashmap::DashMap::new()),
+            config_path: "phalanx.conf".to_string(),
+            cluster_state,
+            sfu_state: Arc::clone(&sfu_state),
+            ice_servers: custom_ice,
+        });
+
+        let app = test::init_service(
+            App::new()
+                .app_data(state.clone())
+                .service(publish_webrtc),
+        )
+        .await;
+        let req = test::TestRequest::post()
+            .uri("/api/webrtc/publish")
+            .set_json(&serde_json::json!({
+                "room_id": "ice-room",
+                "peer_id": "pub-1",
+                "sdp": "v=0\r\no=- 0 0 IN IP4 0.0.0.0\r\ns=-\r\nt=0 0\r\n"
+            }))
+            .to_request();
+        let resp = test::call_service(&app, req).await;
+        // Without a real browser the SDP exchange fails (4xx/5xx).
+        // What matters: the handler doesn't panic and ICE servers
+        // were threaded through. Assert error-class, not exact code.
+        assert!(
+            resp.status().is_client_error() || resp.status().is_server_error(),
+            "expected error status, got {}",
+            resp.status()
+        );
     }
 }

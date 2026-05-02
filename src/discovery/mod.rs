@@ -20,6 +20,42 @@ pub struct DiscoveredBackend {
     pub healthy: bool,
     /// Timestamp (epoch secs) when this backend was registered.
     pub registered_at: u64,
+    /// Optional health check path (e.g., "/health").
+    #[serde(default)]
+    pub health_check_path: Option<String>,
+    /// Max consecutive failures before marking DOWN.
+    #[serde(default)]
+    pub max_fails: Option<u32>,
+    /// Fail timeout window in seconds.
+    #[serde(default)]
+    pub fail_timeout_secs: Option<u64>,
+    /// Slow-start ramp duration in seconds.
+    #[serde(default)]
+    pub slow_start_secs: Option<u32>,
+    /// Max concurrent connections to this backend.
+    #[serde(default)]
+    pub max_conns: Option<u32>,
+    /// Queue size for waiting requests when at max_conns.
+    #[serde(default)]
+    pub queue_size: Option<u32>,
+    /// Queue timeout in milliseconds.
+    #[serde(default)]
+    pub queue_timeout_ms: Option<u64>,
+    /// Whether circuit breaker is enabled for this backend.
+    #[serde(default)]
+    pub circuit_breaker: Option<bool>,
+    /// Expected HTTP status code for health check. Default: 200.
+    #[serde(default)]
+    pub health_check_status: Option<u16>,
+    /// Whether this backend is a hot-standby (only used when all non-backup backends are DOWN).
+    #[serde(default)]
+    pub backup: Option<bool>,
+    /// Circuit breaker initial backoff in seconds. Default: 5.
+    #[serde(default)]
+    pub circuit_initial_backoff_secs: Option<u64>,
+    /// Circuit breaker max backoff in seconds. Default: 60.
+    #[serde(default)]
+    pub circuit_max_backoff_secs: Option<u64>,
 }
 
 /// RocksDB-backed service discovery.
@@ -31,30 +67,19 @@ pub struct ServiceDiscovery {
 
 impl ServiceDiscovery {
     /// Opens or creates RocksDB at the given path.
-    pub fn new<P: AsRef<Path>>(path: P) -> Self {
+    pub fn new<P: AsRef<Path>>(path: P) -> Result<Self, rocksdb::Error> {
         let mut opts = Options::default();
         opts.create_if_missing(true);
         opts.set_allow_concurrent_memtable_write(true);
 
-        match DB::open(&opts, path.as_ref()) {
-            Ok(db) => {
-                info!(
-                    "Service Discovery initialized with RocksDB at {:?}",
-                    path.as_ref()
-                );
-                Self {
-                    db: Some(Arc::new(db)),
-                }
-            }
-            Err(e) => {
-                error!(
-                    "Failed to open RocksDB for Service Discovery at {:?}: {}. Dynamic discovery persistence is disabled.",
-                    path.as_ref(),
-                    e
-                );
-                Self { db: None }
-            }
-        }
+        let db = DB::open(&opts, path.as_ref())?;
+        info!(
+            "Service Discovery initialized with RocksDB at {:?}",
+            path.as_ref()
+        );
+        Ok(Self {
+            db: Some(Arc::new(db)),
+        })
     }
 
     /// Registers or updates a backend in persistent storage.
@@ -177,6 +202,7 @@ pub fn spawn_dns_watcher(
     pool: Arc<crate::routing::UpstreamPool>,
     resolver_addr: String,
     template: crate::config::BackendConfig,
+    cancel: tokio_util::sync::CancellationToken,
 ) {
     tokio::spawn(async move {
         let interval = tokio::time::Duration::from_secs(30);
@@ -195,7 +221,13 @@ pub fn spawn_dns_watcher(
         );
 
         loop {
-            tokio::time::sleep(interval).await;
+            tokio::select! {
+                _ = cancel.cancelled() => {
+                    info!("DNS watcher stopping for '{}' in pool '{}'", hostname, pool_name);
+                    return;
+                }
+                _ = tokio::time::sleep(interval) => {}
+            }
 
             let lookup_host = format!("{}:{}", hostname, port);
             let resolved: Vec<String> = match tokio::net::lookup_host(&lookup_host).await {
