@@ -7,7 +7,6 @@
 use ai_load_balancer::*;
 
 use arc_swap::ArcSwap;
-use parking_lot::RwLock;
 use std::sync::Arc;
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
@@ -245,7 +244,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             } else {
                 ClusterBackend::Standalone
             };
-            ClusterState::new(backend, node_id, cfg_snapshot.admin_bind.clone())
+            ClusterState::new(backend, node_id)
         });
 
         let sfu_state = crate::proxy::webrtc::SfuState::new();
@@ -259,7 +258,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             );
         }
 
-        let reload_status = Arc::new(RwLock::new(None));
         let admin_state = admin::AdminState {
             metrics: Arc::clone(&metrics),
             discovery: Arc::clone(&discovery),
@@ -276,9 +274,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             cluster_state: Arc::clone(&cluster_state),
             sfu_state: Arc::clone(&sfu_state),
             ice_servers: cfg_snapshot.ice_servers.clone(),
-            turn_username: cfg_snapshot.turn_username.clone(),
-            turn_credential: cfg_snapshot.turn_credential.clone(),
-            last_reload_status: Arc::clone(&reload_status),
         };
 
         // GeoIP Database (opt-in: requires `geoip_db_path` in phalanx.conf)
@@ -489,7 +484,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             Arc::clone(&zone_limiter),
             Arc::clone(&gslb_router),
             shutdown_token.clone(),
-            Arc::clone(&reload_status),
         );
 
         let mut supervisor_handles: Vec<JoinHandle<()>> = Vec::new();
@@ -534,30 +528,24 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             Arc::clone(&upstreams),
             shutdown_token.clone(),
         )));
-        if cfg_snapshot.smtp_bind.is_some() {
-            supervisor_handles.push(tokio::spawn(supervise_mail_listener(
-                config_updates_rx.clone(),
-                mail::MailProtocol::Smtp,
-                Arc::clone(&upstreams),
-                shutdown_token.clone(),
-            )));
-        }
-        if cfg_snapshot.imap_bind.is_some() {
-            supervisor_handles.push(tokio::spawn(supervise_mail_listener(
-                config_updates_rx.clone(),
-                mail::MailProtocol::Imap,
-                Arc::clone(&upstreams),
-                shutdown_token.clone(),
-            )));
-        }
-        if cfg_snapshot.pop3_bind.is_some() {
-            supervisor_handles.push(tokio::spawn(supervise_mail_listener(
-                config_updates_rx.clone(),
-                mail::MailProtocol::Pop3,
-                Arc::clone(&upstreams),
-                shutdown_token.clone(),
-            )));
-        }
+        supervisor_handles.push(tokio::spawn(supervise_mail_listener(
+            config_updates_rx.clone(),
+            mail::MailProtocol::Smtp,
+            Arc::clone(&upstreams),
+            shutdown_token.clone(),
+        )));
+        supervisor_handles.push(tokio::spawn(supervise_mail_listener(
+            config_updates_rx.clone(),
+            mail::MailProtocol::Imap,
+            Arc::clone(&upstreams),
+            shutdown_token.clone(),
+        )));
+        supervisor_handles.push(tokio::spawn(supervise_mail_listener(
+            config_updates_rx.clone(),
+            mail::MailProtocol::Pop3,
+            Arc::clone(&upstreams),
+            shutdown_token.clone(),
+        )));
         supervisor_handles.push(tokio::spawn(supervise_http3_listener(
             config_updates_rx,
             Arc::clone(&upstreams),
@@ -1209,7 +1197,6 @@ async fn supervise_http3_listener(
         let access_logger = Arc::clone(&access_logger);
         let bandwidth = Arc::clone(&bandwidth);
         let oidc_sessions = Arc::clone(&oidc_sessions);
-        let trusted_proxies = proxy::realip::TrustedProxies::from_cidrs(&cfg_snapshot.trusted_proxies);
         let handle = tokio::spawn(async move {
             proxy::http3::start_http3_proxy(
                 &bind_addr,
@@ -1230,7 +1217,6 @@ async fn supervise_http3_listener(
                 access_logger,
                 bandwidth,
                 oidc_sessions,
-                trusted_proxies,
                 task_shutdown,
             )
             .await;

@@ -168,16 +168,19 @@ impl WafEngine {
 
     /// Reloads the declarative WAF policy from a JSON file on disk.
     ///
-    /// On error, logs a warning and keeps the existing policy active.
-    pub fn reload_policy(&self, path: &str) {
+    /// On success, swaps the policy engine atomically.
+    /// On error, returns the error string and keeps the existing policy active.
+    pub fn reload_policy(&self, path: &str) -> Result<(), String> {
         let mut engine = PolicyEngine::new();
         match engine.load_from_file(path) {
             Ok(()) => {
                 self.policy_engine.store(Arc::new(engine));
                 info!("WAF policy reloaded from {}", path);
+                Ok(())
             }
             Err(e) => {
                 warn!("WAF policy reload failed (keeping existing): {}", e);
+                Err(e)
             }
         }
     }

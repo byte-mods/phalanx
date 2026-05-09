@@ -96,10 +96,6 @@ pub struct ServerBlock {
     /// ICE server URLs for WebRTC NAT traversal (STUN/TURN).
     /// Each entry is a URL like `stun:host:port` or `turn:host:port?transport=udp`.
     pub ice_servers: Vec<String>,
-    /// TURN server username for authenticated TURN relay.
-    pub turn_username: Option<String>,
-    /// TURN server credential (password) for authenticated TURN relay.
-    pub turn_credential: Option<String>,
 }
 
 /// Represents a `route /path { ... }` block inside a server.
@@ -427,31 +423,9 @@ fn parse_server_block(tokens: &[String], mut i: usize) -> Result<(ServerBlock, u
             continue;
         }
 
-        // Parse: `turn_username "user";`
-        if token == "turn_username" {
-            expect_directive_value_semicolon(tokens, i, "turn_username")?;
-            block.turn_username = Some(tokens[i + 1].clone());
-            i += 3;
-            continue;
-        }
-
-        // Parse: `turn_credential "secret";`
-        if token == "turn_credential" {
-            expect_directive_value_semicolon(tokens, i, "turn_credential")?;
-            block.turn_credential = Some(tokens[i + 1].clone());
-            i += 3;
-            continue;
-        }
-
         // Generic directive: `key value;`
         // Must match exactly: TOKEN VALUE ;
         if i + 2 < tokens.len() && tokens[i + 2] == ";" {
-            if !is_known_server_directive(token) {
-                return Err(format!(
-                    "Unknown directive '{}' inside 'server' block at token position {}",
-                    token, i
-                ));
-            }
             block
                 .directives
                 .insert(tokens[i].clone(), tokens[i + 1].clone());
@@ -473,89 +447,6 @@ fn parse_server_block(tokens: &[String], mut i: usize) -> Result<(ServerBlock, u
         ));
     }
     Err("Unclosed 'server' block: missing closing '}'".to_string())
-}
-
-/// Returns true if `token` is a known server-level directive that follows the
-/// `key value;` pattern.  Keep this list in sync with the directives consumed
-/// by `try_load_config` in `config/mod.rs`.
-fn is_known_server_directive(token: &str) -> bool {
-    const KNOWN: &[&str] = &[
-        "ai_algorithm",
-        "ai_epsilon",
-        "ai_temperature",
-        "ai_thompson_threshold_ms",
-        "ai_ucb_constant",
-        "auth_request",
-        "auto_ssl_cache_dir",
-        "auto_ssl_domain",
-        "auto_ssl_email",
-        "brotli",
-        "cache_disk_path",
-        "captcha_challenge_threshold",
-        "captcha_provider",
-        "captcha_secret_key",
-        "captcha_site_key",
-        "client_max_body_size",
-        "etcd_endpoints",
-        "geo_allow",
-        "geo_deny",
-        "geoip_db",
-        "gossip_bind",
-        "gossip_interval_ms",
-        "gossip_seed_peers",
-        "gslb_max_latency_ms",
-        "gslb_policy",
-        "global_rate_limit",
-        "hsts_max_age",
-        "imap_bind",
-        "k8s_ingress_class",
-        "k8s_ingress_enabled",
-        "keyval_ttl_secs",
-        "listen_quic",
-        "listen_udp",
-        "mail_upstream_pool",
-        "mail_verify_backend_tls",
-        "mirror",
-        "ml_fraud_model_path",
-        "ml_fraud_mode",
-        "node_id",
-        "ocsp_responder_url",
-        "pop3_bind",
-        "proxy_connect_timeout",
-        "proxy_next_upstream_timeout",
-        "proxy_next_upstream_tries",
-        "proxy_proto_v2",
-        "proxy_read_timeout",
-        "rate_limit_burst",
-        "rate_limit_per_ip",
-        "rate_limit_retry_after",
-        "redis_url",
-        "rhai_script",
-        "room_idle_timeout",
-        "shutdown_timeout",
-        "smtp_bind",
-        "ssl_ciphers",
-        "ssl_client_certificate",
-        "ssl_min_version",
-        "tls_ca_cert_path",
-        "tls_ciphers",
-        "tls_min_version",
-        "trusted_proxy",
-        "turn_credential",
-        "turn_username",
-        "udp_session_timeout",
-        "waf_auto_ban_duration",
-        "waf_auto_ban_threshold",
-        "waf_enabled",
-        "waf_policy_path",
-        "wasm_plugin_config",
-        "webtransport",
-        "websocket_idle_timeout",
-        "zone_burst",
-        "zone_max_connections",
-        "zone_rate_per_sec",
-    ];
-    KNOWN.binary_search(&token).is_ok()
 }
 
 /// Parses the contents inside a `route /path { ... }` block.
@@ -931,20 +822,12 @@ fn parse_route_block(
             i += 1;
             while i < tokens.len() && tokens[i] != ";" {
                 let part = &tokens[i];
-                let (pool, weight_str) = part.split_once(':').ok_or_else(|| {
-                    format!(
-                        "Invalid split_traffic entry '{}' at token {}: expected 'pool_name:weight' format",
-                        part, i
-                    )
-                })?;
-                let w = weight_str.parse::<u32>().map_err(|_| {
-                    format!(
-                        "Invalid weight '{}' in split_traffic entry '{}' at token {}: expected unsigned integer",
-                        weight_str, part, i
-                    )
-                })?;
-                block.split_pools.push(pool.to_string());
-                block.split_weights.push(w);
+                if let Some((pool, weight_str)) = part.split_once(':') {
+                    if let Ok(w) = weight_str.parse::<u32>() {
+                        block.split_pools.push(pool.to_string());
+                        block.split_weights.push(w);
+                    }
+                }
                 i += 1;
             }
             if i < tokens.len() && tokens[i] == ";" {
@@ -1522,21 +1405,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_unknown_directive_inside_server() {
-        let cfg = r#"http { server { listen 8080; rate_limt_per_ip 10; } }"#;
-        let result = parse_phalanx_config(cfg);
-        assert!(
-            result.is_err(),
-            "Expected Err for unknown server directive"
-        );
-        let err = result.unwrap_err();
-        assert!(
-            err.contains("rate_limt_per_ip") || err.contains("Unknown"),
-            "Error should mention the unknown directive: {err}"
-        );
-    }
-
     // ── CORS directives ─────────────────────────────────────────────────────
 
     #[test]
@@ -1651,44 +1519,6 @@ mod tests {
         let route = &http.servers[0].routes["/"];
         assert!(route.split_pools.is_empty());
         assert!(route.split_weights.is_empty());
-    }
-
-    #[test]
-    fn test_split_traffic_missing_colon_rejected() {
-        let cfg = r#"
-            http {
-                server {
-                    listen 8080;
-                    route /api {
-                        upstream default;
-                        split_traffic pool_v1:90 pool_v2;
-                    }
-                }
-            }
-        "#;
-        let result = parse_phalanx_config(cfg);
-        assert!(result.is_err(), "Expected error for missing colon in split_traffic");
-        let err = result.unwrap_err();
-        assert!(err.contains("split_traffic entry 'pool_v2'"), "Error should name the bad entry: {}", err);
-    }
-
-    #[test]
-    fn test_split_traffic_invalid_weight_rejected() {
-        let cfg = r#"
-            http {
-                server {
-                    listen 8080;
-                    route /api {
-                        upstream default;
-                        split_traffic pool_v1:90 pool_v2:ten;
-                    }
-                }
-            }
-        "#;
-        let result = parse_phalanx_config(cfg);
-        assert!(result.is_err(), "Expected error for invalid weight in split_traffic");
-        let err = result.unwrap_err();
-        assert!(err.contains("Invalid weight 'ten'"), "Error should name the bad weight: {}", err);
     }
 
     // ── Health check interval/timeout ────────────────────────────────────────
@@ -1894,65 +1724,6 @@ mod tests {
                 server {
                     listen 8080;
                     ice_server;
-                }
-            }
-        "#;
-        let result = parse_phalanx_config(cfg);
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_ice_server_multiple_server_blocks_accumulate_independently() {
-        let cfg = r#"
-            http {
-                upstream default { server 127.0.0.1:8081; }
-                server {
-                    listen 8080;
-                    ice_server stun:stun-a.example.com:3478;
-                }
-                server {
-                    listen 8443;
-                    ice_server turn:turn-b.example.com:3478;
-                    ice_server stun:stun-b.example.com:3478;
-                }
-            }
-        "#;
-        let result = parse_phalanx_config(cfg);
-        assert!(result.is_ok());
-        let servers = &result.unwrap().http.unwrap().servers;
-        assert_eq!(servers.len(), 2);
-        assert_eq!(servers[0].ice_servers, vec!["stun:stun-a.example.com:3478"]);
-        assert_eq!(servers[1].ice_servers.len(), 2);
-    }
-
-    #[test]
-    fn test_turn_username_and_credential_parsed() {
-        let cfg = r#"
-            http {
-                upstream default { server 127.0.0.1:8081; }
-                server {
-                    listen 8080;
-                    ice_server turn:turn.example.com:3478?transport=udp;
-                    turn_username "alice";
-                    turn_credential "wonderland";
-                }
-            }
-        "#;
-        let result = parse_phalanx_config(cfg);
-        assert!(result.is_ok());
-        let servers = &result.unwrap().http.unwrap().servers;
-        assert_eq!(servers[0].turn_username.as_deref(), Some("alice"));
-        assert_eq!(servers[0].turn_credential.as_deref(), Some("wonderland"));
-    }
-
-    #[test]
-    fn test_turn_credential_unknown_directive_rejected() {
-        let cfg = r#"
-            http {
-                upstream default { server 127.0.0.1:8081; }
-                server {
-                    listen 8080;
-                    turn_secret "hacker";
                 }
             }
         "#;

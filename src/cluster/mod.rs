@@ -35,6 +35,9 @@ pub struct ClusterState {
     node_id: String,
     /// Gossip state engine (populated when backend is Gossip).
     gossip_state: Option<Arc<GossipState>>,
+    /// Address this node is reachable on (admin API bind address).
+    /// Used by `list_nodes` in standalone mode to report a real address.
+    bind_addr: String,
 }
 
 #[derive(Clone)]
@@ -91,7 +94,7 @@ impl ClusterState {
     /// # Arguments
     /// * `backend` - Which storage engine to use (etcd, Redis, Gossip, or Standalone).
     /// * `node_id` - A unique identifier for this Phalanx instance.
-    pub fn new(backend: ClusterBackend, node_id: String) -> Self {
+    pub fn new(backend: ClusterBackend, node_id: String, bind_addr: String) -> Self {
         let gossip_state = if let ClusterBackend::Gossip { ref bind_addr, ref seed_peers } = backend {
             let seed_addrs: Vec<std::net::SocketAddr> = seed_peers
                 .iter()
@@ -111,7 +114,7 @@ impl ClusterState {
         };
 
         info!("Cluster state initialized: node_id={}, backend={:?}", node_id, backend);
-        Self { backend, node_id, gossip_state }
+        Self { backend, node_id, gossip_state, bind_addr }
     }
 
     /// Stores a key-value pair in the cluster KV store with an optional TTL.
@@ -405,7 +408,7 @@ impl ClusterState {
                 node_id: self.node_id.clone(),
                 status: "healthy".to_string(),
                 last_seen_secs: 0,
-                addr: String::new(),
+                addr: self.bind_addr.clone(),
             }]
         }
     }
@@ -426,20 +429,20 @@ mod tests {
 
     #[test]
     fn test_cluster_state_standalone_creation() {
-        let state = ClusterState::new(ClusterBackend::Standalone, "node-1".to_string());
+        let state = ClusterState::new(ClusterBackend::Standalone, "node-1".to_string(), "127.0.0.1:9090".to_string());
         assert_eq!(state.node_id(), "node-1");
     }
 
     #[tokio::test]
     async fn test_standalone_put_ok() {
-        let state = ClusterState::new(ClusterBackend::Standalone, "n1".to_string());
+        let state = ClusterState::new(ClusterBackend::Standalone, "n1".to_string(), "127.0.0.1:9090".to_string());
         let result = state.put("key", "value", Some(60)).await;
         assert!(result.is_ok());
     }
 
     #[tokio::test]
     async fn test_standalone_get_returns_none() {
-        let state = ClusterState::new(ClusterBackend::Standalone, "n1".to_string());
+        let state = ClusterState::new(ClusterBackend::Standalone, "n1".to_string(), "127.0.0.1:9090".to_string());
         let result = state.get("key").await;
         assert!(result.is_ok());
         assert!(result.unwrap().is_none());
@@ -447,28 +450,28 @@ mod tests {
 
     #[tokio::test]
     async fn test_standalone_delete_ok() {
-        let state = ClusterState::new(ClusterBackend::Standalone, "n1".to_string());
+        let state = ClusterState::new(ClusterBackend::Standalone, "n1".to_string(), "127.0.0.1:9090".to_string());
         let result = state.delete("key").await;
         assert!(result.is_ok());
     }
 
     #[tokio::test]
     async fn test_standalone_sticky_session_returns_none() {
-        let state = ClusterState::new(ClusterBackend::Standalone, "n1".to_string());
+        let state = ClusterState::new(ClusterBackend::Standalone, "n1".to_string(), "127.0.0.1:9090".to_string());
         let result = state.lookup_sticky_session("sess-1").await;
         assert!(result.is_none());
     }
 
     #[tokio::test]
     async fn test_standalone_share_sticky_session_ok() {
-        let state = ClusterState::new(ClusterBackend::Standalone, "n1".to_string());
+        let state = ClusterState::new(ClusterBackend::Standalone, "n1".to_string(), "127.0.0.1:9090".to_string());
         let result = state.share_sticky_session("sess", "10.0.0.1:80", 60).await;
         assert!(result.is_ok());
     }
 
     #[tokio::test]
     async fn test_standalone_heartbeat() {
-        let state = ClusterState::new(ClusterBackend::Standalone, "n1".to_string());
+        let state = ClusterState::new(ClusterBackend::Standalone, "n1".to_string(), "127.0.0.1:9090".to_string());
         let result = state.heartbeat(30).await;
         assert!(result.is_ok());
     }
@@ -495,6 +498,7 @@ mod tests {
                 seed_peers: vec![],
             },
             "gossip-node-1".to_string(),
+            "127.0.0.1:9090".to_string(),
         );
         assert!(state.gossip_state.is_some());
 
@@ -517,6 +521,7 @@ mod tests {
                 seed_peers: vec![],
             },
             "gossip-node-1".to_string(),
+            "127.0.0.1:9090".to_string(),
         );
         state.share_sticky_session("user-42", "10.0.0.5:8080", 60).await.unwrap();
         let backend = state.lookup_sticky_session("user-42").await;

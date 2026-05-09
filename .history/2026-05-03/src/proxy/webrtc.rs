@@ -104,9 +104,6 @@ pub struct SfuRoom {
     pub publisher_tracks: DashMap<String, Vec<u32>>,
     /// Cancellation tokens for subscriber track-rx tasks (H28).
     pub subscriber_tokens: DashMap<String, CancellationToken>,
-    /// JoinHandles for subscriber track-rx tasks (H28 resilience).
-    /// Stored so we can abort+remove on disconnect and detect panics.
-    pub subscriber_handles: DashMap<String, tokio::task::JoinHandle<()>>,
     /// Cached pre-built WebRTC API for take-and-replenish (C3).
     /// Avoids rebuilding MediaEngine + interceptor registry on every publish/subscribe.
     pub cached_api: tokio::sync::Mutex<Option<webrtc::api::API>>,
@@ -134,7 +131,6 @@ impl SfuRoom {
             publishers: DashMap::new(),
             publisher_tracks: DashMap::new(),
             subscriber_tokens: DashMap::new(),
-            subscriber_handles: DashMap::new(),
             cached_api: tokio::sync::Mutex::new(None),
             last_activity: AtomicU64::new(now),
         })
@@ -360,37 +356,24 @@ fn build_webrtc_api() -> webrtc::error::Result<webrtc::api::API> {
 /// Each entry in `configured_urls` becomes one `RTCIceServer` with a
 /// single-element `urls` vec. When empty, Google's public STUN servers are
 /// used so development works without explicit config.
-///
-/// If `turn_username` and `turn_credential` are provided, they are applied to
-/// every server (STUN URLs will simply ignore them; TURN URLs will use them).
-fn build_ice_servers(
-    configured_urls: &[String],
-    turn_username: Option<&str>,
-    turn_credential: Option<&str>,
-) -> Vec<RTCIceServer> {
+fn build_ice_servers(configured_urls: &[String]) -> Vec<RTCIceServer> {
     let valid: Vec<&String> = configured_urls.iter().filter(|u| !u.trim().is_empty()).collect();
-    let servers = if !valid.is_empty() {
-        valid
+    if !valid.is_empty() {
+        return valid
             .iter()
             .map(|url| RTCIceServer {
                 urls: vec![(*url).clone()],
-                username: turn_username.unwrap_or("").to_owned(),
-                credential: turn_credential.unwrap_or("").to_owned(),
                 ..Default::default()
             })
-            .collect()
-    } else {
-        vec![RTCIceServer {
-            urls: vec![
-                "stun:stun.l.google.com:19302".to_owned(),
-                "stun:stun1.l.google.com:19302".to_owned(),
-            ],
-            username: turn_username.unwrap_or("").to_owned(),
-            credential: turn_credential.unwrap_or("").to_owned(),
-            ..Default::default()
-        }]
-    };
-    servers
+            .collect();
+    }
+    vec![RTCIceServer {
+        urls: vec![
+            "stun:stun.l.google.com:19302".to_owned(),
+            "stun:stun1.l.google.com:19302".to_owned(),
+        ],
+        ..Default::default()
+    }]
 }
 
 // ─── Publisher Signalling ─────────────────────────────────────────────────────
@@ -412,15 +395,13 @@ pub async fn handle_publish(
     offer_sdp: String,
     bandwidth: Option<Arc<BandwidthTracker>>,
     ice_servers: &[String],
-    turn_username: Option<&str>,
-    turn_credential: Option<&str>,
 ) -> Result<String, String> {
     let room = sfu.get_or_create_room(&room_id);
 
     let api = acquire_api(&room).await.map_err(|e| format!("Failed to build WebRTC API: {}", e))?;
 
     let config = RTCConfiguration {
-        ice_servers: build_ice_servers(ice_servers, turn_username, turn_credential),
+        ice_servers: build_ice_servers(ice_servers),
         ..Default::default()
     };
 
@@ -560,12 +541,8 @@ pub async fn handle_publish(
         .await
         .map_err(|e| format!("set_local_description failed: {}", e))?;
 
-    // Block until all ICE candidates have been gathered, but cap wait so
-    // a slow STUN/TURN probe cannot block the async runtime indefinitely.
-    const ICE_GATHER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
-    if tokio::time::timeout(ICE_GATHER_TIMEOUT, gather_complete.recv()).await.is_err() {
-        warn!("ICE gathering timed out for publisher {}, proceeding with partial candidates", peer_id);
-    }
+    // Block until all ICE candidates have been gathered
+    let _ = gather_complete.recv().await;
 
     let local_desc = peer_connection
         .local_description()
@@ -595,15 +572,13 @@ pub async fn handle_subscribe(
     peer_id: String,
     offer_sdp: String,
     ice_servers: &[String],
-    turn_username: Option<&str>,
-    turn_credential: Option<&str>,
 ) -> Result<String, String> {
     let room = sfu.get_or_create_room(&room_id);
 
     let api = acquire_api(&room).await.map_err(|e| format!("Failed to build WebRTC API: {}", e))?;
 
     let config = RTCConfiguration {
-        ice_servers: build_ice_servers(ice_servers, turn_username, turn_credential),
+        ice_servers: build_ice_servers(ice_servers),
         ..Default::default()
     };
 
@@ -636,7 +611,7 @@ pub async fn handle_subscribe(
     let pc_for_future = Arc::clone(&peer_connection);
     let peer_id_future = peer_id.clone();
     let sub_token = sub_cancel.clone();
-    let handle = tokio::spawn(async move {
+    tokio::spawn(async move {
         loop {
             tokio::select! {
                 _ = sub_token.cancelled() => {
@@ -667,7 +642,6 @@ pub async fn handle_subscribe(
             }
         }
     });
-    room.subscriber_handles.insert(peer_id.clone(), handle);
 
     // on_ice_connection_state_change: cleanup on disconnect (H28: cancel subscriber token)
     let room_for_state = Arc::clone(&room);
@@ -676,15 +650,10 @@ pub async fn handle_subscribe(
         let room = Arc::clone(&room_for_state);
         let peer_id = peer_id_for_close.clone();
         Box::pin(async move {
-            if state == RTCIceConnectionState::Disconnected
-                || state == RTCIceConnectionState::Failed
-                || state == RTCIceConnectionState::Closed
-            {
+            if state == RTCIceConnectionState::Disconnected || state == RTCIceConnectionState::Failed {
+                // H28: cancel the track-rx task
                 if let Some((_, token)) = room.subscriber_tokens.remove(&peer_id) {
                     token.cancel();
-                }
-                if let Some((_, handle)) = room.subscriber_handles.remove(&peer_id) {
-                    handle.abort();
                 }
                 room.peers.remove(&peer_id);
                 info!("Subscriber peer {} disconnected from room.", peer_id);
@@ -712,10 +681,7 @@ pub async fn handle_subscribe(
         .await
         .map_err(|e| format!("Subscriber set_local_description failed: {}", e))?;
 
-    const ICE_GATHER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
-    if tokio::time::timeout(ICE_GATHER_TIMEOUT, gather_complete.recv()).await.is_err() {
-        warn!("ICE gathering timed out for subscriber {}, proceeding with partial candidates", peer_id);
-    }
+    let _ = gather_complete.recv().await;
 
     let local_desc = peer_connection
         .local_description()
@@ -789,7 +755,7 @@ mod tests {
 
     #[test]
     fn test_build_ice_servers_empty_returns_google_stun() {
-        let servers = build_ice_servers(&[], None, None);
+        let servers = build_ice_servers(&[]);
         assert_eq!(servers.len(), 1);
         assert!(servers[0].urls.len() >= 2);
         assert!(servers[0].urls[0].starts_with("stun:"));
@@ -800,7 +766,7 @@ mod tests {
         let configured = vec![
             "turn:turn.example.com:3478?transport=udp".to_string(),
         ];
-        let servers = build_ice_servers(&configured, None, None);
+        let servers = build_ice_servers(&configured);
         assert_eq!(servers.len(), 1);
         assert_eq!(servers[0].urls[0], "turn:turn.example.com:3478?transport=udp");
     }
@@ -811,7 +777,7 @@ mod tests {
             "stun:stun.custom.com:3478".to_string(),
             "turn:turn.custom.com:3478?transport=udp".to_string(),
         ];
-        let servers = build_ice_servers(&configured, None, None);
+        let servers = build_ice_servers(&configured);
         assert_eq!(servers.len(), 2);
         assert_eq!(servers[0].urls[0], "stun:stun.custom.com:3478");
         assert_eq!(servers[1].urls[0], "turn:turn.custom.com:3478?transport=udp");
@@ -820,7 +786,7 @@ mod tests {
     #[test]
     fn test_build_ice_servers_empty_string_falls_back_to_google_stun() {
         let configured = vec!["".to_string()];
-        let servers = build_ice_servers(&configured, None, None);
+        let servers = build_ice_servers(&configured);
         assert_eq!(servers.len(), 1);
         assert!(servers[0].urls.len() >= 2);
         assert!(servers[0].urls[0].starts_with("stun:"));
@@ -829,7 +795,7 @@ mod tests {
     #[test]
     fn test_build_ice_servers_whitespace_only_falls_back() {
         let configured = vec!["   ".to_string()];
-        let servers = build_ice_servers(&configured, None, None);
+        let servers = build_ice_servers(&configured);
         assert_eq!(servers.len(), 1);
         assert!(servers[0].urls[0].starts_with("stun:"));
     }
@@ -841,31 +807,9 @@ mod tests {
             "turn:turn.example.com:3478".to_string(),
             "  ".to_string(),
         ];
-        let servers = build_ice_servers(&configured, None, None);
+        let servers = build_ice_servers(&configured);
         assert_eq!(servers.len(), 1);
         assert_eq!(servers[0].urls[0], "turn:turn.example.com:3478");
-    }
-
-    #[test]
-    fn test_build_ice_servers_turn_credentials_applied_to_all_servers() {
-        let configured = vec![
-            "stun:stun.example.com:3478".to_string(),
-            "turn:turn.example.com:3478?transport=udp".to_string(),
-        ];
-        let servers = build_ice_servers(&configured, Some("alice"), Some("wonderland"));
-        assert_eq!(servers.len(), 2);
-        for s in &servers {
-            assert_eq!(s.username, "alice");
-            assert_eq!(s.credential, "wonderland");
-        }
-    }
-
-    #[test]
-    fn test_build_ice_servers_turn_credentials_applied_to_fallback() {
-        let servers = build_ice_servers(&[], Some("bob"), Some("secret"));
-        assert_eq!(servers.len(), 1);
-        assert_eq!(servers[0].username, "bob");
-        assert_eq!(servers[0].credential, "secret");
     }
 
     #[test]
@@ -923,45 +867,5 @@ mod tests {
         assert_eq!(room.participant_count(), 0);
         assert_eq!(room.publisher_count(), 0);
         assert_eq!(room.subscriber_count(), 0);
-    }
-
-    #[tokio::test]
-    async fn test_subscriber_handles_stored_and_removed() {
-        let room = SfuRoom::new("test".into());
-        assert!(room.subscriber_handles.is_empty());
-
-        // Simulate storing a handle (use an already-completed task for the test)
-        let dummy_handle = tokio::spawn(async {});
-        room.subscriber_handles
-            .insert("peer1".into(), dummy_handle);
-        assert_eq!(room.subscriber_handles.len(), 1);
-
-        // Simulate disconnect cleanup
-        let (_, handle) = room.subscriber_handles.remove("peer1").unwrap();
-        handle.abort(); // should be a no-op on already-completed task
-        assert!(room.subscriber_handles.is_empty());
-    }
-
-    /// ICE gathering must not block the runtime indefinitely.
-    /// This test verifies the timeout pattern used in handle_publish/handle_subscribe.
-    #[tokio::test]
-    async fn test_ice_gather_timeout_fires_when_channel_never_sends() {
-        let (_tx, mut rx) = tokio::sync::mpsc::channel::<()>(1);
-        let start = tokio::time::Instant::now();
-        let result = tokio::time::timeout(
-            std::time::Duration::from_millis(50),
-            rx.recv(),
-        )
-        .await;
-        assert!(result.is_err(), "timeout should fire when sender never sends");
-        let elapsed = start.elapsed();
-        assert!(
-            elapsed >= std::time::Duration::from_millis(50),
-            "waited at least the timeout duration"
-        );
-        assert!(
-            elapsed < std::time::Duration::from_millis(200),
-            "should not wait much longer than timeout"
-        );
     }
 }

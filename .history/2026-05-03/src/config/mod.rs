@@ -127,27 +127,6 @@ impl Default for BackendConfig {
     }
 }
 
-impl From<crate::discovery::DiscoveredBackend> for BackendConfig {
-    fn from(d: crate::discovery::DiscoveredBackend) -> Self {
-        Self {
-            address: d.address,
-            weight: d.weight,
-            health_check_path: d.health_check_path,
-            health_check_status: d.health_check_status.unwrap_or(200),
-            max_fails: d.max_fails.unwrap_or(3),
-            fail_timeout_secs: d.fail_timeout_secs.unwrap_or(30),
-            slow_start_secs: d.slow_start_secs.unwrap_or(0),
-            backup: d.backup.unwrap_or(false),
-            max_conns: d.max_conns.unwrap_or(0),
-            queue_size: d.queue_size.unwrap_or(0),
-            queue_timeout_ms: d.queue_timeout_ms.unwrap_or(5000),
-            circuit_breaker: d.circuit_breaker.unwrap_or(false),
-            circuit_initial_backoff_secs: d.circuit_initial_backoff_secs.unwrap_or(5),
-            circuit_max_backoff_secs: d.circuit_max_backoff_secs.unwrap_or(60),
-        }
-    }
-}
-
 /// A pool of backend servers associated with a specific load balancing algorithm.
 ///
 /// Corresponds to an `upstream pool_name { ... }` block in the config file.
@@ -442,10 +421,6 @@ pub struct AppConfig {
     /// Each entry is a URL like `stun:host:port` or `turn:host:port?transport=udp`.
     #[serde(default)]
     pub ice_servers: Vec<String>,
-    /// TURN server username for authenticated TURN relay.
-    pub turn_username: Option<String>,
-    /// TURN server credential (password) for authenticated TURN relay.
-    pub turn_credential: Option<String>,
     /// Seconds before an idle (zero-peer) WebRTC room is garbage-collected.
     /// Default: 300 (5 minutes). Set to 0 to disable housekeeping cleanup.
     #[serde(default = "default_room_idle_timeout")]
@@ -709,8 +684,6 @@ impl Default for AppConfig {
             brotli_enabled: false,
             webtransport_enabled: false,
             ice_servers: Vec::new(),
-            turn_username: None,
-            turn_credential: None,
             room_idle_timeout_secs: 300,
             auth_request_url: None,
             mirror_pool: None,
@@ -877,12 +850,6 @@ pub fn try_load_config(
                 app_cfg
                     .ice_servers
                     .extend(server.ice_servers.iter().cloned());
-                if let Some(v) = server.turn_username.as_ref() {
-                    app_cfg.turn_username = Some(v.clone());
-                }
-                if let Some(v) = server.turn_credential.as_ref() {
-                    app_cfg.turn_credential = Some(v.clone());
-                }
                 if let Some(v) = server.directives.get("auth_request") {
                     app_cfg.auth_request_url = Some(v.clone());
                 }
@@ -1112,13 +1079,6 @@ pub fn try_load_config(
                         app_cfg.udp_session_timeout_secs = val;
                     } else {
                         tracing::warn!("Invalid value '{}' for udp_session_timeout: expected a number, ignoring", v);
-                    }
-                }
-                if let Some(v) = server.directives.get("room_idle_timeout") {
-                    if let Ok(val) = v.parse::<u64>() {
-                        app_cfg.room_idle_timeout_secs = val;
-                    } else {
-                        tracing::warn!("Invalid value '{}' for room_idle_timeout: expected a number, ignoring", v);
                     }
                 }
 
@@ -1723,43 +1683,5 @@ mod tests {
         assert_eq!(cfg.zone_burst, 1000);
         assert_eq!(cfg.zone_max_connections, 100);
         let _ = std::fs::remove_file(path);
-    }
-
-    #[test]
-    fn test_backend_config_from_discovered_no_field_loss() {
-        let db = crate::discovery::DiscoveredBackend {
-            address: "10.0.0.1:8080".to_string(),
-            pool: "api".to_string(),
-            weight: 5,
-            healthy: true,
-            registered_at: 12345,
-            health_check_path: Some("/healthz".to_string()),
-            health_check_status: Some(201),
-            max_fails: Some(5),
-            fail_timeout_secs: Some(60),
-            slow_start_secs: Some(10),
-            backup: Some(true),
-            max_conns: Some(100),
-            queue_size: Some(50),
-            queue_timeout_ms: Some(3000),
-            circuit_breaker: Some(true),
-            circuit_initial_backoff_secs: Some(10),
-            circuit_max_backoff_secs: Some(120),
-        };
-        let bc = BackendConfig::from(db);
-        assert_eq!(bc.address, "10.0.0.1:8080");
-        assert_eq!(bc.weight, 5);
-        assert_eq!(bc.health_check_path, Some("/healthz".to_string()));
-        assert_eq!(bc.health_check_status, 201);
-        assert_eq!(bc.max_fails, 5);
-        assert_eq!(bc.fail_timeout_secs, 60);
-        assert_eq!(bc.slow_start_secs, 10);
-        assert!(bc.backup);
-        assert_eq!(bc.max_conns, 100);
-        assert_eq!(bc.queue_size, 50);
-        assert_eq!(bc.queue_timeout_ms, 3000);
-        assert!(bc.circuit_breaker);
-        assert_eq!(bc.circuit_initial_backoff_secs, 10);
-        assert_eq!(bc.circuit_max_backoff_secs, 120);
     }
 }

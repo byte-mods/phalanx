@@ -19,7 +19,6 @@ use prometheus::{
     Encoder, HistogramOpts, HistogramVec, IntCounter, IntCounterVec, IntGauge, Opts, Registry,
     TextEncoder,
 };
-use parking_lot::RwLock;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use tracing::info;
@@ -57,12 +56,6 @@ pub struct AdminState {
     pub sfu_state: Arc<crate::proxy::webrtc::SfuState>,
     /// Configured ICE server URLs for WebRTC NAT traversal.
     pub ice_servers: Vec<String>,
-    /// TURN server username for authenticated TURN relay.
-    pub turn_username: Option<String>,
-    /// TURN server credential (password) for authenticated TURN relay.
-    pub turn_credential: Option<String>,
-    /// Last SIGHUP reload result (None = no reload attempted yet).
-    pub last_reload_status: Arc<RwLock<Option<crate::reload::ReloadStatus>>>,
 }
 
 /// Global metrics registry shared across the proxy and admin server.
@@ -87,14 +80,6 @@ pub struct ProxyMetrics {
     pub backend_errors_total: IntCounterVec,
     /// Counter for ML fraud model load failures (fallback to rule-based mode).
     pub ml_model_load_failures: IntCounter,
-    /// WebTransport sessions, labeled by outcome (accepted, error).
-    pub wt_sessions_total: IntCounterVec,
-    /// WebTransport stream operations, labeled by stream type (bidi, uni) and outcome (echoed, error).
-    pub wt_streams_total: IntCounterVec,
-    /// WebTransport datagrams sent, labeled by outcome (echoed, error).
-    pub wt_datagrams_total: IntCounterVec,
-    /// Number of currently active WebTransport sessions.
-    pub wt_active_sessions: IntGauge,
 }
 
 impl ProxyMetrics {
@@ -207,49 +192,6 @@ impl ProxyMetrics {
             .register(Box::new(ml_model_load_failures.clone()))
             .unwrap();
 
-        let wt_sessions_total = IntCounterVec::new(
-            Opts::new(
-                "phalanx_wt_sessions_total",
-                "Total WebTransport sessions",
-            ),
-            &["outcome"],
-        )
-        .unwrap();
-        let wt_streams_total = IntCounterVec::new(
-            Opts::new(
-                "phalanx_wt_streams_total",
-                "Total WebTransport stream operations",
-            ),
-            &["stream_type", "outcome"],
-        )
-        .unwrap();
-        let wt_datagrams_total = IntCounterVec::new(
-            Opts::new(
-                "phalanx_wt_datagrams_total",
-                "Total WebTransport datagrams sent",
-            ),
-            &["outcome"],
-        )
-        .unwrap();
-        let wt_active_sessions = IntGauge::new(
-            "phalanx_wt_active_sessions",
-            "Number of currently active WebTransport sessions",
-        )
-        .unwrap();
-
-        registry
-            .register(Box::new(wt_sessions_total.clone()))
-            .unwrap();
-        registry
-            .register(Box::new(wt_streams_total.clone()))
-            .unwrap();
-        registry
-            .register(Box::new(wt_datagrams_total.clone()))
-            .unwrap();
-        registry
-            .register(Box::new(wt_active_sessions.clone()))
-            .unwrap();
-
         Self {
             registry,
             http_requests_total,
@@ -261,10 +203,6 @@ impl ProxyMetrics {
             backend_request_duration,
             backend_errors_total,
             ml_model_load_failures,
-            wt_sessions_total,
-            wt_streams_total,
-            wt_datagrams_total,
-            wt_active_sessions,
         }
     }
 
@@ -298,11 +236,29 @@ async fn metrics_endpoint(state: web::Data<AdminState>) -> impl Responder {
 /// the frontend can render counters without parsing the text format.
 #[get("/api/stats")]
 async fn api_stats(state: web::Data<AdminState>) -> impl Responder {
+    // Instead of using generic Prometheus encoding which is hard to parse in JS,
+    // we create a custom JSON structure wrapping the registry output.
+    // However, the cleanest way to expose Prometheus metrics to a simple UI
+    // is to just use a custom struct. For simplicity here, we'll manually
+    // extract the gauge/counter values.
+
     let active = state.metrics.active_connections.get();
+
+    // Summing counters across all labels involves iterating the registry
+    // But since the UI JS fetches this, we can give it raw counts or parsed.
+    // The easiest robust way is just exposing the prometheus `gather()` in a simplified shape.
     let families = state.metrics.registry.gather();
 
-    let mut metrics: serde_json::Map<String, serde_json::Value> = serde_json::Map::new();
-    metrics.insert("active_connections".to_string(), serde_json::json!(active));
+    // We'll return a raw JSON map that the JS can parse
+    // using serde_json. We don't have to perfectly serialize prometheus,
+    // just give enough data to the UI.
+    let mut stats = serde_json::json!({
+        "active_connections": active,
+        "http_requests_total": [],
+        "cache_hits_total": [],
+        "waf_blocks_total": [],
+        "rate_limit_rejections": [],
+    });
 
     for family in families {
         let name = family.name().to_string();
@@ -317,32 +273,39 @@ async fn api_stats(state: web::Data<AdminState>) -> impl Responder {
                 );
             }
 
-            let (val, metric_type) = if let Some(counter) = m.get_counter().as_ref() {
-                (counter.value(), "counter")
+            let val = if let Some(counter) = m.get_counter().as_ref() {
+                counter.value()
             } else if let Some(gauge) = m.get_gauge().as_ref() {
-                (gauge.value(), "gauge")
+                gauge.value()
             } else if let Some(hist) = m.get_histogram().as_ref() {
-                let avg = if hist.get_sample_count() > 0 {
+                // Compute average from the histogram's cumulative sum and count.
+                if hist.get_sample_count() > 0 {
                     hist.get_sample_sum() / hist.get_sample_count() as f64
                 } else {
                     0.0
-                };
-                (avg, "histogram")
+                }
             } else {
-                (0.0, "unknown")
+                0.0
             };
 
             metrics_array.push(serde_json::json!({
                 "labels": labels,
-                "value": val,
-                "type": metric_type,
+                "value": val
             }));
         }
 
-        metrics.insert(name, serde_json::json!(metrics_array));
+        if name == "phalanx_http_requests_total" {
+            stats["http_requests_total"] = serde_json::json!(metrics_array);
+        } else if name == "phalanx_cache_total" {
+            stats["cache_hits_total"] = serde_json::json!(metrics_array);
+        } else if name == "phalanx_waf_blocks_total" {
+            stats["waf_blocks_total"] = serde_json::json!(metrics_array);
+        } else if name == "phalanx_rate_limit_rejections_total" {
+            stats["rate_limit_rejections"] = serde_json::json!(metrics_array);
+        }
     }
 
-    HttpResponse::Ok().json(serde_json::Value::Object(metrics))
+    HttpResponse::Ok().json(stats)
 }
 
 /// GET /dashboard -- serves the embedded HTML dashboard (compiled into the binary).
@@ -366,7 +329,22 @@ async fn add_backend(
 
     // Add to active memory
     if let Some(pool) = state.manager.get_pool(&backend.pool) {
-        pool.add_backend(crate::config::BackendConfig::from(backend));
+        pool.add_backend(crate::config::BackendConfig {
+            address: backend.address.clone(),
+            weight: backend.weight,
+            health_check_path: backend.health_check_path.clone(),
+            health_check_status: backend.health_check_status.unwrap_or(200),
+            max_fails: backend.max_fails.unwrap_or(3),
+            fail_timeout_secs: backend.fail_timeout_secs.unwrap_or(30),
+            slow_start_secs: backend.slow_start_secs.unwrap_or(0),
+            backup: backend.backup.unwrap_or(false),
+            max_conns: backend.max_conns.unwrap_or(0),
+            queue_size: backend.queue_size.unwrap_or(0),
+            queue_timeout_ms: backend.queue_timeout_ms.unwrap_or(5000),
+            circuit_breaker: backend.circuit_breaker.unwrap_or(false),
+            circuit_initial_backoff_secs: backend.circuit_initial_backoff_secs.unwrap_or(5),
+            circuit_max_backoff_secs: backend.circuit_max_backoff_secs.unwrap_or(60),
+        });
         HttpResponse::Ok().json(serde_json::json!({"status": "added"}))
     } else {
         HttpResponse::NotFound().json(serde_json::json!({"error": "pool not found"}))
@@ -434,9 +412,6 @@ pub async fn start_admin_server(
                 cluster_state: Arc::clone(&s.cluster_state),
                 sfu_state: Arc::clone(&s.sfu_state),
                 ice_servers: s.ice_servers.clone(),
-                turn_username: s.turn_username.clone(),
-                turn_credential: s.turn_credential.clone(),
-                last_reload_status: Arc::clone(&s.last_reload_status),
             },
             rate_limiter,
             bandwidth: Arc::clone(&s.bandwidth),
@@ -464,7 +439,6 @@ pub async fn start_admin_server(
             .service(upstreams_health)
             .service(config_validate)
             .service(config_reload)
-            .service(reload_status)
             .service(api::ml_upload)
             .service(api::ml_logs)
             .service(api::ml_mode)
@@ -722,24 +696,6 @@ async fn config_reload(state: web::Data<AdminState>) -> impl Responder {
     HttpResponse::Ok().json(serde_json::json!({ "status": "reload not supported on this platform" }))
 }
 
-/// GET /api/reload/status -- returns the result of the most recent SIGHUP reload.
-#[get("/api/reload/status")]
-async fn reload_status(state: web::Data<AdminState>) -> impl Responder {
-    let guard = state.last_reload_status.read();
-    match guard.as_ref() {
-        Some(status) => HttpResponse::Ok().json(serde_json::json!({
-            "last_attempt": status.last_attempt,
-            "success": status.success,
-            "errors": status.errors,
-        })),
-        None => HttpResponse::Ok().json(serde_json::json!({
-            "last_attempt": null,
-            "success": null,
-            "errors": [],
-        })),
-    }
-}
-
 // ─── WebRTC SFU Signalling Endpoints ─────────────────────────────────────────
 
 /// Request body for publish and subscribe WebRTC signalling endpoints.
@@ -764,8 +720,6 @@ async fn publish_webrtc(
         req.sdp,
         Some(state.bandwidth.clone()),
         &state.ice_servers,
-        state.turn_username.as_deref(),
-        state.turn_credential.as_deref(),
     )
     .await
     {
@@ -787,8 +741,6 @@ async fn subscribe_webrtc(
         req.peer_id,
         req.sdp,
         &state.ice_servers,
-        state.turn_username.as_deref(),
-        state.turn_credential.as_deref(),
     )
     .await
     {
@@ -901,80 +853,9 @@ mod tests {
         assert!(encoded.contains("phalanx_cache_total"));
     }
 
-    #[actix_web::test]
-    async fn test_wt_sessions_total_counter() {
-        let metrics = ProxyMetrics::new();
-        metrics
-            .wt_sessions_total
-            .with_label_values(&["accepted"])
-            .inc();
-        metrics
-            .wt_sessions_total
-            .with_label_values(&["error"])
-            .inc_by(2);
-        let encoded = metrics.encode();
-        assert!(encoded.contains("phalanx_wt_sessions_total"));
-        assert!(encoded.contains(r#"outcome="accepted""#));
-        assert!(encoded.contains(r#"outcome="error""#));
-    }
-
-    #[actix_web::test]
-    async fn test_wt_streams_total_counter() {
-        let metrics = ProxyMetrics::new();
-        metrics
-            .wt_streams_total
-            .with_label_values(&["bidi", "echoed"])
-            .inc();
-        metrics
-            .wt_streams_total
-            .with_label_values(&["uni", "drained"])
-            .inc_by(3);
-        metrics
-            .wt_streams_total
-            .with_label_values(&["bidi", "error"])
-            .inc();
-        let encoded = metrics.encode();
-        assert!(encoded.contains("phalanx_wt_streams_total"));
-        assert!(encoded.contains(r#"stream_type="bidi""#));
-        assert!(encoded.contains(r#"stream_type="uni""#));
-        assert!(encoded.contains(r#"outcome="echoed""#));
-        assert!(encoded.contains(r#"outcome="drained""#));
-        assert!(encoded.contains(r#"outcome="error""#));
-    }
-
-    #[actix_web::test]
-    async fn test_wt_datagrams_total_counter() {
-        let metrics = ProxyMetrics::new();
-        metrics
-            .wt_datagrams_total
-            .with_label_values(&["echoed"])
-            .inc_by(5);
-        metrics
-            .wt_datagrams_total
-            .with_label_values(&["error"])
-            .inc();
-        let encoded = metrics.encode();
-        assert!(encoded.contains("phalanx_wt_datagrams_total"));
-        assert!(encoded.contains(r#"outcome="echoed""#));
-        assert!(encoded.contains(r#"outcome="error""#));
-    }
-
-    #[actix_web::test]
-    async fn test_wt_active_sessions_gauge() {
-        let metrics = ProxyMetrics::new();
-        assert_eq!(metrics.wt_active_sessions.get(), 0);
-        metrics.wt_active_sessions.inc();
-        metrics.wt_active_sessions.inc();
-        assert_eq!(metrics.wt_active_sessions.get(), 2);
-        metrics.wt_active_sessions.dec();
-        assert_eq!(metrics.wt_active_sessions.get(), 1);
-        metrics.wt_active_sessions.dec();
-        assert_eq!(metrics.wt_active_sessions.get(), 0);
-    }
-
     /// Regression: ensure every DiscoveredBackend field survives the
-    /// conversion to BackendConfig via the From impl. If a field is added
-    /// to DiscoveredBackend but not mapped in From, this test fails.
+    /// conversion to BackendConfig in add_backend. If a field is added
+    /// to DiscoveredBackend but not mapped here, this test fails.
     #[actix_web::test]
     async fn test_add_backend_all_fields_preserved() {
         use crate::config::BackendConfig;
@@ -1000,7 +881,23 @@ mod tests {
             circuit_max_backoff_secs: Some(120),
         };
 
-        let bc = BackendConfig::from(db);
+        // Replicate the conversion from add_backend (src/admin/mod.rs:328-343).
+        let bc = BackendConfig {
+            address: db.address.clone(),
+            weight: db.weight,
+            health_check_path: db.health_check_path.clone(),
+            health_check_status: db.health_check_status.unwrap_or(200),
+            max_fails: db.max_fails.unwrap_or(3),
+            fail_timeout_secs: db.fail_timeout_secs.unwrap_or(30),
+            slow_start_secs: db.slow_start_secs.unwrap_or(0),
+            backup: db.backup.unwrap_or(false),
+            max_conns: db.max_conns.unwrap_or(0),
+            queue_size: db.queue_size.unwrap_or(0),
+            queue_timeout_ms: db.queue_timeout_ms.unwrap_or(5000),
+            circuit_breaker: db.circuit_breaker.unwrap_or(false),
+            circuit_initial_backoff_secs: db.circuit_initial_backoff_secs.unwrap_or(5),
+            circuit_max_backoff_secs: db.circuit_max_backoff_secs.unwrap_or(60),
+        };
 
         assert_eq!(bc.address, "10.0.0.1:8080");
         assert_eq!(bc.weight, 5);
@@ -1049,7 +946,6 @@ mod tests {
         let cluster_state = Arc::new(crate::cluster::ClusterState::new(
             crate::cluster::ClusterBackend::Standalone,
             "test-node".to_string(),
-            "127.0.0.1:9090".to_string(),
         ));
         let sfu_state = crate::proxy::webrtc::SfuState::new();
         let state = AdminState {
@@ -1068,9 +964,6 @@ mod tests {
             cluster_state,
             sfu_state: Arc::clone(&sfu_state),
             ice_servers: Vec::new(),
-            turn_username: None,
-            turn_credential: None,
-            last_reload_status: Arc::new(RwLock::new(None)),
         };
         (web::Data::new(state), sfu_state)
     }
@@ -1204,312 +1097,5 @@ mod tests {
             .to_request();
         let resp = test::call_service(&app, req).await;
         assert_eq!(resp.status(), 400);
-    }
-
-    /// Integration: publish then subscribe to the same room and verify
-    /// the room reflects both peers in its participant/publisher/subscriber
-    /// counts.
-    #[actix_web::test]
-    async fn test_webrtc_publish_subscribe_same_room_counts() {
-        let (state, _sfu) = make_webrtc_admin_state();
-        let app = test::init_service(
-            App::new()
-                .app_data(state.clone())
-                .service(publish_webrtc)
-                .service(subscribe_webrtc)
-                .service(list_webrtc_rooms),
-        )
-        .await;
-
-        // Publish and subscribe both fail because there is no real browser,
-        // but get_or_create_room runs before the WebRTC stack is touched,
-        // so the room and peer entries survive the error.
-        let pub_req = test::TestRequest::post()
-            .uri("/api/webrtc/publish")
-            .set_json(&serde_json::json!({
-                "room_id": "flow-room",
-                "peer_id": "pub-1",
-                "sdp": "v=0\r\no=- 0 0 IN IP4 0.0.0.0\r\ns=-\r\nt=0 0\r\n"
-            }))
-            .to_request();
-        let _ = test::call_service(&app, pub_req).await;
-
-        let sub_req = test::TestRequest::post()
-            .uri("/api/webrtc/subscribe")
-            .set_json(&serde_json::json!({
-                "room_id": "flow-room",
-                "peer_id": "sub-1",
-                "sdp": "v=0\r\no=- 0 0 IN IP4 0.0.0.0\r\ns=-\r\nt=0 0\r\n"
-            }))
-            .to_request();
-        let _ = test::call_service(&app, sub_req).await;
-
-        let list_req = test::TestRequest::get()
-            .uri("/api/webrtc/rooms")
-            .to_request();
-        let resp = test::call_service(&app, list_req).await;
-        assert_eq!(resp.status(), 200);
-        let body: serde_json::Value = test::read_body_json(resp).await;
-        let rooms = body["rooms"].as_array().unwrap();
-        assert_eq!(rooms.len(), 1);
-        assert_eq!(rooms[0]["id"], "flow-room");
-        assert_eq!(rooms[0]["peer_count"], 2);
-        assert_eq!(rooms[0]["publishers"], 1);
-        assert_eq!(rooms[0]["subscribers"], 1);
-    }
-
-    /// Integration: two publishes to different rooms + verify both show
-    /// up independently in the room list.
-    #[actix_web::test]
-    async fn test_webrtc_multiple_rooms_independent() {
-        let (state, _sfu) = make_webrtc_admin_state();
-        let app = test::init_service(
-            App::new()
-                .app_data(state.clone())
-                .service(publish_webrtc)
-                .service(list_webrtc_rooms),
-        )
-        .await;
-
-        for room_id in &["room-a", "room-b"] {
-            let req = test::TestRequest::post()
-                .uri("/api/webrtc/publish")
-                .set_json(&serde_json::json!({
-                    "room_id": room_id,
-                    "peer_id": format!("pub-{}", room_id),
-                    "sdp": "v=0\r\no=- 0 0 IN IP4 0.0.0.0\r\ns=-\r\nt=0 0\r\n"
-                }))
-                .to_request();
-            let _ = test::call_service(&app, req).await;
-        }
-
-        let list_req = test::TestRequest::get()
-            .uri("/api/webrtc/rooms")
-            .to_request();
-        let resp = test::call_service(&app, list_req).await;
-        assert_eq!(resp.status(), 200);
-        let body: serde_json::Value = test::read_body_json(resp).await;
-        let rooms = body["rooms"].as_array().unwrap();
-        assert_eq!(rooms.len(), 2);
-        let ids: Vec<&str> = rooms.iter().map(|r| r["id"].as_str().unwrap()).collect();
-        assert!(ids.contains(&"room-a"));
-        assert!(ids.contains(&"room-b"));
-    }
-
-    /// Integration: the admin state carries ice_servers and the publish
-    /// endpoint accepts requests. Smoke-test that common config values
-    /// are threadable (the actual ICE server usage is tested in webrtc
-    /// unit tests via build_ice_servers).
-    #[actix_web::test]
-    async fn test_webrtc_publish_with_configured_ice_servers() {
-        let metrics = Arc::new(ProxyMetrics::new());
-        let db_path = format!(
-            "/tmp/phalanx_test_webrtc_ice_{}_{}",
-            std::process::id(),
-            rand::random::<u64>()
-        );
-        let _ = std::fs::create_dir_all(&db_path);
-        let discovery = Arc::new(
-            crate::discovery::ServiceDiscovery::new(&db_path).unwrap(),
-        );
-        let config = crate::config::AppConfig::default();
-        let manager = Arc::new(crate::routing::UpstreamManager::new(
-            &config,
-            Arc::clone(&discovery),
-            tokio_util::sync::CancellationToken::new(),
-        ));
-        let keyval = crate::keyval::KeyvalStore::new(0, None);
-        let reputation = crate::waf::reputation::IpReputationManager::new(5, 3600, None);
-        let waf = Arc::new(crate::waf::WafEngine::new(false, Arc::clone(&reputation)));
-        let cache = Arc::new(crate::middleware::cache::AdvancedCache::new(1000, 60, None));
-        let rate_limiter = Arc::new(crate::middleware::ratelimit::PhalanxRateLimiter::new(
-            100, 200, None, None,
-        ));
-        let bandwidth = crate::telemetry::bandwidth::BandwidthTracker::new();
-        let alert_engine = crate::admin::alerts::AlertEngine::new(Arc::clone(&bandwidth));
-        let cluster_state = Arc::new(crate::cluster::ClusterState::new(
-            crate::cluster::ClusterBackend::Standalone,
-            "test-node".to_string(),
-            "127.0.0.1:9090".to_string(),
-        ));
-        let sfu_state = crate::proxy::webrtc::SfuState::new();
-        let custom_ice = vec!["turn:custom.example.com:3478".to_string()];
-        let state = web::Data::new(AdminState {
-            metrics,
-            discovery,
-            manager,
-            keyval,
-            waf,
-            cache,
-            rate_limiter,
-            bandwidth,
-            alert_engine,
-            dynamic_routes: Arc::new(dashmap::DashMap::new()),
-            dynamic_certs: Arc::new(dashmap::DashMap::new()),
-            config_path: "phalanx.conf".to_string(),
-            cluster_state,
-            sfu_state: Arc::clone(&sfu_state),
-            ice_servers: custom_ice,
-            turn_username: None,
-            turn_credential: None,
-            last_reload_status: Arc::new(RwLock::new(None)),
-        });
-
-        let app = test::init_service(
-            App::new()
-                .app_data(state.clone())
-                .service(publish_webrtc),
-        )
-        .await;
-        let req = test::TestRequest::post()
-            .uri("/api/webrtc/publish")
-            .set_json(&serde_json::json!({
-                "room_id": "ice-room",
-                "peer_id": "pub-1",
-                "sdp": "v=0\r\no=- 0 0 IN IP4 0.0.0.0\r\ns=-\r\nt=0 0\r\n"
-            }))
-            .to_request();
-        let resp = test::call_service(&app, req).await;
-        // Without a real browser the SDP exchange fails (4xx/5xx).
-        // What matters: the handler doesn't panic and ICE servers
-        // were threaded through. Assert error-class, not exact code.
-        assert!(
-            resp.status().is_client_error() || resp.status().is_server_error(),
-            "expected error status, got {}",
-            resp.status()
-        );
-    }
-
-    #[actix_web::test]
-    async fn test_reload_status_returns_none_before_reload() {
-        let (state, _sfu) = make_webrtc_admin_state();
-        let app = test::init_service(
-            App::new()
-                .app_data(state.clone())
-                .service(reload_status),
-        )
-        .await;
-        let req = test::TestRequest::get().uri("/api/reload/status").to_request();
-        let resp = test::call_service(&app, req).await;
-        assert_eq!(resp.status(), 200);
-        let body: serde_json::Value = test::read_body_json(resp).await;
-        assert!(body["last_attempt"].is_null());
-    }
-
-    #[actix_web::test]
-    async fn test_reload_status_reflects_success() {
-        let (state, _sfu) = make_webrtc_admin_state();
-        {
-            let mut guard = state.last_reload_status.write();
-            *guard = Some(crate::reload::ReloadStatus {
-                last_attempt: 1234567890,
-                success: true,
-                errors: vec![],
-            });
-        }
-        let app = test::init_service(
-            App::new()
-                .app_data(state.clone())
-                .service(reload_status),
-        )
-        .await;
-        let req = test::TestRequest::get().uri("/api/reload/status").to_request();
-        let resp = test::call_service(&app, req).await;
-        assert_eq!(resp.status(), 200);
-        let body: serde_json::Value = test::read_body_json(resp).await;
-        assert_eq!(body["last_attempt"], 1234567890);
-        assert_eq!(body["success"], true);
-        assert_eq!(body["errors"].as_array().unwrap().len(), 0);
-    }
-
-    #[actix_web::test]
-    async fn test_reload_status_reflects_failure() {
-        let (state, _sfu) = make_webrtc_admin_state();
-        {
-            let mut guard = state.last_reload_status.write();
-            *guard = Some(crate::reload::ReloadStatus {
-                last_attempt: 1234567890,
-                success: false,
-                errors: vec!["WAF policy reload failed".to_string()],
-            });
-        }
-        let app = test::init_service(
-            App::new()
-                .app_data(state.clone())
-                .service(reload_status),
-        )
-        .await;
-        let req = test::TestRequest::get().uri("/api/reload/status").to_request();
-        let resp = test::call_service(&app, req).await;
-        assert_eq!(resp.status(), 200);
-        let body: serde_json::Value = test::read_body_json(resp).await;
-        assert_eq!(body["success"], false);
-        assert_eq!(body["errors"].as_array().unwrap().len(), 1);
-    }
-
-    #[actix_web::test]
-    async fn test_api_stats_includes_histograms() {
-        let metrics = Arc::new(ProxyMetrics::new());
-        // Record a request to populate the histogram
-        metrics.http_request_duration.with_label_values(&["GET", "default"]).observe(0.042);
-        metrics.http_requests_total.with_label_values(&["GET", "200", "default"]).inc();
-
-        let discovery = Arc::new(crate::discovery::ServiceDiscovery::new("/tmp/dummy_db").unwrap());
-        let manager = Arc::new(crate::routing::UpstreamManager::new(
-            &crate::config::AppConfig::default(),
-            Arc::clone(&discovery),
-            tokio_util::sync::CancellationToken::new(),
-        ));
-        let bandwidth = crate::telemetry::bandwidth::BandwidthTracker::new();
-        let alert_engine = crate::admin::alerts::AlertEngine::new(Arc::clone(&bandwidth));
-        let sfu_state = crate::proxy::webrtc::SfuState::new();
-        let state = web::Data::new(AdminState {
-            metrics: Arc::clone(&metrics),
-            discovery,
-            manager,
-            keyval: crate::keyval::KeyvalStore::new(0, None),
-            waf: Arc::new(crate::waf::WafEngine::new(false, crate::waf::reputation::IpReputationManager::new(5, 3600, None))),
-            cache: Arc::new(crate::middleware::cache::AdvancedCache::new(1000, 60, None)),
-            rate_limiter: Arc::new(crate::middleware::ratelimit::PhalanxRateLimiter::new(100, 200, None, None)),
-            bandwidth,
-            alert_engine,
-            dynamic_routes: Arc::new(dashmap::DashMap::new()),
-            dynamic_certs: Arc::new(dashmap::DashMap::new()),
-            config_path: "phalanx.conf".to_string(),
-            cluster_state: Arc::new(crate::cluster::ClusterState::new(
-                crate::cluster::ClusterBackend::Standalone,
-                "test-node".to_string(),
-                "127.0.0.1:9090".to_string(),
-            )),
-            sfu_state: Arc::clone(&sfu_state),
-            ice_servers: Vec::new(),
-            turn_username: None,
-            turn_credential: None,
-            last_reload_status: Arc::new(RwLock::new(None)),
-        });
-
-        let app = test::init_service(
-            App::new()
-                .app_data(state.clone())
-                .service(api_stats),
-        )
-        .await;
-        let req = test::TestRequest::get().uri("/api/stats").to_request();
-        let resp = test::call_service(&app, req).await;
-        assert_eq!(resp.status(), 200);
-        let body: serde_json::Value = test::read_body_json(resp).await;
-
-        // Histogram family must be present
-        let hist = body.get("phalanx_http_request_duration_seconds").expect("histogram family missing");
-        let hist_arr = hist.as_array().expect("histogram must be array");
-        assert!(!hist_arr.is_empty(), "histogram array must not be empty");
-        assert_eq!(hist_arr[0]["type"], "histogram");
-        assert!(hist_arr[0]["value"].as_f64().unwrap() > 0.0);
-
-        // Counter family must still be present
-        let counter = body.get("phalanx_http_requests_total").expect("counter family missing");
-        let counter_arr = counter.as_array().expect("counter must be array");
-        assert!(!counter_arr.is_empty());
-        assert_eq!(counter_arr[0]["type"], "counter");
     }
 }

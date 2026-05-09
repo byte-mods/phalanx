@@ -2330,7 +2330,7 @@ mod cluster_state_integration_tests {
 
     #[tokio::test]
     async fn test_standalone_put_and_get_is_none() {
-        let state = ClusterState::new(ClusterBackend::Standalone, "node-a".to_string());
+        let state = ClusterState::new(ClusterBackend::Standalone, "node-a".to_string(), "127.0.0.1:9090".to_string());
         assert!(state.put("k", "v", None).await.is_ok());
         // Standalone has no persistent store — get returns None
         assert!(state.get("k").await.unwrap().is_none());
@@ -2338,19 +2338,19 @@ mod cluster_state_integration_tests {
 
     #[tokio::test]
     async fn test_standalone_delete_ok() {
-        let state = ClusterState::new(ClusterBackend::Standalone, "node-a".to_string());
+        let state = ClusterState::new(ClusterBackend::Standalone, "node-a".to_string(), "127.0.0.1:9090".to_string());
         assert!(state.delete("any-key").await.is_ok());
     }
 
     #[tokio::test]
     async fn test_standalone_heartbeat_ok() {
-        let state = ClusterState::new(ClusterBackend::Standalone, "node-a".to_string());
+        let state = ClusterState::new(ClusterBackend::Standalone, "node-a".to_string(), "127.0.0.1:9090".to_string());
         assert!(state.heartbeat(30).await.is_ok());
     }
 
     #[tokio::test]
     async fn test_standalone_sticky_session_roundtrip() {
-        let state = ClusterState::new(ClusterBackend::Standalone, "node-a".to_string());
+        let state = ClusterState::new(ClusterBackend::Standalone, "node-a".to_string(), "127.0.0.1:9090".to_string());
         assert!(state.share_sticky_session("sess-x", "10.0.0.5:8080", 60).await.is_ok());
         // Standalone has no storage — lookup returns None
         assert!(state.lookup_sticky_session("sess-x").await.is_none());
@@ -2358,7 +2358,7 @@ mod cluster_state_integration_tests {
 
     #[test]
     fn test_node_id_returns_configured_value() {
-        let state = ClusterState::new(ClusterBackend::Standalone, "phalanx-node-42".to_string());
+        let state = ClusterState::new(ClusterBackend::Standalone, "phalanx-node-42".to_string(), "127.0.0.1:9090".to_string());
         assert_eq!(state.node_id(), "phalanx-node-42");
     }
 
@@ -2381,6 +2381,7 @@ mod cluster_state_integration_tests {
         let state = ClusterState::new(
             ClusterBackend::Redis { url: "redis://127.0.0.1:19999".to_string(), client: std::sync::Arc::new(tokio::sync::Mutex::new(None)) },
             "node-b".to_string(),
+            "127.0.0.1:9090".to_string(),
         );
         // Should fail gracefully — not panic
         let result = state.put("key", "val", None).await;
@@ -2391,7 +2392,7 @@ mod cluster_state_integration_tests {
 
     #[tokio::test]
     async fn test_put_with_ttl_standalone_ok() {
-        let state = ClusterState::new(ClusterBackend::Standalone, "n".to_string());
+        let state = ClusterState::new(ClusterBackend::Standalone, "n".to_string(), "127.0.0.1:9090".to_string());
         assert!(state.put("ttl-key", "value", Some(300)).await.is_ok());
     }
 }

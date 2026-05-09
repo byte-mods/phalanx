@@ -213,8 +213,9 @@ impl HookEngine {
     /// Removes all Rhai hooks (identified by name prefix "rhai:") and re-registers
     /// from the given script file. Called on SIGHUP reload when `rhai_script` changes.
     ///
-    /// On error, logs a warning and preserves existing hooks.
-    pub fn reload_rhai_script(&self, script_path: &str) {
+    /// On success, swaps hooks atomically.
+    /// On error, returns the error string and preserves existing hooks.
+    pub fn reload_rhai_script(&self, script_path: &str) -> Result<(), String> {
         let sp = script_path.to_string();
         let result = std::thread::spawn(move || {
             rhai_engine::RhaiHookHandler::from_file(&sp)
@@ -241,9 +242,11 @@ impl HookEngine {
                     });
                 }
                 info!("Rhai script reloaded from {}", script_path);
+                Ok(())
             }
             Err(e) => {
                 tracing::warn!("Rhai script reload failed (keeping existing): {}", e);
+                Err(e)
             }
         }
     }

@@ -127,8 +127,6 @@ pub struct NodeStatus {
     pub status: String,
     /// Seconds since the node was last seen by the cluster.
     pub last_seen_secs: u64,
-    /// Reachable address of the node (admin API bind address).
-    pub addr: String,
 }
 
 /// GET /api/cluster/nodes — registered cluster nodes and their health.
@@ -144,7 +142,6 @@ pub async fn cluster_nodes(state: web::Data<DashboardState>) -> impl Responder {
             node_id: n.node_id,
             status: n.status,
             last_seen_secs: n.last_seen_secs,
-            addr: n.addr,
         })
         .collect();
     HttpResponse::Ok().json(serde_json::json!({ "nodes": nodes }))
@@ -215,7 +212,6 @@ mod tests {
     use std::sync::Arc;
 
     fn make_state() -> web::Data<DashboardState> {
-        use parking_lot::RwLock;
         use std::sync::atomic::{AtomicU64, Ordering};
         static CTR: AtomicU64 = AtomicU64::new(0);
         let id = CTR.fetch_add(1, Ordering::SeqCst);
@@ -247,7 +243,6 @@ mod tests {
             crate::cluster::ClusterState::new(
                 crate::cluster::ClusterBackend::Standalone,
                 "test-node".to_string(),
-                "127.0.0.1:9090".to_string(),
             )
         );
         let sfu_state = crate::proxy::webrtc::SfuState::new();
@@ -262,9 +257,6 @@ mod tests {
             cluster_state: Arc::clone(&cluster_state),
             sfu_state: Arc::clone(&sfu_state),
             ice_servers: Vec::new(),
-            turn_username: None,
-            turn_credential: None,
-            last_reload_status: Arc::new(RwLock::new(None)),
         };
         web::Data::new(DashboardState {
             base,
@@ -449,7 +441,6 @@ mod tests {
         let body: serde_json::Value = test::read_body_json(resp).await;
         assert!(!body["nodes"].as_array().unwrap().is_empty());
         assert_eq!(body["nodes"][0]["status"], "healthy");
-        assert_eq!(body["nodes"][0]["addr"], "127.0.0.1:9090");
     }
 
     #[actix_web::test]

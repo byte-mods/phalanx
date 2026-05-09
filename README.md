@@ -93,7 +93,7 @@ limitations under the License.
 
 ## What Is Built
 
-Every item below is fully implemented, compiles, and is covered by tests. **955 tests total (729 unit + 226 integration) — all passing.**
+Every item below is fully implemented, compiles, and is covered by tests. **1,109 tests total (878 unit + 229 integration + 2 smoke) — all passing.**
 
 > **2026-04-27 update (later, batch 9):** Two long-deferred items closed (one fully, one as detection). **P2** — `HookContext`'s hot-path string fields (`client_ip`, `method`, `path`, `query`) now use `Arc<str>` instead of `String`. Each HTTP/1, HTTP/2, and HTTP/3 handler builds a single `ip_arc` / `method_arc` / `final_path_arc` per request and `Arc::clone` (atomic increment, no heap allocation) at every per-phase HookContext construction site. Net per request when hooks fire: 12 `String` allocations → 5 `Arc::from(&str)` allocations + 12 atomic increments (~58% fewer heap allocations). PreRoute keeps a separate path Arc because it sees the original (pre-rewrite) path. `IpAccessHook` switched to slice-deref comparison; `RhaiHookHandler` converts to `String` at the Rhai scope boundary (Rhai needs the concrete `String` type for `starts_with`/`contains` dispatch). `WasmRequestContext` and `AccessLogEntry` keep `String` deliberately — they're downstream serialisation boundaries where the API ripple cost outweighs the marginal allocation save. **WebTransport detection** — `is_h3_extended_connect` recognises any HTTP/3 CONNECT request (and `sec-webtransport-http3-draft02`); responds 501 with a `phalanx-webtransport-status: not_implemented` header so operators see attempted WT usage and clients distinguish "feature not implemented" from "URL not found". The actual WT session protocol (bidi streams, datagrams, SETTINGS_ENABLE_WEBTRANSPORT) is **not** implemented — that needs the experimental `h3-webtransport` crate plus a forwarding-semantics design. 6 new tests; 955 passing.
 
@@ -231,7 +231,7 @@ cargo build --release
 # Debug build
 cargo build
 
-# Run tests (911 total: 685 unit + 226 integration — all passing)
+# Run tests (1,109 total: 876 unit + 231 integration + 2 smoke — all passing)
 cargo test
 
 # Run with default config
@@ -1085,6 +1085,8 @@ Licensed under the Apache License, Version 2.0
 2. Phalanx creates or joins a room
 3. Each peer's tracks (video/audio) are forwarded to all other peers in the room
 4. Trickle ICE candidate exchange is handled by the SFU
+5. ICE gathering is capped at 10 seconds so slow STUN/TURN probes cannot block the async runtime
+6. TURN servers can be configured with `turn_username` and `turn_credential` for authenticated relay
 
 **Testing:**
 Open `src/admin/webrtc_test.html` in two browser tabs and connect both to the same room name.
@@ -3042,7 +3044,7 @@ Response fields: `timestamp`, `level` (`info`/`warning`/`critical`), `category`,
 
 | Method | Path | Role | Description |
 |---|---|---|---|
-| `GET` | `/api/cluster/nodes` | ReadOnly | Registered cluster nodes and their health |
+| `GET` | `/api/cluster/nodes` | ReadOnly | Registered cluster nodes and their health (includes `addr`) |
 
 #### ML Fraud Detection
 
@@ -3057,6 +3059,7 @@ Response fields: `timestamp`, `level` (`info`/`warning`/`critical`), `category`,
 | Method | Path | Role | Description |
 |---|---|---|---|
 | `POST` | `/api/reload` | Admin | Trigger hot config reload (sends SIGHUP) |
+| `GET` | `/api/reload/status` | ReadOnly | Result of the most recent reload (`last_attempt`, `success`, `errors[]`) |
 | `POST` | `/api/routes` | Admin | Add a dynamic route |
 | `GET` | `/api/routes` | ReadOnly | List dynamic routes |
 | `DELETE` | `/api/routes/:path` | Admin | Delete a dynamic route |
