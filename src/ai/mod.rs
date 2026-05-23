@@ -67,7 +67,8 @@ impl EpsilonGreedyRouter {
 
 impl AiRouter for EpsilonGreedyRouter {
     fn sweep_stale_backends(&self, active_addrs: &[String]) {
-        let active: std::collections::HashSet<&str> = active_addrs.iter().map(|s| s.as_str()).collect();
+        let active: std::collections::HashSet<&str> =
+            active_addrs.iter().map(|s| s.as_str()).collect();
         self.scores.retain(|addr, _| active.contains(addr.as_str()));
     }
 
@@ -174,7 +175,8 @@ impl Ucb1Router {
 
 impl AiRouter for Ucb1Router {
     fn sweep_stale_backends(&self, active_addrs: &[String]) {
-        let active: std::collections::HashSet<&str> = active_addrs.iter().map(|s| s.as_str()).collect();
+        let active: std::collections::HashSet<&str> =
+            active_addrs.iter().map(|s| s.as_str()).collect();
         self.stats.retain(|addr, _| active.contains(addr.as_str()));
     }
 
@@ -276,7 +278,8 @@ impl SoftmaxRouter {
 
 impl AiRouter for SoftmaxRouter {
     fn sweep_stale_backends(&self, active_addrs: &[String]) {
-        let active: std::collections::HashSet<&str> = active_addrs.iter().map(|s| s.as_str()).collect();
+        let active: std::collections::HashSet<&str> =
+            active_addrs.iter().map(|s| s.as_str()).collect();
         self.scores.retain(|addr, _| active.contains(addr.as_str()));
     }
 
@@ -408,7 +411,8 @@ impl ThompsonSamplingRouter {
 
 impl AiRouter for ThompsonSamplingRouter {
     fn sweep_stale_backends(&self, active_addrs: &[String]) {
-        let active: std::collections::HashSet<&str> = active_addrs.iter().map(|s| s.as_str()).collect();
+        let active: std::collections::HashSet<&str> =
+            active_addrs.iter().map(|s| s.as_str()).collect();
         self.params.retain(|addr, _| active.contains(addr.as_str()));
     }
 
@@ -543,15 +547,30 @@ mod tests {
 
     #[test]
     fn test_ai_algorithm_from_str() {
-        assert_eq!(AiAlgorithm::from_str("epsilon_greedy"), AiAlgorithm::EpsilonGreedy);
-        assert_eq!(AiAlgorithm::from_str("epsilongreedy"), AiAlgorithm::EpsilonGreedy);
-        assert_eq!(AiAlgorithm::from_str("epsilon-greedy"), AiAlgorithm::EpsilonGreedy);
+        assert_eq!(
+            AiAlgorithm::from_str("epsilon_greedy"),
+            AiAlgorithm::EpsilonGreedy
+        );
+        assert_eq!(
+            AiAlgorithm::from_str("epsilongreedy"),
+            AiAlgorithm::EpsilonGreedy
+        );
+        assert_eq!(
+            AiAlgorithm::from_str("epsilon-greedy"),
+            AiAlgorithm::EpsilonGreedy
+        );
         assert_eq!(AiAlgorithm::from_str("ucb1"), AiAlgorithm::Ucb1);
         assert_eq!(AiAlgorithm::from_str("ucb"), AiAlgorithm::Ucb1);
         assert_eq!(AiAlgorithm::from_str("softmax"), AiAlgorithm::Softmax);
         assert_eq!(AiAlgorithm::from_str("boltzmann"), AiAlgorithm::Softmax);
-        assert_eq!(AiAlgorithm::from_str("thompson"), AiAlgorithm::ThompsonSampling);
-        assert_eq!(AiAlgorithm::from_str("thompson_sampling"), AiAlgorithm::ThompsonSampling);
+        assert_eq!(
+            AiAlgorithm::from_str("thompson"),
+            AiAlgorithm::ThompsonSampling
+        );
+        assert_eq!(
+            AiAlgorithm::from_str("thompson_sampling"),
+            AiAlgorithm::ThompsonSampling
+        );
         assert_eq!(AiAlgorithm::from_str("unknown"), AiAlgorithm::EpsilonGreedy);
     }
 
@@ -640,7 +659,11 @@ mod tests {
                 fast_count += 1;
             }
         }
-        assert!(fast_count > 50, "fast backend should be preferred: picked {} times", fast_count);
+        assert!(
+            fast_count > 50,
+            "fast backend should be preferred: picked {} times",
+            fast_count
+        );
     }
 
     #[test]

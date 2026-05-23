@@ -11,7 +11,7 @@ use tokio::sync::mpsc;
 use tracing::{error, info};
 
 #[cfg(unix)]
-use tokio::signal::unix::{signal, SignalKind};
+use tokio::signal::unix::{SignalKind, signal};
 
 /// The output format for access log entries.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -135,7 +135,10 @@ impl AccessLogger {
                         let mut sigusr1 = match signal(SignalKind::user_defined1()) {
                             Ok(s) => s,
                             Err(e) => {
-                                error!("Failed to register SIGUSR1 handler for log rotation: {}", e);
+                                error!(
+                                    "Failed to register SIGUSR1 handler for log rotation: {}",
+                                    e
+                                );
                                 // Fall back to non-rotation mode
                                 while let Some(entry) = receiver.recv().await {
                                     let line = format_entry(&entry, format);
@@ -357,8 +360,13 @@ mod tests {
         logger.log(sample_entry());
         // Allow background writer to flush
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
-        let contents = tokio::fs::read_to_string(&log_path).await.unwrap_or_default();
-        assert!(contents.contains("192.168.1.1"), "log file should contain the entry");
+        let contents = tokio::fs::read_to_string(&log_path)
+            .await
+            .unwrap_or_default();
+        assert!(
+            contents.contains("192.168.1.1"),
+            "log file should contain the entry"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

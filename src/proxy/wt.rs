@@ -75,16 +75,19 @@ pub async fn serve_session(
     let session = match WebTransportSession::accept(req, stream, conn).await {
         Ok(s) => {
             info!("WebTransport session accepted from {}", remote_addr);
-            metrics.wt_sessions_total.with_label_values(&["accepted"]).inc();
+            metrics
+                .wt_sessions_total
+                .with_label_values(&["accepted"])
+                .inc();
             metrics.wt_active_sessions.inc();
             s
         }
         Err(e) => {
-            warn!(
-                "WebTransport accept failed from {}: {}",
-                remote_addr, e
-            );
-            metrics.wt_sessions_total.with_label_values(&["error"]).inc();
+            warn!("WebTransport accept failed from {}: {}", remote_addr, e);
+            metrics
+                .wt_sessions_total
+                .with_label_values(&["error"])
+                .inc();
             return;
         }
     };
@@ -378,11 +381,10 @@ mod tests {
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         cancel.cancel();
 
-        let result = tokio::time::timeout(
-            std::time::Duration::from_millis(100),
-            handle,
-        )
-        .await;
-        assert!(result.is_ok(), "remaining loop should exit after parent cancel");
+        let result = tokio::time::timeout(std::time::Duration::from_millis(100), handle).await;
+        assert!(
+            result.is_ok(),
+            "remaining loop should exit after parent cancel"
+        );
     }
 }

@@ -296,10 +296,8 @@ pub fn spawn_srv_watcher(
             srv_name, pool_name
         );
 
-        let resolver = TokioAsyncResolver::tokio(
-            ResolverConfig::default(),
-            ResolverOpts::default(),
-        );
+        let resolver =
+            TokioAsyncResolver::tokio(ResolverConfig::default(), ResolverOpts::default());
 
         let mut prev_addrs: std::collections::HashSet<String> = std::collections::HashSet::new();
 
@@ -321,8 +319,7 @@ pub fn spawn_srv_watcher(
                 }
             };
 
-            let mut new_set: std::collections::HashSet<String> =
-                std::collections::HashSet::new();
+            let mut new_set: std::collections::HashSet<String> = std::collections::HashSet::new();
 
             // 2. For each SRV record resolve the A/AAAA target
             for srv in srv_records.iter() {
@@ -336,10 +333,7 @@ pub fn spawn_srv_watcher(
                         }
                     }
                     Err(e) => {
-                        warn!(
-                            "SRV watcher: failed to resolve target '{}': {}",
-                            target, e
-                        );
+                        warn!("SRV watcher: failed to resolve target '{}': {}", target, e);
                     }
                 }
             }

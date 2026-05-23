@@ -82,14 +82,9 @@ pub enum GossipMessage {
         target_addr: SocketAddr,
     },
     /// Join request from a new node
-    Join {
-        node_id: String,
-        addr: SocketAddr,
-    },
+    Join { node_id: String, addr: SocketAddr },
     /// Leave notification
-    Leave {
-        node_id: String,
-    },
+    Leave { node_id: String },
 }
 
 /// Configuration for the gossip protocol.
@@ -269,7 +264,9 @@ impl GossipState {
         for peer in incoming {
             let dominated = members
                 .get(&peer.node_id)
-                .map(|existing| peer.incarnation > existing.incarnation || peer.last_seen > existing.last_seen)
+                .map(|existing| {
+                    peer.incarnation > existing.incarnation || peer.last_seen > existing.last_seen
+                })
                 .unwrap_or(true);
             if dominated {
                 members.insert(peer.node_id.clone(), peer.clone());
@@ -364,7 +361,9 @@ impl GossipState {
                 self.merge_entries(&entries);
                 self.merge_members(&members);
                 // Reply with our state
-                let inc = self.incarnation.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let inc = self
+                    .incarnation
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 Some(GossipMessage::Ack {
                     sender_id: self.config.node_id.clone(),
                     sender_addr: self.config.bind_addr,
@@ -472,7 +471,9 @@ impl GossipState {
     /// Builds a Ping whose encoded size fits within `MAX_DATAGRAM_SIZE` (H17).
     /// If the full snapshot is too large, halves the entry/member lists until it fits.
     fn build_size_checked_ping(&self) -> GossipMessage {
-        let inc = self.incarnation.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let inc = self
+            .incarnation
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let mut entries = self.snapshot_entries();
         let mut members = self.snapshot_members();
 
@@ -579,7 +580,10 @@ impl GossipState {
                                 }
                             };
                             match GossipState::decode_message(&plain) {
-                                Ok(GossipMessage::PingReq { sender_id: _, target_addr }) => {
+                                Ok(GossipMessage::PingReq {
+                                    sender_id: _,
+                                    target_addr,
+                                }) => {
                                     // H18: rate-limit PingReq to 1/target/sec
                                     if !recv_state.allow_pingreq(target_addr) {
                                         debug!(
@@ -599,10 +603,9 @@ impl GossipState {
                                             Ok(s) => s,
                                             Err(_) => return,
                                         };
-                                        let inc = probe_state.incarnation.fetch_add(
-                                            1,
-                                            std::sync::atomic::Ordering::SeqCst,
-                                        );
+                                        let inc = probe_state
+                                            .incarnation
+                                            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                                         let ping = GossipMessage::Ping {
                                             sender_id: probe_state.config.node_id.clone(),
                                             sender_addr: probe_state.config.bind_addr,
@@ -639,7 +642,10 @@ impl GossipState {
                                                 {
                                                     // Target is alive — relay Ack to requester
                                                     let ack = GossipMessage::Ack {
-                                                        sender_id: probe_state.config.node_id.clone(),
+                                                        sender_id: probe_state
+                                                            .config
+                                                            .node_id
+                                                            .clone(),
                                                         sender_addr: probe_state.config.bind_addr,
                                                         incarnation: probe_state.incarnation.load(
                                                             std::sync::atomic::Ordering::SeqCst,
@@ -703,7 +709,9 @@ impl GossipState {
                     let members = state.members.read();
                     members
                         .values()
-                        .filter(|p| p.node_id != state.config.node_id && p.state == NodeState::Alive)
+                        .filter(|p| {
+                            p.node_id != state.config.node_id && p.state == NodeState::Alive
+                        })
                         .map(|p| p.addr)
                         .collect()
                 };
@@ -808,13 +816,16 @@ mod tests {
         // Insert with TTL of 0 (expired immediately via manual timestamp)
         {
             let mut entries = state.entries.write();
-            entries.insert("expired".to_string(), GossipEntry {
-                key: "expired".to_string(),
-                value: "old".to_string(),
-                timestamp: 1, // very old timestamp
-                node_id: "node-1".to_string(),
-                ttl_secs: 1,
-            });
+            entries.insert(
+                "expired".to_string(),
+                GossipEntry {
+                    key: "expired".to_string(),
+                    value: "old".to_string(),
+                    timestamp: 1, // very old timestamp
+                    node_id: "node-1".to_string(),
+                    ttl_secs: 1,
+                },
+            );
         }
         assert_eq!(state.get("expired"), None);
     }
@@ -922,7 +933,11 @@ mod tests {
         let data = GossipState::encode_message(&msg).unwrap();
         let decoded = GossipState::decode_message(&data).unwrap();
         match decoded {
-            GossipMessage::Ping { sender_id, incarnation, .. } => {
+            GossipMessage::Ping {
+                sender_id,
+                incarnation,
+                ..
+            } => {
                 assert_eq!(sender_id, "node-1");
                 assert_eq!(incarnation, 5);
             }
@@ -963,7 +978,9 @@ mod tests {
 
     #[test]
     fn test_gossip_encode_decode_leave() {
-        let msg = GossipMessage::Leave { node_id: "leaving".to_string() };
+        let msg = GossipMessage::Leave {
+            node_id: "leaving".to_string(),
+        };
         let data = GossipState::encode_message(&msg).unwrap();
         let decoded = GossipState::decode_message(&data).unwrap();
         match decoded {
@@ -1027,7 +1044,9 @@ mod tests {
     fn test_gossip_process_leave() {
         let state = make_state("node-1");
         state.handle_join("node-2", "10.0.0.2:7946".parse().unwrap());
-        let leave = GossipMessage::Leave { node_id: "node-2".to_string() };
+        let leave = GossipMessage::Leave {
+            node_id: "node-2".to_string(),
+        };
         state.process_message(leave);
         assert_eq!(state.alive_member_count(), 1);
     }
@@ -1037,13 +1056,16 @@ mod tests {
         let state = make_state("node-1");
         {
             let mut entries = state.entries.write();
-            entries.insert("old".to_string(), GossipEntry {
-                key: "old".to_string(),
-                value: "stale".to_string(),
-                timestamp: 1,
-                node_id: "node-1".to_string(),
-                ttl_secs: 1,
-            });
+            entries.insert(
+                "old".to_string(),
+                GossipEntry {
+                    key: "old".to_string(),
+                    value: "stale".to_string(),
+                    timestamp: 1,
+                    node_id: "node-1".to_string(),
+                    ttl_secs: 1,
+                },
+            );
         }
         state.put("fresh", "new", 3600);
         state.evict_expired();
@@ -1139,9 +1161,15 @@ mod tests {
         let data = GossipState::encode_message(&msg).unwrap();
         let decoded = GossipState::decode_message(&data).unwrap();
         match decoded {
-            GossipMessage::PingReq { sender_id, target_addr } => {
+            GossipMessage::PingReq {
+                sender_id,
+                target_addr,
+            } => {
                 assert_eq!(sender_id, "node-1");
-                assert_eq!(target_addr, "10.0.0.5:7946".parse::<std::net::SocketAddr>().unwrap());
+                assert_eq!(
+                    target_addr,
+                    "10.0.0.5:7946".parse::<std::net::SocketAddr>().unwrap()
+                );
             }
             _ => panic!("Expected PingReq"),
         }
@@ -1310,11 +1338,7 @@ mod tests {
         let state = make_state("node-1");
         // Add many entries to test truncation
         for i in 0..2000 {
-            state.put(
-                &format!("key-{:04}", i),
-                &"x".repeat(500),
-                0,
-            );
+            state.put(&format!("key-{:04}", i), &"x".repeat(500), 0);
         }
         // Register many fake members
         for i in 2..200 {

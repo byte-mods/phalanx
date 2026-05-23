@@ -51,8 +51,8 @@ pub async fn check(
 ) -> (AuthResult, Vec<(String, String)>) {
     let client = auth_request_client();
 
-    let reqwest_method = reqwest::Method::from_bytes(method.as_bytes())
-        .unwrap_or(reqwest::Method::GET);
+    let reqwest_method =
+        reqwest::Method::from_bytes(method.as_bytes()).unwrap_or(reqwest::Method::GET);
     let mut req = client.request(reqwest_method, auth_url);
 
     // Forward original headers to the auth service, stripping sensitive
@@ -114,7 +114,10 @@ pub async fn check(
         Err(e) => {
             warn!("auth_request: subrequest to {} failed: {}", auth_url, e);
             (
-                AuthResult::Denied(StatusCode::INTERNAL_SERVER_ERROR, "Auth service unreachable"),
+                AuthResult::Denied(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "Auth service unreachable",
+                ),
                 vec![],
             )
         }

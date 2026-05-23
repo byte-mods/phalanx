@@ -205,7 +205,11 @@ impl PolicyEngine {
             .map(|s| (s.name.clone(), s.name.to_lowercase(), s.severity, s.enabled))
             .collect();
 
-        info!("Loaded WAF policy '{}' with {} custom rules", name, custom_patterns.len());
+        info!(
+            "Loaded WAF policy '{}' with {} custom rules",
+            name,
+            custom_patterns.len()
+        );
 
         self.policies.insert(
             name,
@@ -459,7 +463,13 @@ mod tests {
         engine
             .add_policy(default_owasp_policy())
             .expect("add_policy");
-        let v = engine.evaluate(None, "/x", None, &std::collections::HashMap::new(), Some("connect to 127.0.0.1"));
+        let v = engine.evaluate(
+            None,
+            "/x",
+            None,
+            &std::collections::HashMap::new(),
+            Some("connect to 127.0.0.1"),
+        );
         assert!(
             v.iter().any(|x| x.rule_id == 1001),
             "expected SSRF rule 1001 violation, got {:?}",
@@ -474,7 +484,13 @@ mod tests {
             .add_policy(default_owasp_policy())
             .expect("add_policy");
         let body = r#"<?xml version="1.0"?><!DOCTYPE foo [<!ENTITY xxe SYSTEM "file:///etc/passwd">]><r/>"#;
-        let v = engine.evaluate(None, "/xml", None, &std::collections::HashMap::new(), Some(body));
+        let v = engine.evaluate(
+            None,
+            "/xml",
+            None,
+            &std::collections::HashMap::new(),
+            Some(body),
+        );
         assert!(
             v.iter().any(|x| x.rule_id == 1002),
             "expected XXE rule 1002 violation, got {:?}",
@@ -488,9 +504,10 @@ mod tests {
         engine
             .add_policy(default_owasp_policy())
             .expect("add_policy");
-        let headers: std::collections::HashMap<String, String> = [
-            ("X-Request-Id".to_string(), "abc-123".to_string()),
-        ].into_iter().collect();
+        let headers: std::collections::HashMap<String, String> =
+            [("X-Request-Id".to_string(), "abc-123".to_string())]
+                .into_iter()
+                .collect();
         let v = engine.evaluate(
             None,
             "/api/v1/resource",
@@ -527,7 +544,13 @@ mod tests {
         p.enforcement_mode = EnforcementMode::Transparent;
         let mut engine = PolicyEngine::new();
         engine.add_policy(p).expect("add_policy");
-        let v = engine.evaluate(None, "/x", None, &std::collections::HashMap::new(), Some("127.0.0.1"));
+        let v = engine.evaluate(
+            None,
+            "/x",
+            None,
+            &std::collections::HashMap::new(),
+            Some("127.0.0.1"),
+        );
         assert!(!v.is_empty(), "transparent mode still records violations");
         assert!(
             !engine.should_block(&v, None),
@@ -541,7 +564,13 @@ mod tests {
         engine
             .add_policy(default_owasp_policy())
             .expect("add_policy");
-        let v = engine.evaluate(None, "/x", None, &std::collections::HashMap::new(), Some("127.0.0.1"));
+        let v = engine.evaluate(
+            None,
+            "/x",
+            None,
+            &std::collections::HashMap::new(),
+            Some("127.0.0.1"),
+        );
         assert!(
             engine.should_block(&v, None),
             "blocking mode should block on Block action"
@@ -618,7 +647,13 @@ mod tests {
         assert_eq!(body_hit.len(), 1);
         assert_eq!(body_hit[0].rule_id, 9002);
 
-        let url_only = engine.evaluate(Some("body-only"), "/clean", None, &std::collections::HashMap::new(), None);
+        let url_only = engine.evaluate(
+            Some("body-only"),
+            "/clean",
+            None,
+            &std::collections::HashMap::new(),
+            None,
+        );
         assert!(
             url_only.is_empty(),
             "Body target must not match when body absent, got {:?}",
@@ -636,7 +671,9 @@ mod tests {
     #[test]
     fn test_signature_set_sqli_produces_violation() {
         let mut engine = PolicyEngine::new();
-        engine.add_policy(default_owasp_policy()).expect("add_policy");
+        engine
+            .add_policy(default_owasp_policy())
+            .expect("add_policy");
         let v = engine.evaluate_with_categories(
             None,
             "/api/data",
@@ -655,7 +692,9 @@ mod tests {
     #[test]
     fn test_signature_set_xss_produces_violation() {
         let mut engine = PolicyEngine::new();
-        engine.add_policy(default_owasp_policy()).expect("add_policy");
+        engine
+            .add_policy(default_owasp_policy())
+            .expect("add_policy");
         let v = engine.evaluate_with_categories(
             None,
             "/",
@@ -699,7 +738,9 @@ mod tests {
     #[test]
     fn test_signature_set_unmatched_category_no_violation() {
         let mut engine = PolicyEngine::new();
-        engine.add_policy(default_owasp_policy()).expect("add_policy");
+        engine
+            .add_policy(default_owasp_policy())
+            .expect("add_policy");
         let v = engine.evaluate_with_categories(
             None,
             "/",
@@ -719,9 +760,17 @@ mod tests {
     #[test]
     fn test_evaluate_backward_compatible_without_categories() {
         let mut engine = PolicyEngine::new();
-        engine.add_policy(default_owasp_policy()).expect("add_policy");
+        engine
+            .add_policy(default_owasp_policy())
+            .expect("add_policy");
         // Original evaluate() without categories still works
-        let v = engine.evaluate(None, "/x", None, &std::collections::HashMap::new(), Some("127.0.0.1"));
+        let v = engine.evaluate(
+            None,
+            "/x",
+            None,
+            &std::collections::HashMap::new(),
+            Some("127.0.0.1"),
+        );
         assert!(!v.is_empty(), "SSRF custom rule should still match");
     }
 }

@@ -43,9 +43,7 @@ pub enum StickyMode {
     },
     /// Route based on a value embedded in the request (e.g. a `route` cookie or
     /// the first portion of a `jsessionid`).
-    Route {
-        cookie_name: String,
-    },
+    Route { cookie_name: String },
 }
 
 /// A single learned session → backend mapping.
@@ -363,10 +361,7 @@ mod tests {
             Some("correct".to_string())
         );
         // Only the suffixed cookie should not match
-        assert_eq!(
-            mgr.extract_from_cookie("ROUTEID_other=val"),
-            None
-        );
+        assert_eq!(mgr.extract_from_cookie("ROUTEID_other=val"), None);
     }
 
     #[test]
@@ -429,7 +424,10 @@ mod tests {
             }
         }
         let tampered: String = chars.into_iter().collect();
-        assert!(mgr.extract_from_cookie(&format!("SERVERID={}", tampered)).is_none());
+        assert!(
+            mgr.extract_from_cookie(&format!("SERVERID={}", tampered))
+                .is_none()
+        );
     }
 
     #[test]
@@ -455,7 +453,11 @@ mod tests {
             .nth(1)
             .and_then(|s| s.split(';').next())
             .unwrap();
-        assert!(mgr_b.extract_from_cookie(&format!("SERVERID={}", signed_value)).is_none());
+        assert!(
+            mgr_b
+                .extract_from_cookie(&format!("SERVERID={}", signed_value))
+                .is_none()
+        );
     }
 
     #[test]

@@ -8,10 +8,10 @@
 //! This is useful for protocols like DNS, QUIC (when not using HTTP/3 mode),
 //! gaming, and VoIP where the proxy must maintain per-client affinity.
 
+use dashmap::DashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use dashmap::DashMap;
 use tokio::net::UdpSocket;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info};
@@ -74,8 +74,7 @@ pub async fn start_udp_proxy(
 
     info!("UDP Proxy listening on udp://{}", addr);
 
-    let sessions: Arc<DashMap<SocketAddr, UdpSession>> =
-        Arc::new(DashMap::new());
+    let sessions: Arc<DashMap<SocketAddr, UdpSession>> = Arc::new(DashMap::new());
 
     // Spawn a reaper task to clean up expired sessions
     let sessions_reaper = Arc::clone(&sessions);
@@ -162,11 +161,14 @@ pub async fn start_udp_proxy(
                 continue;
             }
 
-            sessions.insert(client_addr, UdpSession {
-                backend_socket: Arc::clone(&backend_socket),
-                backend_addr,
-                last_active: Instant::now(),
-            });
+            sessions.insert(
+                client_addr,
+                UdpSession {
+                    backend_socket: Arc::clone(&backend_socket),
+                    backend_addr,
+                    last_active: Instant::now(),
+                },
+            );
 
             // Spawn a receiver task for backend → client responses
             let frontend = Arc::clone(&socket);

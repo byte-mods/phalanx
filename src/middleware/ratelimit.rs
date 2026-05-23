@@ -11,9 +11,9 @@
 /// falls back to local in-memory `governor` rate limiters.
 use arc_swap::ArcSwap;
 use governor::{
-    clock::DefaultClock,
-    state::{direct::NotKeyed, keyed::DefaultKeyedStateStore, InMemoryState},
     Quota, RateLimiter,
+    clock::DefaultClock,
+    state::{InMemoryState, direct::NotKeyed, keyed::DefaultKeyedStateStore},
 };
 use std::sync::Arc;
 use std::{net::IpAddr, num::NonZeroU32};
@@ -74,7 +74,9 @@ fn build_inner(per_ip_rate: u32, per_ip_burst: u32, global_rate: Option<u32>) ->
         .allow_burst(NonZeroU32::new(safe_per_ip_burst).unwrap_or(NonZeroU32::MIN));
 
     let global_limiter = if let Some(gr) = normalized_global_rate {
-        RateLimiter::direct(Quota::per_second(NonZeroU32::new(gr).unwrap_or(NonZeroU32::MIN)))
+        RateLimiter::direct(Quota::per_second(
+            NonZeroU32::new(gr).unwrap_or(NonZeroU32::MIN),
+        ))
     } else {
         RateLimiter::direct(Quota::per_second(NonZeroU32::MIN))
     };
@@ -96,14 +98,21 @@ impl PhalanxRateLimiter {
     /// * `per_ip_burst` - Maximum burst allowance per IP (clamped to 1 if 0).
     /// * `global_rate` - Optional global requests/second cap (`None` or `Some(0)` disables).
     /// * `redis_url` - Optional Redis URL for distributed rate limiting.
-    pub fn new(per_ip_rate: u32, per_ip_burst: u32, global_rate: Option<u32>, redis_url: Option<&str>) -> Self {
+    pub fn new(
+        per_ip_rate: u32,
+        per_ip_burst: u32,
+        global_rate: Option<u32>,
+        redis_url: Option<&str>,
+    ) -> Self {
         let inner = build_inner(per_ip_rate, per_ip_burst, global_rate);
 
         let redis_client = redis_url.and_then(|url| {
-            redis::Client::open(url).map_err(|e| {
-                error!("Failed to connect to Redis for Rate Limiter: {}", e);
-                e
-            }).ok()
+            redis::Client::open(url)
+                .map_err(|e| {
+                    error!("Failed to connect to Redis for Rate Limiter: {}", e);
+                    e
+                })
+                .ok()
         });
 
         Self {
@@ -119,7 +128,12 @@ impl PhalanxRateLimiter {
     /// Called on SIGHUP reload when rate limit config values change. Existing
     /// in-flight requests that already loaded the old inner will finish against
     /// the old limiters; new requests see the new limits immediately.
-    pub fn reload(&self, per_ip_rate: Option<u32>, per_ip_burst: Option<u32>, global_rate: Option<u32>) {
+    pub fn reload(
+        &self,
+        per_ip_rate: Option<u32>,
+        per_ip_burst: Option<u32>,
+        global_rate: Option<u32>,
+    ) {
         let new_inner = build_inner(
             per_ip_rate.unwrap_or(50),
             per_ip_burst.unwrap_or(100),
@@ -164,8 +178,8 @@ impl PhalanxRateLimiter {
     /// exceeds `n`, the smallest element is popped. After iteration, the heap contains
     /// exactly the top N entries which are drained into a descending Vec.
     pub fn top_ips(&self, n: usize) -> Vec<(String, u64)> {
-        use std::collections::BinaryHeap;
         use std::cmp::Reverse;
+        use std::collections::BinaryHeap;
 
         if n == 0 {
             return Vec::new();
@@ -181,8 +195,7 @@ impl PhalanxRateLimiter {
             }
         }
 
-        heap
-            .into_sorted_vec()
+        heap.into_sorted_vec()
             .into_iter()
             .map(|Reverse((count, key))| (key, count))
             .collect()
@@ -270,7 +283,10 @@ impl PhalanxRateLimiter {
                     .invoke_async(&mut *con)
                     .await;
                 if let Ok(0) = result {
-                    warn!("Per-IP Rate Limit Exceeded (Redis) for {}! Dropping connection.", ip);
+                    warn!(
+                        "Per-IP Rate Limit Exceeded (Redis) for {}! Dropping connection.",
+                        ip
+                    );
                     return false;
                 }
 
@@ -284,14 +300,20 @@ impl PhalanxRateLimiter {
         let inner = self.inner.load();
         if inner.global_enabled {
             if inner.global_limiter.check().is_err() {
-                warn!("Global DDoS Rate Limit Exceeded (Local)! Dropping connection from {}", ip);
+                warn!(
+                    "Global DDoS Rate Limit Exceeded (Local)! Dropping connection from {}",
+                    ip
+                );
                 return false;
             }
         }
 
         // 3. Per-IP Token Bucket — local fallback
         if inner.ip_limiter.check_key(&ip).is_err() {
-            warn!("Per-IP Rate Limit Exceeded for {}! Dropping connection.", ip);
+            warn!(
+                "Per-IP Rate Limit Exceeded for {}! Dropping connection.",
+                ip
+            );
             return false;
         }
 
@@ -344,7 +366,10 @@ mod tests {
         let ip1 = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1));
         let ip2 = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2));
         limiter.check_ip(ip1).await;
-        assert!(limiter.check_ip(ip2).await, "different IPs should not share buckets");
+        assert!(
+            limiter.check_ip(ip2).await,
+            "different IPs should not share buckets"
+        );
     }
 
     #[test]
@@ -380,7 +405,10 @@ mod tests {
         let ip_v4 = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1));
         let ip_v6 = IpAddr::V6("::1".parse().unwrap());
         limiter.check_ip(ip_v4).await;
-        assert!(limiter.check_ip(ip_v6).await, "IPv4 and IPv6 should have independent buckets");
+        assert!(
+            limiter.check_ip(ip_v6).await,
+            "IPv4 and IPv6 should have independent buckets"
+        );
     }
 
     #[tokio::test]

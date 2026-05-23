@@ -87,8 +87,10 @@ pub async fn start_tcp_proxy(
                             // Consume the PP2 header bytes from the stream
                             let mut discard = vec![0u8; consumed];
                             let _ = tokio::io::AsyncReadExt::read_exact(
-                                &mut client_stream, &mut discard,
-                            ).await;
+                                &mut client_stream,
+                                &mut discard,
+                            )
+                            .await;
                             let addr = hdr.src_addr.unwrap_or(peer);
                             debug!("TCP proxy: PP2 real client IP: {}", addr);
                             addr
@@ -99,8 +101,10 @@ pub async fn start_tcp_proxy(
                                 Some((addr, consumed)) => {
                                     let mut discard = vec![0u8; consumed];
                                     let _ = tokio::io::AsyncReadExt::read_exact(
-                                        &mut client_stream, &mut discard,
-                                    ).await;
+                                        &mut client_stream,
+                                        &mut discard,
+                                    )
+                                    .await;
                                     debug!("TCP proxy: PP1 real client IP: {}", addr);
                                     addr
                                 }

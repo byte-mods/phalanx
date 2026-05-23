@@ -3,7 +3,7 @@
 //! Exposes WAF bans/attack-log/strikes, rate-limit top-N,
 //! cluster node status, and cache stats for the `/dashboard` frontend.
 
-use actix_web::{delete, get, post, web, HttpResponse, Responder};
+use actix_web::{HttpResponse, Responder, delete, get, post, web};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
@@ -45,7 +45,11 @@ pub async fn list_bans(state: web::Data<DashboardState>) -> impl Responder {
         .reputation
         .list_bans()
         .into_iter()
-        .map(|(ip, strikes, expires_in_secs)| BanEntry { ip, strikes, expires_in_secs })
+        .map(|(ip, strikes, expires_in_secs)| BanEntry {
+            ip,
+            strikes,
+            expires_in_secs,
+        })
         .collect();
     HttpResponse::Ok().json(serde_json::json!({ "bans": bans }))
 }
@@ -63,10 +67,7 @@ pub async fn manual_ban(
 
 /// DELETE /api/waf/ban/{ip} — unban an IP (clear all strikes).
 #[delete("/api/waf/ban/{ip}")]
-pub async fn unban_ip(
-    state: web::Data<DashboardState>,
-    path: web::Path<String>,
-) -> impl Responder {
+pub async fn unban_ip(state: web::Data<DashboardState>, path: web::Path<String>) -> impl Responder {
     let ip = path.into_inner();
     state.base.waf.reputation.unban(&ip);
     HttpResponse::Ok().json(serde_json::json!({ "status": "unbanned", "ip": ip }))
@@ -211,7 +212,7 @@ pub async fn trigger_alert_check(state: web::Data<DashboardState>) -> impl Respo
 #[cfg(test)]
 mod tests {
     use super::*;
-    use actix_web::{test, App};
+    use actix_web::{App, test};
     use std::sync::Arc;
 
     fn make_state() -> web::Data<DashboardState> {
@@ -224,10 +225,10 @@ mod tests {
         use crate::config::AppConfig;
         use crate::discovery::ServiceDiscovery;
         use crate::keyval::KeyvalStore;
-        use crate::middleware::{ratelimit::PhalanxRateLimiter, cache::AdvancedCache};
+        use crate::middleware::{cache::AdvancedCache, ratelimit::PhalanxRateLimiter};
         use crate::routing::UpstreamManager;
         use crate::telemetry::bandwidth::BandwidthTracker;
-        use crate::waf::{reputation::IpReputationManager, WafEngine};
+        use crate::waf::{WafEngine, reputation::IpReputationManager};
 
         let reputation = IpReputationManager::new(5, 3600, None);
         let waf = Arc::new(WafEngine::new(true, Arc::clone(&reputation)));
@@ -236,23 +237,30 @@ mod tests {
         let db_path = format!("/tmp/phalanx_test_dash_{}", id);
         let discovery = Arc::new(ServiceDiscovery::new(&db_path).unwrap());
         let config = AppConfig::default();
-        let manager = Arc::new(UpstreamManager::new(&config, Arc::clone(&discovery), tokio_util::sync::CancellationToken::new()));
+        let manager = Arc::new(UpstreamManager::new(
+            &config,
+            Arc::clone(&discovery),
+            tokio_util::sync::CancellationToken::new(),
+        ));
         let keyval = KeyvalStore::new(0, None);
         let metrics = Arc::new(ProxyMetrics::new());
         let rate_limiter = Arc::new(PhalanxRateLimiter::new(100, 200, None, None));
         let bandwidth = BandwidthTracker::new();
         let alert_engine = AlertEngine::new(Arc::clone(&bandwidth));
 
-        let cluster_state = Arc::new(
-            crate::cluster::ClusterState::new(
-                crate::cluster::ClusterBackend::Standalone,
-                "test-node".to_string(),
-                "127.0.0.1:9090".to_string(),
-            )
-        );
+        let cluster_state = Arc::new(crate::cluster::ClusterState::new(
+            crate::cluster::ClusterBackend::Standalone,
+            "test-node".to_string(),
+            "127.0.0.1:9090".to_string(),
+        ));
         let sfu_state = crate::proxy::webrtc::SfuState::new();
         let base = AdminState {
-            metrics, discovery, manager, keyval, waf, cache,
+            metrics,
+            discovery,
+            manager,
+            keyval,
+            waf,
+            cache,
             rate_limiter: Arc::clone(&rate_limiter),
             bandwidth: Arc::clone(&bandwidth),
             alert_engine: Arc::clone(&alert_engine),
@@ -279,9 +287,7 @@ mod tests {
     #[actix_web::test]
     async fn test_list_bans_empty() {
         let state = make_state();
-        let app = test::init_service(
-            App::new().app_data(state.clone()).service(list_bans)
-        ).await;
+        let app = test::init_service(App::new().app_data(state.clone()).service(list_bans)).await;
         let req = test::TestRequest::get().uri("/api/waf/bans").to_request();
         let resp = test::call_service(&app, req).await;
         assert_eq!(resp.status(), 200);
@@ -296,9 +302,12 @@ mod tests {
             App::new()
                 .app_data(state.clone())
                 .service(manual_ban)
-                .service(list_bans)
-        ).await;
-        let ban_req = test::TestRequest::post().uri("/api/waf/ban/9.9.9.9").to_request();
+                .service(list_bans),
+        )
+        .await;
+        let ban_req = test::TestRequest::post()
+            .uri("/api/waf/ban/9.9.9.9")
+            .to_request();
         let ban_resp = test::call_service(&app, ban_req).await;
         assert_eq!(ban_resp.status(), 200);
 
@@ -317,9 +326,12 @@ mod tests {
             App::new()
                 .app_data(state.clone())
                 .service(unban_ip)
-                .service(list_bans)
-        ).await;
-        let unban_req = test::TestRequest::delete().uri("/api/waf/ban/bad.ip").to_request();
+                .service(list_bans),
+        )
+        .await;
+        let unban_req = test::TestRequest::delete()
+            .uri("/api/waf/ban/bad.ip")
+            .to_request();
         let unban_resp = test::call_service(&app, unban_req).await;
         assert_eq!(unban_resp.status(), 200);
 
@@ -333,9 +345,7 @@ mod tests {
     async fn test_list_bans_shows_pre_banned_ip() {
         let state = make_state();
         state.base.waf.reputation.manual_ban("1.2.3.4");
-        let app = test::init_service(
-            App::new().app_data(state.clone()).service(list_bans)
-        ).await;
+        let app = test::init_service(App::new().app_data(state.clone()).service(list_bans)).await;
         let req = test::TestRequest::get().uri("/api/waf/bans").to_request();
         let resp = test::call_service(&app, req).await;
         let body: serde_json::Value = test::read_body_json(resp).await;
@@ -347,10 +357,11 @@ mod tests {
     #[actix_web::test]
     async fn test_list_attacks_empty() {
         let state = make_state();
-        let app = test::init_service(
-            App::new().app_data(state.clone()).service(list_attacks)
-        ).await;
-        let req = test::TestRequest::get().uri("/api/waf/attacks").to_request();
+        let app =
+            test::init_service(App::new().app_data(state.clone()).service(list_attacks)).await;
+        let req = test::TestRequest::get()
+            .uri("/api/waf/attacks")
+            .to_request();
         let resp = test::call_service(&app, req).await;
         assert_eq!(resp.status(), 200);
         let body: serde_json::Value = test::read_body_json(resp).await;
@@ -360,12 +371,21 @@ mod tests {
     #[actix_web::test]
     async fn test_list_attacks_with_events() {
         let state = make_state();
-        state.base.waf.record_attack("10.0.0.1", "/api/login", "POST", "SQLi").await;
-        state.base.waf.record_attack("10.0.0.2", "/admin", "GET", "IP Banned").await;
-        let app = test::init_service(
-            App::new().app_data(state.clone()).service(list_attacks)
-        ).await;
-        let req = test::TestRequest::get().uri("/api/waf/attacks").to_request();
+        state
+            .base
+            .waf
+            .record_attack("10.0.0.1", "/api/login", "POST", "SQLi")
+            .await;
+        state
+            .base
+            .waf
+            .record_attack("10.0.0.2", "/admin", "GET", "IP Banned")
+            .await;
+        let app =
+            test::init_service(App::new().app_data(state.clone()).service(list_attacks)).await;
+        let req = test::TestRequest::get()
+            .uri("/api/waf/attacks")
+            .to_request();
         let resp = test::call_service(&app, req).await;
         let body: serde_json::Value = test::read_body_json(resp).await;
         let attacks = body["attacks"].as_array().unwrap();
@@ -379,24 +399,30 @@ mod tests {
     async fn test_list_strikes() {
         let state = make_state();
         state.base.waf.reputation.add_strike("strike.ip", 3);
-        let app = test::init_service(
-            App::new().app_data(state.clone()).service(list_strikes)
-        ).await;
-        let req = test::TestRequest::get().uri("/api/waf/strikes").to_request();
+        let app =
+            test::init_service(App::new().app_data(state.clone()).service(list_strikes)).await;
+        let req = test::TestRequest::get()
+            .uri("/api/waf/strikes")
+            .to_request();
         let resp = test::call_service(&app, req).await;
         assert_eq!(resp.status(), 200);
         let body: serde_json::Value = test::read_body_json(resp).await;
         let strikes = body["strikes"].as_array().unwrap();
-        assert!(strikes.iter().any(|s| s["ip"] == "strike.ip" && s["strikes"] == 3));
+        assert!(
+            strikes
+                .iter()
+                .any(|s| s["ip"] == "strike.ip" && s["strikes"] == 3)
+        );
     }
 
     #[actix_web::test]
     async fn test_top_rate_ips_empty() {
         let state = make_state();
-        let app = test::init_service(
-            App::new().app_data(state.clone()).service(top_rate_ips)
-        ).await;
-        let req = test::TestRequest::get().uri("/api/rates/top?n=5").to_request();
+        let app =
+            test::init_service(App::new().app_data(state.clone()).service(top_rate_ips)).await;
+        let req = test::TestRequest::get()
+            .uri("/api/rates/top?n=5")
+            .to_request();
         let resp = test::call_service(&app, req).await;
         assert_eq!(resp.status(), 200);
         let body: serde_json::Value = test::read_body_json(resp).await;
@@ -406,12 +432,17 @@ mod tests {
     #[actix_web::test]
     async fn test_top_rate_ips_with_data() {
         let state = make_state();
-        for _ in 0..5 { state.rate_limiter.record_request("192.168.1.1"); }
-        for _ in 0..3 { state.rate_limiter.record_request("192.168.1.2"); }
-        let app = test::init_service(
-            App::new().app_data(state.clone()).service(top_rate_ips)
-        ).await;
-        let req = test::TestRequest::get().uri("/api/rates/top?n=10").to_request();
+        for _ in 0..5 {
+            state.rate_limiter.record_request("192.168.1.1");
+        }
+        for _ in 0..3 {
+            state.rate_limiter.record_request("192.168.1.2");
+        }
+        let app =
+            test::init_service(App::new().app_data(state.clone()).service(top_rate_ips)).await;
+        let req = test::TestRequest::get()
+            .uri("/api/rates/top?n=10")
+            .to_request();
         let resp = test::call_service(&app, req).await;
         assert_eq!(resp.status(), 200);
         let body: serde_json::Value = test::read_body_json(resp).await;
@@ -426,10 +457,11 @@ mod tests {
     #[actix_web::test]
     async fn test_top_rate_default_n() {
         let state = make_state();
-        for i in 0..15u32 { state.rate_limiter.record_request(&format!("10.0.{}.1", i)); }
-        let app = test::init_service(
-            App::new().app_data(state.clone()).service(top_rate_ips)
-        ).await;
+        for i in 0..15u32 {
+            state.rate_limiter.record_request(&format!("10.0.{}.1", i));
+        }
+        let app =
+            test::init_service(App::new().app_data(state.clone()).service(top_rate_ips)).await;
         // no ?n= → defaults to 10
         let req = test::TestRequest::get().uri("/api/rates/top").to_request();
         let resp = test::call_service(&app, req).await;
@@ -440,10 +472,11 @@ mod tests {
     #[actix_web::test]
     async fn test_cluster_nodes() {
         let state = make_state();
-        let app = test::init_service(
-            App::new().app_data(state.clone()).service(cluster_nodes)
-        ).await;
-        let req = test::TestRequest::get().uri("/api/cluster/nodes").to_request();
+        let app =
+            test::init_service(App::new().app_data(state.clone()).service(cluster_nodes)).await;
+        let req = test::TestRequest::get()
+            .uri("/api/cluster/nodes")
+            .to_request();
         let resp = test::call_service(&app, req).await;
         assert_eq!(resp.status(), 200);
         let body: serde_json::Value = test::read_body_json(resp).await;
@@ -455,10 +488,10 @@ mod tests {
     #[actix_web::test]
     async fn test_cache_stats() {
         let state = make_state();
-        let app = test::init_service(
-            App::new().app_data(state.clone()).service(cache_stats)
-        ).await;
-        let req = test::TestRequest::get().uri("/api/cache/stats").to_request();
+        let app = test::init_service(App::new().app_data(state.clone()).service(cache_stats)).await;
+        let req = test::TestRequest::get()
+            .uri("/api/cache/stats")
+            .to_request();
         let resp = test::call_service(&app, req).await;
         assert_eq!(resp.status(), 200);
         let body: serde_json::Value = test::read_body_json(resp).await;
@@ -468,16 +501,24 @@ mod tests {
     #[actix_web::test]
     async fn test_bandwidth_stats_returns_all_protocols() {
         let state = make_state();
-        let app = test::init_service(
-            App::new().app_data(state.clone()).service(bandwidth_stats)
-        ).await;
+        let app =
+            test::init_service(App::new().app_data(state.clone()).service(bandwidth_stats)).await;
         let req = test::TestRequest::get().uri("/api/bandwidth").to_request();
         let resp = test::call_service(&app, req).await;
         assert_eq!(resp.status(), 200);
         let body: serde_json::Value = test::read_body_json(resp).await;
         let protocols = body["protocols"].as_array().unwrap();
         // All 8 known protocols must be present
-        for proto in &["http1", "http2", "http3", "websocket", "grpc", "tcp", "udp", "webrtc"] {
+        for proto in &[
+            "http1",
+            "http2",
+            "http3",
+            "websocket",
+            "grpc",
+            "tcp",
+            "udp",
+            "webrtc",
+        ] {
             assert!(
                 protocols.iter().any(|p| p["protocol"] == *proto),
                 "Missing protocol in bandwidth response: {}",
@@ -492,14 +533,14 @@ mod tests {
         // Inject some traffic
         state.bandwidth.protocol("http1").add_in(12345);
         state.bandwidth.protocol("http1").add_out(6789);
-        let app = test::init_service(
-            App::new().app_data(state.clone()).service(bandwidth_stats)
-        ).await;
+        let app =
+            test::init_service(App::new().app_data(state.clone()).service(bandwidth_stats)).await;
         let req = test::TestRequest::get().uri("/api/bandwidth").to_request();
         let resp = test::call_service(&app, req).await;
         let body: serde_json::Value = test::read_body_json(resp).await;
         let http1 = body["protocols"]
-            .as_array().unwrap()
+            .as_array()
+            .unwrap()
             .iter()
             .find(|p| p["protocol"] == "http1")
             .unwrap();
@@ -510,10 +551,10 @@ mod tests {
     #[actix_web::test]
     async fn test_list_alerts_empty() {
         let state = make_state();
-        let app = test::init_service(
-            App::new().app_data(state.clone()).service(list_alerts)
-        ).await;
-        let req = test::TestRequest::get().uri("/api/alerts?n=10").to_request();
+        let app = test::init_service(App::new().app_data(state.clone()).service(list_alerts)).await;
+        let req = test::TestRequest::get()
+            .uri("/api/alerts?n=10")
+            .to_request();
         let resp = test::call_service(&app, req).await;
         assert_eq!(resp.status(), 200);
         let body: serde_json::Value = test::read_body_json(resp).await;
@@ -525,9 +566,14 @@ mod tests {
     async fn test_trigger_alert_check() {
         let state = make_state();
         let app = test::init_service(
-            App::new().app_data(state.clone()).service(trigger_alert_check)
-        ).await;
-        let req = test::TestRequest::post().uri("/api/alerts/check").to_request();
+            App::new()
+                .app_data(state.clone())
+                .service(trigger_alert_check),
+        )
+        .await;
+        let req = test::TestRequest::post()
+            .uri("/api/alerts/check")
+            .to_request();
         let resp = test::call_service(&app, req).await;
         assert_eq!(resp.status(), 200);
         let body: serde_json::Value = test::read_body_json(resp).await;
@@ -540,20 +586,23 @@ mod tests {
         use crate::telemetry::bandwidth::ProtocolThreshold;
         let state = make_state();
         // Set tiny threshold, establish baseline, then add traffic
-        state.bandwidth.set_threshold("tcp", ProtocolThreshold {
-            bandwidth_bps_warn: 1,
-            bandwidth_bps_critical: 1_000_000,
-            connections_warn: 999_999,
-            connections_critical: 9_999_999,
-        });
+        state.bandwidth.set_threshold(
+            "tcp",
+            ProtocolThreshold {
+                bandwidth_bps_warn: 1,
+                bandwidth_bps_critical: 1_000_000,
+                connections_warn: 999_999,
+                connections_critical: 9_999_999,
+            },
+        );
         state.alert_engine.check().await; // establish baseline
         state.bandwidth.protocol("tcp").add_in(100);
         state.alert_engine.check().await; // rate now exceeds threshold
 
-        let app = test::init_service(
-            App::new().app_data(state.clone()).service(list_alerts)
-        ).await;
-        let req = test::TestRequest::get().uri("/api/alerts?n=20").to_request();
+        let app = test::init_service(App::new().app_data(state.clone()).service(list_alerts)).await;
+        let req = test::TestRequest::get()
+            .uri("/api/alerts?n=20")
+            .to_request();
         let resp = test::call_service(&app, req).await;
         let body: serde_json::Value = test::read_body_json(resp).await;
         let alerts = body["alerts"].as_array().unwrap();
@@ -568,9 +617,14 @@ mod tests {
     async fn test_bandwidth_pool_stats_empty() {
         let state = make_state();
         let app = test::init_service(
-            App::new().app_data(state.clone()).service(bandwidth_pool_stats)
-        ).await;
-        let req = test::TestRequest::get().uri("/api/bandwidth/pools").to_request();
+            App::new()
+                .app_data(state.clone())
+                .service(bandwidth_pool_stats),
+        )
+        .await;
+        let req = test::TestRequest::get()
+            .uri("/api/bandwidth/pools")
+            .to_request();
         let resp = test::call_service(&app, req).await;
         assert_eq!(resp.status(), 200);
         let body: serde_json::Value = test::read_body_json(resp).await;
@@ -586,9 +640,14 @@ mod tests {
         state.bandwidth.pool("static_pool").add_in(2000);
 
         let app = test::init_service(
-            App::new().app_data(state.clone()).service(bandwidth_pool_stats)
-        ).await;
-        let req = test::TestRequest::get().uri("/api/bandwidth/pools").to_request();
+            App::new()
+                .app_data(state.clone())
+                .service(bandwidth_pool_stats),
+        )
+        .await;
+        let req = test::TestRequest::get()
+            .uri("/api/bandwidth/pools")
+            .to_request();
         let resp = test::call_service(&app, req).await;
         assert_eq!(resp.status(), 200);
         let body: serde_json::Value = test::read_body_json(resp).await;

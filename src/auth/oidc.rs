@@ -204,7 +204,7 @@ pub fn generate_code_verifier() -> String {
 
 /// Computes the S256 code_challenge from a code_verifier (SHA-256 + base64url).
 pub fn compute_code_challenge(verifier: &str) -> String {
-    use sha2::{Sha256, Digest};
+    use sha2::{Digest, Sha256};
     let hash = Sha256::digest(verifier.as_bytes());
     use base64::Engine;
     base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(hash)
@@ -300,7 +300,9 @@ pub async fn exchange_code_with_pkce(
 
     // Decode ID token claims (without full validation for simplicity)
     let sub = if let Some(ref id_token) = token_resp.id_token {
-        extract_sub_from_id_token(id_token, None, None).await.unwrap_or_else(|| "unknown".to_string())
+        extract_sub_from_id_token(id_token, None, None)
+            .await
+            .unwrap_or_else(|| "unknown".to_string())
     } else {
         "unknown".to_string()
     };
@@ -395,7 +397,9 @@ pub async fn refresh_session(
         .map_err(|e| format!("Token parse error: {}", e))?;
 
     let sub = if let Some(ref id_token) = token_resp.id_token {
-        extract_sub_from_id_token(id_token, None, None).await.unwrap_or_else(|| "unknown".to_string())
+        extract_sub_from_id_token(id_token, None, None)
+            .await
+            .unwrap_or_else(|| "unknown".to_string())
     } else {
         "unknown".to_string()
     };
@@ -565,8 +569,8 @@ async fn extract_sub_with_jwks_verification(
     manager: &super::jwks::JwksManager,
     jwks_uri: &str,
 ) -> Option<String> {
-    use jsonwebtoken::{Validation, decode_header};
     use super::jwks::JwksManager;
+    use jsonwebtoken::{Validation, decode_header};
 
     let header = decode_header(id_token).ok()?;
     let kid = header.kid.as_deref()?;
@@ -767,10 +771,7 @@ mod tests {
     #[test]
     fn test_extract_cookie_present() {
         let mut headers = hyper::HeaderMap::new();
-        headers.insert(
-            hyper::header::COOKIE,
-            "sid=abc; other=xyz".parse().unwrap(),
-        );
+        headers.insert(hyper::header::COOKIE, "sid=abc; other=xyz".parse().unwrap());
         assert_eq!(extract_cookie(&headers, "sid"), Some("abc".to_string()));
     }
 
@@ -877,10 +878,7 @@ mod tests {
             },
         );
         let mut headers = hyper::HeaderMap::new();
-        headers.insert(
-            hyper::header::COOKIE,
-            "sess=expired".parse().unwrap(),
-        );
+        headers.insert(hyper::header::COOKIE, "sess=expired".parse().unwrap());
         let (result, _) = check_session_async(&headers, "sess", &store, None, None).await;
         assert!(matches!(result, AuthResult::Denied(..)));
     }
@@ -936,7 +934,10 @@ mod tests {
     fn test_pkce_verifier_store_operations() {
         let store = new_pkce_verifier_store();
         assert!(store.is_empty());
-        store.insert("state-1".to_string(), ("verifier-1".to_string(), std::time::Instant::now()));
+        store.insert(
+            "state-1".to_string(),
+            ("verifier-1".to_string(), std::time::Instant::now()),
+        );
         assert_eq!(store.len(), 1);
         let v = store.remove("state-1").map(|(_, (v, _))| v);
         assert_eq!(v, Some("verifier-1".to_string()));
@@ -951,7 +952,10 @@ mod tests {
             .checked_sub(std::time::Duration::from_secs(3600))
             .unwrap_or(std::time::Instant::now());
         store.insert("old-state".to_string(), ("old-verifier".to_string(), past));
-        store.insert("fresh-state".to_string(), ("fresh-verifier".to_string(), std::time::Instant::now()));
+        store.insert(
+            "fresh-state".to_string(),
+            ("fresh-verifier".to_string(), std::time::Instant::now()),
+        );
         assert_eq!(store.len(), 2);
 
         // Sweep with 300s TTL — old entry should be evicted, fresh one kept

@@ -255,7 +255,9 @@ mod cache_tests {
         assert!(cache.get(&key).await.is_none());
 
         // Insert
-        cache.insert(key.clone(), make_entry(b"cached response body", 60)).await;
+        cache
+            .insert(key.clone(), make_entry(b"cached response body", 60))
+            .await;
 
         // Hit
         let cached = cache.get(&key).await.expect("should be cached");
@@ -412,7 +414,10 @@ mod sticky_session_tests {
         });
         mgr.learn("k".to_string(), "backend".to_string());
         std::thread::sleep(Duration::from_millis(10));
-        assert!(mgr.lookup("k").is_none(), "expired entry should not be returned");
+        assert!(
+            mgr.lookup("k").is_none(),
+            "expired entry should not be returned"
+        );
     }
 
     #[test]
@@ -449,9 +454,16 @@ mod sticky_session_tests {
             max_age: 0,
         });
         let header = mgr.set_cookie_header(addr).unwrap();
-        let full_value = header.split('=').nth(1).and_then(|s| s.split(';').next()).unwrap();
+        let full_value = header
+            .split('=')
+            .nth(1)
+            .and_then(|s| s.split(';').next())
+            .unwrap();
         // Cookie value is <base64_payload>.<base64_hmac> — extract just the payload
-        let payload = full_value.rsplit_once('.').map(|(p, _)| p).unwrap_or(full_value);
+        let payload = full_value
+            .rsplit_once('.')
+            .map(|(p, _)| p)
+            .unwrap_or(full_value);
         let decoded = base64_decode_addr(payload).unwrap();
         assert_eq!(decoded, addr);
     }
@@ -495,13 +507,19 @@ mod mirror_tests {
             counts[split_traffic(&key, &weights)] += 1;
         }
         // 90% bucket should get roughly 9000 ± 300
-        assert!(counts[0] > 8000 && counts[0] < 9500, "90% bucket got {}", counts[0]);
+        assert!(
+            counts[0] > 8000 && counts[0] < 9500,
+            "90% bucket got {}",
+            counts[0]
+        );
     }
 }
 
 #[cfg(test)]
 mod realip_tests {
-    use ai_load_balancer::proxy::realip::{TrustedProxies, resolve_client_ip, inject_forwarding_headers};
+    use ai_load_balancer::proxy::realip::{
+        TrustedProxies, inject_forwarding_headers, resolve_client_ip,
+    };
     use std::net::{IpAddr, SocketAddr};
 
     #[test]
@@ -584,7 +602,7 @@ mod realip_tests {
 
 #[cfg(test)]
 mod connlimit_tests {
-    use ai_load_balancer::middleware::connlimit::{ZoneLimiter, ZoneKeySource};
+    use ai_load_balancer::middleware::connlimit::{ZoneKeySource, ZoneLimiter};
 
     #[test]
     fn test_zone_rate_allowed_initially() {
@@ -599,7 +617,10 @@ mod connlimit_tests {
         assert!(limiter.acquire_connection("k"));
         assert!(!limiter.acquire_connection("k"), "3rd should be denied");
         limiter.release_connection("k");
-        assert!(limiter.acquire_connection("k"), "after release should allow");
+        assert!(
+            limiter.acquire_connection("k"),
+            "after release should allow"
+        );
     }
 
     #[test]
@@ -612,10 +633,7 @@ mod connlimit_tests {
 
     #[test]
     fn test_key_source_composite() {
-        let src = ZoneKeySource::Composite(vec![
-            ZoneKeySource::ClientIp,
-            ZoneKeySource::Uri,
-        ]);
+        let src = ZoneKeySource::Composite(vec![ZoneKeySource::ClientIp, ZoneKeySource::Uri]);
         let headers = hyper::HeaderMap::new();
         let key = src.extract("1.2.3.4", &headers, "/api/v1", None);
         assert_eq!(key, "1.2.3.4:/api/v1");
@@ -631,7 +649,7 @@ mod connlimit_tests {
 
 #[cfg(test)]
 mod brotli_tests {
-    use ai_load_balancer::middleware::brotli::{accepts_brotli, brotli_compress, MIN_BROTLI_SIZE};
+    use ai_load_balancer::middleware::brotli::{MIN_BROTLI_SIZE, accepts_brotli, brotli_compress};
 
     #[test]
     fn test_accepts_brotli_with_br() {
@@ -655,20 +673,26 @@ mod brotli_tests {
     fn test_brotli_compress_large_compressible() {
         let data = "the quick brown fox jumps over the lazy dog ".repeat(100);
         let compressed = brotli_compress(data.as_bytes(), 6).unwrap();
-        assert!(compressed.len() < data.len(), "brotli output should be smaller");
+        assert!(
+            compressed.len() < data.len(),
+            "brotli output should be smaller"
+        );
     }
 
     #[test]
     fn test_brotli_minimum_size_constant() {
-        assert!(MIN_BROTLI_SIZE >= 512, "MIN_BROTLI_SIZE should be at least 512 bytes");
+        assert!(
+            MIN_BROTLI_SIZE >= 512,
+            "MIN_BROTLI_SIZE should be at least 512 bytes"
+        );
     }
 }
 
 #[cfg(test)]
 mod ai_router_tests {
     use ai_load_balancer::ai::{AiAlgorithm, build_ai_router};
-    use ai_load_balancer::routing::BackendNode;
     use ai_load_balancer::config::BackendConfig;
+    use ai_load_balancer::routing::BackendNode;
     use std::sync::Arc;
 
     fn make_backend(addr: &str) -> Arc<BackendNode> {
@@ -723,17 +747,23 @@ mod ai_router_tests {
 
     #[test]
     fn test_algorithm_from_str() {
-        assert_eq!(AiAlgorithm::from_str("epsilon_greedy"), AiAlgorithm::EpsilonGreedy);
+        assert_eq!(
+            AiAlgorithm::from_str("epsilon_greedy"),
+            AiAlgorithm::EpsilonGreedy
+        );
         assert_eq!(AiAlgorithm::from_str("ucb1"), AiAlgorithm::Ucb1);
         assert_eq!(AiAlgorithm::from_str("softmax"), AiAlgorithm::Softmax);
-        assert_eq!(AiAlgorithm::from_str("thompson_sampling"), AiAlgorithm::ThompsonSampling);
+        assert_eq!(
+            AiAlgorithm::from_str("thompson_sampling"),
+            AiAlgorithm::ThompsonSampling
+        );
     }
 }
 
 #[cfg(test)]
 mod routing_tests {
-    use ai_load_balancer::routing::BackendNode;
     use ai_load_balancer::config::BackendConfig;
+    use ai_load_balancer::routing::BackendNode;
     use std::sync::atomic::Ordering;
 
     fn make_backend(addr: &str) -> BackendNode {
@@ -758,8 +788,10 @@ mod routing_tests {
         for _ in 0..3 {
             b.record_failure();
         }
-        assert!(!b.is_healthy.load(Ordering::Relaxed),
-            "backend should be marked unhealthy after 3 failures");
+        assert!(
+            !b.is_healthy.load(Ordering::Relaxed),
+            "backend should be marked unhealthy after 3 failures"
+        );
     }
 
     #[test]
@@ -808,7 +840,10 @@ mod keyval_tests {
         // Wait a moment and verify eviction kicks in
         std::thread::sleep(std::time::Duration::from_millis(10));
         store.evict_expired();
-        assert!(store.get("temp").is_none(), "key with 0-second TTL should have expired");
+        assert!(
+            store.get("temp").is_none(),
+            "key with 0-second TTL should have expired"
+        );
     }
 
     #[test]
@@ -897,7 +932,7 @@ mod grpc_web_integration_tests {
     };
     use bytes::Bytes;
     use http_body_util::{BodyExt, Empty, Full};
-    use hyper::{header, Request, Response, StatusCode};
+    use hyper::{Request, Response, StatusCode, header};
 
     fn grpc_web_req_parts_body(content_type: &str) -> (hyper::http::request::Parts, Bytes) {
         let req = Request::builder()
@@ -906,7 +941,10 @@ mod grpc_web_integration_tests {
             .header(header::CONTENT_TYPE, content_type)
             .body(())
             .unwrap();
-        (req.into_parts().0, Bytes::from_static(b"\x00\x00\x00\x00\x05hello"))
+        (
+            req.into_parts().0,
+            Bytes::from_static(b"\x00\x00\x00\x00\x05hello"),
+        )
     }
 
     fn grpc_web_req(content_type: &str) -> Request<Full<Bytes>> {
@@ -951,7 +989,10 @@ mod grpc_web_integration_tests {
         let (req_parts, body) = grpc_web_req_parts_body("application/grpc-web");
         let (parts, _body) = translate_request(req_parts, body);
         assert_eq!(
-            parts.headers.get(header::CONTENT_TYPE).and_then(|v| v.to_str().ok()),
+            parts
+                .headers
+                .get(header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok()),
             Some("application/grpc")
         );
         assert_eq!(
@@ -965,7 +1006,10 @@ mod grpc_web_integration_tests {
         let (req_parts, body) = grpc_web_req_parts_body("application/grpc-web+proto");
         let (parts, _body) = translate_request(req_parts, body);
         assert_eq!(
-            parts.headers.get(header::CONTENT_TYPE).and_then(|v| v.to_str().ok()),
+            parts
+                .headers
+                .get(header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok()),
             Some("application/grpc+proto")
         );
     }
@@ -975,7 +1019,10 @@ mod grpc_web_integration_tests {
         let (req_parts, body) = grpc_web_req_parts_body("application/grpc-web-text");
         let (parts, _body) = translate_request(req_parts, body);
         assert_eq!(
-            parts.headers.get(header::CONTENT_TYPE).and_then(|v| v.to_str().ok()),
+            parts
+                .headers
+                .get(header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok()),
             Some("application/grpc")
         );
     }
@@ -998,7 +1045,9 @@ mod grpc_web_integration_tests {
 
     // ── translate_response ───────────────────────────────────────────────────
 
-    fn make_grpc_response(content_type: &str) -> Response<http_body_util::combinators::BoxBody<Bytes, hyper::Error>> {
+    fn make_grpc_response(
+        content_type: &str,
+    ) -> Response<http_body_util::combinators::BoxBody<Bytes, hyper::Error>> {
         Response::builder()
             .status(StatusCode::OK)
             .header(header::CONTENT_TYPE, content_type)
@@ -1014,7 +1063,9 @@ mod grpc_web_integration_tests {
     async fn test_translate_response_grpc_to_grpc_web() {
         let resp = translate_response(make_grpc_response("application/grpc"), false).await;
         assert_eq!(
-            resp.headers().get(header::CONTENT_TYPE).and_then(|v| v.to_str().ok()),
+            resp.headers()
+                .get(header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok()),
             Some("application/grpc-web")
         );
     }
@@ -1023,7 +1074,9 @@ mod grpc_web_integration_tests {
     async fn test_translate_response_grpc_to_grpc_web_text() {
         let resp = translate_response(make_grpc_response("application/grpc"), true).await;
         assert_eq!(
-            resp.headers().get(header::CONTENT_TYPE).and_then(|v| v.to_str().ok()),
+            resp.headers()
+                .get(header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok()),
             Some("application/grpc-web-text")
         );
     }
@@ -1096,7 +1149,7 @@ mod grpc_web_integration_tests {
 // ─── Sticky session integration tests ─────────────────────────────────────────
 #[cfg(test)]
 mod sticky_session_integration_tests {
-    use ai_load_balancer::proxy::sticky::{base64_decode_addr, StickyMode, StickySessionManager};
+    use ai_load_balancer::proxy::sticky::{StickyMode, StickySessionManager, base64_decode_addr};
     use std::time::Duration;
 
     // ── Cookie mode ──────────────────────────────────────────────────────────
@@ -1123,13 +1176,7 @@ mod sticky_session_integration_tests {
         let mgr = cookie_mgr();
         let header = mgr.set_cookie_header("10.0.0.1:8080").unwrap();
         // The value between '=' and ';' is <base64_addr>.<base64_hmac>
-        let value = header
-            .split('=')
-            .nth(1)
-            .unwrap()
-            .split(';')
-            .next()
-            .unwrap();
+        let value = header.split('=').nth(1).unwrap().split(';').next().unwrap();
         // Extract just the payload part (before the '.') for decoding
         let payload = value.rsplit_once('.').map(|(p, _)| p).unwrap_or(value);
         let decoded = base64_decode_addr(payload);
@@ -1147,7 +1194,8 @@ mod sticky_session_integration_tests {
             .nth(1)
             .and_then(|s| s.split(';').next())
             .unwrap();
-        let result = mgr.extract_from_cookie(&format!("other=val; PHALANXID={}; more=x", signed_value));
+        let result =
+            mgr.extract_from_cookie(&format!("other=val; PHALANXID={}; more=x", signed_value));
         assert!(result.is_some());
     }
 
@@ -1172,7 +1220,10 @@ mod sticky_session_integration_tests {
         let mgr = cookie_mgr();
         // Unsigned cookie values (no '.' separator) are rejected in Cookie mode
         let result = mgr.extract_from_cookie("PHALANXID=dGVzdA");
-        assert!(result.is_none(), "unsigned cookie should be rejected in Cookie mode");
+        assert!(
+            result.is_none(),
+            "unsigned cookie should be rejected in Cookie mode"
+        );
     }
 
     #[test]
@@ -1193,7 +1244,10 @@ mod sticky_session_integration_tests {
             .and_then(|s| s.split(';').next())
             .unwrap();
         let result = mgr2.extract_from_cookie(&format!("PHALANXID={}", signed_value));
-        assert!(result.is_none(), "cookie signed by different key should be rejected");
+        assert!(
+            result.is_none(),
+            "cookie signed by different key should be rejected"
+        );
     }
 
     #[test]
@@ -1250,7 +1304,10 @@ mod sticky_session_integration_tests {
     #[test]
     fn test_learn_extract_response_header_missing() {
         let mgr = learn_mgr();
-        assert!(mgr.extract_from_response_header(&hyper::HeaderMap::new()).is_none());
+        assert!(
+            mgr.extract_from_response_header(&hyper::HeaderMap::new())
+                .is_none()
+        );
     }
 
     #[test]
@@ -1297,8 +1354,8 @@ mod sticky_session_integration_tests {
     #[test]
     fn test_base64_decode_addr_valid() {
         use base64::Engine;
-        let encoded = base64::engine::general_purpose::URL_SAFE_NO_PAD
-            .encode("192.168.0.1:3000".as_bytes());
+        let encoded =
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode("192.168.0.1:3000".as_bytes());
         assert_eq!(
             base64_decode_addr(&encoded),
             Some("192.168.0.1:3000".to_string())
@@ -1320,14 +1377,20 @@ mod zone_limiter_raii_tests {
     #[test]
     fn test_connection_guard_releases_on_drop() {
         let limiter = Arc::new(ZoneLimiter::new("test", 1000, 100, 1));
-        assert!(limiter.acquire_connection("k"), "first acquire must succeed");
+        assert!(
+            limiter.acquire_connection("k"),
+            "first acquire must succeed"
+        );
 
         // Second would exceed limit=1
         assert!(!limiter.acquire_connection("k"), "second must fail");
 
         // Release via drop
         limiter.release_connection("k");
-        assert!(limiter.acquire_connection("k"), "after release must succeed again");
+        assert!(
+            limiter.acquire_connection("k"),
+            "after release must succeed again"
+        );
     }
 
     #[test]
@@ -1386,7 +1449,10 @@ mod zone_limiter_raii_tests {
     #[test]
     fn test_zone_rate_check_allows_under_limit() {
         let limiter = ZoneLimiter::new("rate", 500, 500, 0);
-        assert!(limiter.check_rate("client"), "under-limit request must be allowed");
+        assert!(
+            limiter.check_rate("client"),
+            "under-limit request must be allowed"
+        );
     }
 
     #[test]
@@ -1514,8 +1580,15 @@ mod hook_engine_phase_tests {
         });
 
         let results = engine.execute(HookPhase::PreRoute, &ctx());
-        assert_eq!(results.len(), 1, "only Respond hook result, not the subsequent one");
-        assert!(matches!(&results[0], HookResult::Respond { status: 403, .. }));
+        assert_eq!(
+            results.len(),
+            1,
+            "only Respond hook result, not the subsequent one"
+        );
+        assert!(matches!(
+            &results[0],
+            HookResult::Respond { status: 403, .. }
+        ));
     }
 
     #[test]
@@ -1561,10 +1634,13 @@ mod hook_engine_phase_tests {
 
         let results = engine.execute(HookPhase::PreUpstream, &ctx());
         assert_eq!(results.len(), 3);
-        let paths: Vec<&str> = results.iter().map(|r| match r {
-            HookResult::RewritePath(p) => p.as_str(),
-            _ => "",
-        }).collect();
+        let paths: Vec<&str> = results
+            .iter()
+            .map(|r| match r {
+                HookResult::RewritePath(p) => p.as_str(),
+                _ => "",
+            })
+            .collect();
         assert_eq!(paths, vec!["/a", "/b", "/c"]);
     }
 
@@ -1578,10 +1654,7 @@ mod hook_engine_phase_tests {
         }
         impl HookHandler for CaptureHook {
             fn execute(&self, ctx: &HookContext) -> HookResult {
-                *self.captured.lock().unwrap() = Some((
-                    ctx.status,
-                    ctx.response_headers.clone(),
-                ));
+                *self.captured.lock().unwrap() = Some((ctx.status, ctx.response_headers.clone()));
                 HookResult::Continue
             }
         }
@@ -1592,7 +1665,9 @@ mod hook_engine_phase_tests {
             name: "capture_post".to_string(),
             phase: HookPhase::PostUpstream,
             priority: 0,
-            handler: Box::new(CaptureHook { captured: captured.clone() }),
+            handler: Box::new(CaptureHook {
+                captured: captured.clone(),
+            }),
         });
 
         assert!(engine.has_hooks(HookPhase::PostUpstream));
@@ -1618,7 +1693,10 @@ mod hook_engine_phase_tests {
         let captured = captured.lock().unwrap();
         let (status, headers) = captured.as_ref().unwrap();
         assert_eq!(*status, Some(200));
-        assert_eq!(headers.get("x-custom").map(|s| s.as_str()), Some("value123"));
+        assert_eq!(
+            headers.get("x-custom").map(|s| s.as_str()),
+            Some("value123")
+        );
     }
 
     #[test]
@@ -1654,7 +1732,10 @@ mod hook_engine_phase_tests {
         assert_eq!(results.len(), 1);
         match &results[0] {
             HookResult::SetHeaders(hdrs) => {
-                assert_eq!(hdrs.get("x-injected").map(|s| s.as_str()), Some("from-hook"));
+                assert_eq!(
+                    hdrs.get("x-injected").map(|s| s.as_str()),
+                    Some("from-hook")
+                );
             }
             other => panic!("Expected SetHeaders, got {:?}", other),
         }
@@ -1699,15 +1780,24 @@ mod waf_policy_engine_tests {
     fn test_policy_engine_new_is_empty() {
         let engine = PolicyEngine::new();
         // Empty engine returns no violations
-        let violations = engine.evaluate(None, "/safe", None, &std::collections::HashMap::new(), None);
+        let violations =
+            engine.evaluate(None, "/safe", None, &std::collections::HashMap::new(), None);
         assert!(violations.is_empty());
     }
 
     #[test]
     fn test_policy_add_and_evaluate_block_rule() {
         let mut engine = PolicyEngine::new();
-        engine.add_policy(blocking_policy(r"evil", RuleTarget::Url)).unwrap();
-        let violations = engine.evaluate(None, "/evil/path", None, &std::collections::HashMap::new(), None);
+        engine
+            .add_policy(blocking_policy(r"evil", RuleTarget::Url))
+            .unwrap();
+        let violations = engine.evaluate(
+            None,
+            "/evil/path",
+            None,
+            &std::collections::HashMap::new(),
+            None,
+        );
         assert!(!violations.is_empty());
         assert!(matches!(violations[0].action, RuleAction::Block));
     }
@@ -1715,34 +1805,61 @@ mod waf_policy_engine_tests {
     #[test]
     fn test_policy_evaluate_no_match_allows() {
         let mut engine = PolicyEngine::new();
-        engine.add_policy(blocking_policy(r"evil", RuleTarget::Url)).unwrap();
-        let violations = engine.evaluate(None, "/safe/path", None, &std::collections::HashMap::new(), None);
+        engine
+            .add_policy(blocking_policy(r"evil", RuleTarget::Url))
+            .unwrap();
+        let violations = engine.evaluate(
+            None,
+            "/safe/path",
+            None,
+            &std::collections::HashMap::new(),
+            None,
+        );
         assert!(violations.is_empty());
     }
 
     #[test]
     fn test_policy_query_target_match() {
         let mut engine = PolicyEngine::new();
-        engine.add_policy(blocking_policy(r"malicious", RuleTarget::QueryString)).unwrap();
-        let violations = engine.evaluate(None, "/page", Some("q=malicious+content"), &std::collections::HashMap::new(), None);
+        engine
+            .add_policy(blocking_policy(r"malicious", RuleTarget::QueryString))
+            .unwrap();
+        let violations = engine.evaluate(
+            None,
+            "/page",
+            Some("q=malicious+content"),
+            &std::collections::HashMap::new(),
+            None,
+        );
         assert!(!violations.is_empty());
     }
 
     #[test]
     fn test_policy_body_target_match() {
         let mut engine = PolicyEngine::new();
-        engine.add_policy(blocking_policy(r"<script>", RuleTarget::Body)).unwrap();
-        let violations = engine.evaluate(None, "/post", None, &std::collections::HashMap::new(), Some("<script>alert(1)</script>"));
+        engine
+            .add_policy(blocking_policy(r"<script>", RuleTarget::Body))
+            .unwrap();
+        let violations = engine.evaluate(
+            None,
+            "/post",
+            None,
+            &std::collections::HashMap::new(),
+            Some("<script>alert(1)</script>"),
+        );
         assert!(!violations.is_empty());
     }
 
     #[test]
     fn test_policy_headers_target_match() {
         let mut engine = PolicyEngine::new();
-        engine.add_policy(blocking_policy(r"sqlmap", RuleTarget::Headers)).unwrap();
-        let headers: std::collections::HashMap<String, String> = [
-            ("User-Agent".to_string(), "sqlmap/1.0".to_string()),
-        ].into_iter().collect();
+        engine
+            .add_policy(blocking_policy(r"sqlmap", RuleTarget::Headers))
+            .unwrap();
+        let headers: std::collections::HashMap<String, String> =
+            [("User-Agent".to_string(), "sqlmap/1.0".to_string())]
+                .into_iter()
+                .collect();
         let violations = engine.evaluate(None, "/api", None, &headers, None);
         assert!(!violations.is_empty());
     }
@@ -1766,17 +1883,38 @@ mod waf_policy_engine_tests {
         };
         engine.add_policy(policy).unwrap();
         // Excluded path — no violations
-        let violations = engine.evaluate(None, "/admin/evil", None, &std::collections::HashMap::new(), None);
-        assert!(violations.is_empty(), "excluded path should not trigger rule");
+        let violations = engine.evaluate(
+            None,
+            "/admin/evil",
+            None,
+            &std::collections::HashMap::new(),
+            None,
+        );
+        assert!(
+            violations.is_empty(),
+            "excluded path should not trigger rule"
+        );
         // Non-excluded path — blocked
-        let violations = engine.evaluate(None, "/public/evil", None, &std::collections::HashMap::new(), None);
+        let violations = engine.evaluate(
+            None,
+            "/public/evil",
+            None,
+            &std::collections::HashMap::new(),
+            None,
+        );
         assert!(!violations.is_empty());
     }
 
     #[test]
     fn test_waf_engine_policy_blocks_via_inspect() {
         let waf = make_waf_with_policy(blocking_policy(r"badactor", RuleTarget::Url));
-        let result = waf.inspect("1.2.3.4", "/badactor/action", None, &HashMap::new(), Some("Mozilla/5.0"));
+        let result = waf.inspect(
+            "1.2.3.4",
+            "/badactor/action",
+            None,
+            &HashMap::new(),
+            Some("Mozilla/5.0"),
+        );
         assert!(
             matches!(result, WafAction::Block(_)),
             "policy engine should block matched URL"
@@ -1788,15 +1926,29 @@ mod waf_policy_engine_tests {
         let reputation = IpReputationManager::new(100, 60, None);
         let waf = WafEngine::new(true, reputation);
         // Empty policy engine — safe URL passes
-        let result = waf.inspect("1.2.3.4", "/safe", None, &HashMap::new(), Some("Mozilla/5.0"));
+        let result = waf.inspect(
+            "1.2.3.4",
+            "/safe",
+            None,
+            &HashMap::new(),
+            Some("Mozilla/5.0"),
+        );
         assert_eq!(result, WafAction::Allow);
     }
 
     #[test]
     fn test_policy_rule_id_and_category_in_violation() {
         let mut engine = PolicyEngine::new();
-        engine.add_policy(blocking_policy(r"exploit", RuleTarget::All)).unwrap();
-        let violations = engine.evaluate(None, "/exploit", None, &std::collections::HashMap::new(), None);
+        engine
+            .add_policy(blocking_policy(r"exploit", RuleTarget::All))
+            .unwrap();
+        let violations = engine.evaluate(
+            None,
+            "/exploit",
+            None,
+            &std::collections::HashMap::new(),
+            None,
+        );
         assert_eq!(violations[0].rule_id, 1001);
         assert!(!violations[0].category.is_empty());
     }
@@ -1866,28 +2018,47 @@ mod response_cache_purge_tests {
     #[tokio::test]
     async fn test_cache_purge_prefix() {
         let cache = AdvancedCache::new(100, 60, None);
-        cache.insert("GET:host:/api/v1".to_string(), make_entry(b"1")).await;
-        cache.insert("GET:host:/api/v2".to_string(), make_entry(b"2")).await;
-        cache.insert("GET:host:/static/img".to_string(), make_entry(b"3")).await;
+        cache
+            .insert("GET:host:/api/v1".to_string(), make_entry(b"1"))
+            .await;
+        cache
+            .insert("GET:host:/api/v2".to_string(), make_entry(b"2"))
+            .await;
+        cache
+            .insert("GET:host:/static/img".to_string(), make_entry(b"3"))
+            .await;
         cache.run_pending_tasks().await;
         cache.purge_prefix("GET:host:/api").await;
         // Disk-only prefix purge; memory entries can be verified by direct get
-        assert!(cache.get("GET:host:/static/img").await.is_some(), "non-prefix entry should remain");
+        assert!(
+            cache.get("GET:host:/static/img").await.is_some(),
+            "non-prefix entry should remain"
+        );
     }
 
     #[tokio::test]
     async fn test_l2_disk_cache_persist_and_reload() {
-        let dir = format!("/tmp/phalanx_cache_test_{}", std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos());
+        let dir = format!(
+            "/tmp/phalanx_cache_test_{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
         {
             let cache = AdvancedCache::new(100, 300, Some(&dir));
-            cache.insert("disk-key".to_string(), make_entry(b"disk-value")).await;
+            cache
+                .insert("disk-key".to_string(), make_entry(b"disk-value"))
+                .await;
             cache.run_pending_tasks().await;
         }
         // New cache instance reads from disk
         let cache2 = AdvancedCache::new(100, 300, Some(&dir));
         let entry = cache2.get("disk-key").await;
-        assert!(entry.is_some(), "disk-cached entry should survive across instances");
+        assert!(
+            entry.is_some(),
+            "disk-cached entry should survive across instances"
+        );
         assert_eq!(entry.unwrap().body, Bytes::from_static(b"disk-value"));
         // Cleanup
         let _ = std::fs::remove_dir_all(&dir);
@@ -1921,6 +2092,7 @@ mod mail_proxy_config_tests {
             upstream_pool: "mail_pool".to_string(),
             banner: Some("220 phalanx.example.com".to_string()),
             starttls: true,
+            backend_starttls: false,
             tls_cert_path: Some("/etc/phalanx/cert.pem".to_string()),
             tls_key_path: Some("/etc/phalanx/key.pem".to_string()),
         };
@@ -1939,6 +2111,7 @@ mod mail_proxy_config_tests {
             upstream_pool: "default".to_string(),
             banner: None,
             starttls: false,
+            backend_starttls: false,
             tls_cert_path: None,
             tls_key_path: None,
         };
@@ -1987,7 +2160,10 @@ mod rewrite_integration_tests {
         ]);
         assert_eq!(
             apply_rewrites(&r, "/api/v1/users"),
-            RewriteResult::Rewritten { new_uri: "/v1/users".to_string(), restart_routing: false }
+            RewriteResult::Rewritten {
+                new_uri: "/v1/users".to_string(),
+                restart_routing: false
+            }
         );
     }
 
@@ -1996,7 +2172,10 @@ mod rewrite_integration_tests {
         let r = rules(&[(r"^/old/(.+)$", "/new/$1", "last")]);
         assert_eq!(
             apply_rewrites(&r, "/old/page"),
-            RewriteResult::Rewritten { new_uri: "/new/page".to_string(), restart_routing: true }
+            RewriteResult::Rewritten {
+                new_uri: "/new/page".to_string(),
+                restart_routing: true
+            }
         );
     }
 
@@ -2050,7 +2229,11 @@ mod rewrite_integration_tests {
 
     #[test]
     fn test_multiple_capture_groups_in_redirect() {
-        let r = rules(&[(r"^/shop/(\w+)/(\d+)$", "https://store.example.com/$1/$2", "permanent")]);
+        let r = rules(&[(
+            r"^/shop/(\w+)/(\d+)$",
+            "https://store.example.com/$1/$2",
+            "permanent",
+        )]);
         assert_eq!(
             apply_rewrites(&r, "/shop/books/99"),
             RewriteResult::Redirect {
@@ -2080,7 +2263,9 @@ mod rate_limiter_integration_tests {
         let ip = IpAddr::V4(Ipv4Addr::new(10, 1, 1, 1));
         let mut allowed = 0usize;
         for _ in 0..20 {
-            if limiter.check_ip(ip).await { allowed += 1; }
+            if limiter.check_ip(ip).await {
+                allowed += 1;
+            }
         }
         assert!(allowed < 20, "Should be blocked after burst exhausted");
         assert!(allowed >= 1, "At least one request should succeed");
@@ -2092,9 +2277,14 @@ mod rate_limiter_integration_tests {
         let ip1 = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1));
         let ip2 = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2));
         // Exhaust ip1
-        for _ in 0..10 { limiter.check_ip(ip1).await; }
+        for _ in 0..10 {
+            limiter.check_ip(ip1).await;
+        }
         // ip2 should still be fresh
-        assert!(limiter.check_ip(ip2).await, "ip2 bucket should be independent");
+        assert!(
+            limiter.check_ip(ip2).await,
+            "ip2 bucket should be independent"
+        );
     }
 
     #[test]
@@ -2140,14 +2330,16 @@ mod auth_jwt_integration_tests {
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
-            .as_secs() + 3600
+            .as_secs()
+            + 3600
     }
 
     fn past_exp() -> u64 {
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
-            .as_secs() - 100
+            .as_secs()
+            - 100
     }
 
     fn make_hs256_token(secret: &str, sub: &str, exp: u64) -> String {
@@ -2168,7 +2360,10 @@ mod auth_jwt_integration_tests {
 
     fn with_bearer(token: &str) -> HeaderMap {
         let mut h = HeaderMap::new();
-        h.insert(hyper::header::AUTHORIZATION, format!("Bearer {token}").parse().unwrap());
+        h.insert(
+            hyper::header::AUTHORIZATION,
+            format!("Bearer {token}").parse().unwrap(),
+        );
         h
     }
 
@@ -2229,13 +2424,22 @@ mod auth_jwt_integration_tests {
         };
         let hdrs = claims_to_headers(&claims);
         assert_eq!(hdrs.get("X-Auth-Sub").map(String::as_str), Some("abc"));
-        assert_eq!(hdrs.get("X-Auth-Email").map(String::as_str), Some("abc@test.com"));
+        assert_eq!(
+            hdrs.get("X-Auth-Email").map(String::as_str),
+            Some("abc@test.com")
+        );
     }
 
     #[test]
     fn test_claims_to_headers_empty_when_no_sub_or_email() {
         use ai_load_balancer::auth::jwt::Claims;
-        let claims = Claims { sub: None, email: None, exp: None, iss: None, aud: None };
+        let claims = Claims {
+            sub: None,
+            email: None,
+            exp: None,
+            iss: None,
+            aud: None,
+        };
         let hdrs = claims_to_headers(&claims);
         assert!(!hdrs.contains_key("X-Auth-Sub"));
         assert!(!hdrs.contains_key("X-Auth-Email"));
@@ -2253,7 +2457,10 @@ mod auth_basic_integration_tests {
     use std::collections::HashMap;
 
     fn creds(pairs: &[(&str, &str)]) -> HashMap<String, String> {
-        pairs.iter().map(|(u, p)| (u.to_string(), p.to_string())).collect()
+        pairs
+            .iter()
+            .map(|(u, p)| (u.to_string(), p.to_string()))
+            .collect()
     }
 
     fn basic_header(user: &str, pass: &str) -> HeaderMap {
@@ -2298,7 +2505,10 @@ mod auth_basic_integration_tests {
     fn test_bearer_scheme_rejected() {
         let users = creds(&[("alice", "pw")]);
         let mut h = HeaderMap::new();
-        h.insert(hyper::header::AUTHORIZATION, "Bearer some.token".parse().unwrap());
+        h.insert(
+            hyper::header::AUTHORIZATION,
+            "Bearer some.token".parse().unwrap(),
+        );
         let result = check(&h, "Realm", &users);
         assert!(matches!(result, AuthResult::Denied(..)));
     }
@@ -2312,7 +2522,10 @@ mod auth_basic_integration_tests {
 
     #[test]
     fn test_www_authenticate_header_format() {
-        assert_eq!(www_authenticate_header("Protected"), r#"Basic realm="Protected""#);
+        assert_eq!(
+            www_authenticate_header("Protected"),
+            r#"Basic realm="Protected""#
+        );
     }
 
     #[test]
@@ -2330,7 +2543,11 @@ mod cluster_state_integration_tests {
 
     #[tokio::test]
     async fn test_standalone_put_and_get_is_none() {
-        let state = ClusterState::new(ClusterBackend::Standalone, "node-a".to_string(), "127.0.0.1:9090".to_string());
+        let state = ClusterState::new(
+            ClusterBackend::Standalone,
+            "node-a".to_string(),
+            "127.0.0.1:9090".to_string(),
+        );
         assert!(state.put("k", "v", None).await.is_ok());
         // Standalone has no persistent store — get returns None
         assert!(state.get("k").await.unwrap().is_none());
@@ -2338,27 +2555,48 @@ mod cluster_state_integration_tests {
 
     #[tokio::test]
     async fn test_standalone_delete_ok() {
-        let state = ClusterState::new(ClusterBackend::Standalone, "node-a".to_string(), "127.0.0.1:9090".to_string());
+        let state = ClusterState::new(
+            ClusterBackend::Standalone,
+            "node-a".to_string(),
+            "127.0.0.1:9090".to_string(),
+        );
         assert!(state.delete("any-key").await.is_ok());
     }
 
     #[tokio::test]
     async fn test_standalone_heartbeat_ok() {
-        let state = ClusterState::new(ClusterBackend::Standalone, "node-a".to_string(), "127.0.0.1:9090".to_string());
+        let state = ClusterState::new(
+            ClusterBackend::Standalone,
+            "node-a".to_string(),
+            "127.0.0.1:9090".to_string(),
+        );
         assert!(state.heartbeat(30).await.is_ok());
     }
 
     #[tokio::test]
     async fn test_standalone_sticky_session_roundtrip() {
-        let state = ClusterState::new(ClusterBackend::Standalone, "node-a".to_string(), "127.0.0.1:9090".to_string());
-        assert!(state.share_sticky_session("sess-x", "10.0.0.5:8080", 60).await.is_ok());
+        let state = ClusterState::new(
+            ClusterBackend::Standalone,
+            "node-a".to_string(),
+            "127.0.0.1:9090".to_string(),
+        );
+        assert!(
+            state
+                .share_sticky_session("sess-x", "10.0.0.5:8080", 60)
+                .await
+                .is_ok()
+        );
         // Standalone has no storage — lookup returns None
         assert!(state.lookup_sticky_session("sess-x").await.is_none());
     }
 
     #[test]
     fn test_node_id_returns_configured_value() {
-        let state = ClusterState::new(ClusterBackend::Standalone, "phalanx-node-42".to_string(), "127.0.0.1:9090".to_string());
+        let state = ClusterState::new(
+            ClusterBackend::Standalone,
+            "phalanx-node-42".to_string(),
+            "127.0.0.1:9090".to_string(),
+        );
         assert_eq!(state.node_id(), "phalanx-node-42");
     }
 
@@ -2379,7 +2617,10 @@ mod cluster_state_integration_tests {
     #[tokio::test]
     async fn test_redis_backend_returns_error_when_unavailable() {
         let state = ClusterState::new(
-            ClusterBackend::Redis { url: "redis://127.0.0.1:19999".to_string(), client: std::sync::Arc::new(tokio::sync::Mutex::new(None)) },
+            ClusterBackend::Redis {
+                url: "redis://127.0.0.1:19999".to_string(),
+                client: std::sync::Arc::new(tokio::sync::Mutex::new(None)),
+            },
             "node-b".to_string(),
             "127.0.0.1:9090".to_string(),
         );
@@ -2387,12 +2628,19 @@ mod cluster_state_integration_tests {
         let result = state.put("key", "val", None).await;
         assert!(result.is_err(), "Unavailable Redis should return Err");
         let result = state.get("key").await;
-        assert!(result.is_err(), "Unavailable Redis should return Err for get");
+        assert!(
+            result.is_err(),
+            "Unavailable Redis should return Err for get"
+        );
     }
 
     #[tokio::test]
     async fn test_put_with_ttl_standalone_ok() {
-        let state = ClusterState::new(ClusterBackend::Standalone, "n".to_string(), "127.0.0.1:9090".to_string());
+        let state = ClusterState::new(
+            ClusterBackend::Standalone,
+            "n".to_string(),
+            "127.0.0.1:9090".to_string(),
+        );
         assert!(state.put("ttl-key", "value", Some(300)).await.is_ok());
     }
 }
@@ -2400,7 +2648,9 @@ mod cluster_state_integration_tests {
 // ─── Bot detection tests ───────────────────────────────────────────────────────
 #[cfg(test)]
 mod bot_detection_tests {
-    use ai_load_balancer::waf::bot::{BotClass, BotRateTracker, captcha_challenge_html, classify_user_agent};
+    use ai_load_balancer::waf::bot::{
+        BotClass, BotRateTracker, captcha_challenge_html, classify_user_agent,
+    };
 
     #[test]
     fn test_sqlmap_is_bad_bot() {
@@ -2420,7 +2670,9 @@ mod bot_detection_tests {
     #[test]
     fn test_googlebot_is_good_bot() {
         assert_eq!(
-            classify_user_agent("Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)"),
+            classify_user_agent(
+                "Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)"
+            ),
             BotClass::GoodBot
         );
     }
@@ -2428,7 +2680,9 @@ mod bot_detection_tests {
     #[test]
     fn test_bingbot_is_good_bot() {
         assert_eq!(
-            classify_user_agent("Mozilla/5.0 (compatible; bingbot/2.0; +http://www.bing.com/bingbot.htm)"),
+            classify_user_agent(
+                "Mozilla/5.0 (compatible; bingbot/2.0; +http://www.bing.com/bingbot.htm)"
+            ),
             BotClass::GoodBot
         );
     }
@@ -2440,7 +2694,10 @@ mod bot_detection_tests {
 
     #[test]
     fn test_python_requests_is_unknown() {
-        assert_eq!(classify_user_agent("python-requests/2.31.0"), BotClass::Unknown);
+        assert_eq!(
+            classify_user_agent("python-requests/2.31.0"),
+            BotClass::Unknown
+        );
     }
 
     #[test]
@@ -2461,7 +2718,9 @@ mod bot_detection_tests {
     #[test]
     fn test_chrome_browser_is_human() {
         assert_eq!(
-            classify_user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/121.0.0.0 Safari/537.36"),
+            classify_user_agent(
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/121.0.0.0 Safari/537.36"
+            ),
             BotClass::Human
         );
     }
@@ -2469,7 +2728,9 @@ mod bot_detection_tests {
     #[test]
     fn test_firefox_browser_is_human() {
         assert_eq!(
-            classify_user_agent("Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:122.0) Gecko/20100101 Firefox/122.0"),
+            classify_user_agent(
+                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:122.0) Gecko/20100101 Firefox/122.0"
+            ),
             BotClass::Human
         );
     }
@@ -2477,7 +2738,9 @@ mod bot_detection_tests {
     #[test]
     fn test_safari_browser_is_human() {
         assert_eq!(
-            classify_user_agent("Mozilla/5.0 (iPhone; CPU iPhone OS 17_2 like Mac OS X) AppleWebKit/605.1.15 Version/17.2 Mobile/15E148 Safari/604.1"),
+            classify_user_agent(
+                "Mozilla/5.0 (iPhone; CPU iPhone OS 17_2 like Mac OS X) AppleWebKit/605.1.15 Version/17.2 Mobile/15E148 Safari/604.1"
+            ),
             BotClass::Human
         );
     }
@@ -2496,7 +2759,10 @@ mod bot_detection_tests {
             tracker.record_and_rate("5.5.5.5");
         }
         let rate = tracker.record_and_rate("5.5.5.5");
-        assert!(rate > 0.5, "51 requests in 60s window should give rate > 0.5 req/s");
+        assert!(
+            rate > 0.5,
+            "51 requests in 60s window should give rate > 0.5 req/s"
+        );
     }
 
     #[test]
@@ -2507,7 +2773,10 @@ mod bot_detection_tests {
         }
         tracker.clear("6.6.6.6");
         let rate = tracker.record_and_rate("6.6.6.6");
-        assert!(rate < 1.0, "after clear, only 1 request — rate should be low");
+        assert!(
+            rate < 1.0,
+            "after clear, only 1 request — rate should be low"
+        );
     }
 
     #[test]
@@ -2518,7 +2787,10 @@ mod bot_detection_tests {
     #[test]
     fn test_captcha_html_embeds_site_key() {
         let html = captcha_challenge_html(Some("xyz-site-key-123")).unwrap();
-        assert!(html.contains("xyz-site-key-123"), "HTML should embed the site key");
+        assert!(
+            html.contains("xyz-site-key-123"),
+            "HTML should embed the site key"
+        );
         assert!(html.contains("<form"), "HTML should include a form");
     }
 }
@@ -2536,7 +2808,10 @@ mod basic_auth_bcrypt_tests {
     fn basic_header(user: &str, pass: &str) -> HeaderMap {
         let mut h = HeaderMap::new();
         let encoded = STANDARD.encode(format!("{user}:{pass}"));
-        h.insert(hyper::header::AUTHORIZATION, format!("Basic {encoded}").parse().unwrap());
+        h.insert(
+            hyper::header::AUTHORIZATION,
+            format!("Basic {encoded}").parse().unwrap(),
+        );
         h
     }
 
@@ -2593,7 +2868,10 @@ mod otel_tests {
             .get("traceparent")
             .and_then(|v| v.to_str().ok())
             .unwrap_or("");
-        assert!(traceparent.starts_with("00-abc123-span456-"), "format: 00-traceid-spanid-flags");
+        assert!(
+            traceparent.starts_with("00-abc123-span456-"),
+            "format: 00-traceid-spanid-flags"
+        );
         assert!(traceparent.ends_with("01"), "sampled flag should be 01");
     }
 
@@ -2617,7 +2895,10 @@ mod otel_tests {
             .get("traceparent")
             .and_then(|v| v.to_str().ok())
             .unwrap_or("");
-        assert!(traceparent.contains("new-trace"), "should overwrite with new trace id");
+        assert!(
+            traceparent.contains("new-trace"),
+            "should overwrite with new trace id"
+        );
     }
 
     #[test]
@@ -2691,15 +2972,18 @@ mod oidc_tests {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_secs();
-        store.insert("tok-1".to_string(), OidcSession {
-            sub: "user-99".to_string(),
-            email: Some("u@example.com".to_string()),
-            issuer: Some("https://idp.example.com".to_string()),
-            access_token: "at-abc".to_string(),
-            refresh_token: None,
-            created_at: now,
-            expires_in: 3600,
-        });
+        store.insert(
+            "tok-1".to_string(),
+            OidcSession {
+                sub: "user-99".to_string(),
+                email: Some("u@example.com".to_string()),
+                issuer: Some("https://idp.example.com".to_string()),
+                access_token: "at-abc".to_string(),
+                refresh_token: None,
+                created_at: now,
+                expires_in: 3600,
+            },
+        );
         let mut headers = HeaderMap::new();
         headers.insert(hyper::header::COOKIE, "sess=tok-1".parse().unwrap());
         let (result, session) = check_session(&headers, "sess", &store);
@@ -2710,20 +2994,26 @@ mod oidc_tests {
     #[test]
     fn test_expired_session_is_denied_and_removed() {
         let store = new_session_store();
-        store.insert("old-tok".to_string(), OidcSession {
-            sub: "ghost".to_string(),
-            email: None,
-            issuer: Some("https://idp.example.com".to_string()),
-            access_token: "at".to_string(),
-            refresh_token: None,
-            created_at: 1000,
-            expires_in: 1,
-        });
+        store.insert(
+            "old-tok".to_string(),
+            OidcSession {
+                sub: "ghost".to_string(),
+                email: None,
+                issuer: Some("https://idp.example.com".to_string()),
+                access_token: "at".to_string(),
+                refresh_token: None,
+                created_at: 1000,
+                expires_in: 1,
+            },
+        );
         let mut headers = HeaderMap::new();
         headers.insert(hyper::header::COOKIE, "sess=old-tok".parse().unwrap());
         let (result, _) = check_session(&headers, "sess", &store);
         assert!(matches!(result, AuthResult::Denied(..)));
-        assert!(!store.contains_key("old-tok"), "expired session should be removed");
+        assert!(
+            !store.contains_key("old-tok"),
+            "expired session should be removed"
+        );
     }
 
     #[test]
@@ -2744,11 +3034,11 @@ mod proxy_proto_v2_integration_tests {
 
     fn v2_ipv4_buf(src: [u8; 4], dst: [u8; 4], src_port: u16, dst_port: u16) -> Vec<u8> {
         let mut buf = vec![
-            0x0D, 0x0A, 0x0D, 0x0A, 0x00, 0x0D, 0x0A, 0x51,
-            0x55, 0x49, 0x54, 0x0A, // signature
-            0x21,                   // version=2, command=PROXY
-            0x11,                   // family=AF_INET, protocol=STREAM
-            0x00, 0x0C,             // addr length = 12
+            0x0D, 0x0A, 0x0D, 0x0A, 0x00, 0x0D, 0x0A, 0x51, 0x55, 0x49, 0x54,
+            0x0A, // signature
+            0x21, // version=2, command=PROXY
+            0x11, // family=AF_INET, protocol=STREAM
+            0x00, 0x0C, // addr length = 12
         ];
         buf.extend_from_slice(&src);
         buf.extend_from_slice(&dst);
@@ -2779,14 +3069,16 @@ mod proxy_proto_v2_integration_tests {
     #[test]
     fn test_v2_header_bad_signature_errors() {
         let buf = vec![0x00u8; 20];
-        assert!(matches!(parse_v2_header(&buf), Err(ParseError::NotProxyProtocol)));
+        assert!(matches!(
+            parse_v2_header(&buf),
+            Err(ParseError::NotProxyProtocol)
+        ));
     }
 
     #[test]
     fn test_v2_local_command_no_addresses() {
         let mut buf = vec![
-            0x0D, 0x0A, 0x0D, 0x0A, 0x00, 0x0D, 0x0A, 0x51,
-            0x55, 0x49, 0x54, 0x0A,
+            0x0D, 0x0A, 0x0D, 0x0A, 0x00, 0x0D, 0x0A, 0x51, 0x55, 0x49, 0x54, 0x0A,
             0x20, // version=2, command=LOCAL
             0x00, // unspec
             0x00, 0x00, // length = 0
@@ -2819,14 +3111,20 @@ mod fastcgi_protocol_tests {
         let req = Request::builder()
             .method("GET")
             .uri("/index.php")
-            .body(
-                Empty::<Bytes>::new(),
-            )
+            .body(Empty::<Bytes>::new())
             .unwrap();
         // Port 19901 — nothing listening
-        let resp = serve_fastcgi("/", "/index.php", "127.0.0.1:19901".to_string(), req, logger, "GET", "127.0.0.1")
-            .await
-            .unwrap();
+        let resp = serve_fastcgi(
+            "/",
+            "/index.php",
+            "127.0.0.1:19901".to_string(),
+            req,
+            logger,
+            "GET",
+            "127.0.0.1",
+        )
+        .await
+        .unwrap();
         assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
     }
 
@@ -2848,13 +3146,19 @@ mod fastcgi_protocol_tests {
         let req = Request::builder()
             .method("GET")
             .uri("/test.php")
-            .body(
-                Empty::<Bytes>::new(),
-            )
+            .body(Empty::<Bytes>::new())
             .unwrap();
-        let resp = serve_fastcgi("/", "/test.php", addr.to_string(), req, logger, "GET", "10.0.0.1")
-            .await
-            .unwrap();
+        let resp = serve_fastcgi(
+            "/",
+            "/test.php",
+            addr.to_string(),
+            req,
+            logger,
+            "GET",
+            "10.0.0.1",
+        )
+        .await
+        .unwrap();
         // FastCGI client will fail to parse an empty/invalid response → 502
         assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
     }
@@ -2879,19 +3183,31 @@ mod fastcgi_protocol_tests {
         let req = Request::builder()
             .method("POST")
             .uri("/api/submit.php?foo=bar")
-            .body(
-                Empty::<Bytes>::new(),
-            )
+            .body(Empty::<Bytes>::new())
             .unwrap();
         // Call — will return 502 since server doesn't speak FastCGI, but we
         // verify the connection was attempted (socket received data).
-        let _ = serve_fastcgi("/api", "/api/submit.php", addr.to_string(), req, logger, "POST", "192.168.1.1")
-            .await;
+        let _ = serve_fastcgi(
+            "/api",
+            "/api/submit.php",
+            addr.to_string(),
+            req,
+            logger,
+            "POST",
+            "192.168.1.1",
+        )
+        .await;
 
         // The mock should have received something (FastCGI begin-request record)
         let received = tokio::time::timeout(std::time::Duration::from_secs(2), rx).await;
-        assert!(received.is_ok(), "FastCGI client should have sent data to server");
-        assert!(!received.unwrap().unwrap().is_empty(), "FastCGI request should be non-empty");
+        assert!(
+            received.is_ok(),
+            "FastCGI client should have sent data to server"
+        );
+        assert!(
+            !received.unwrap().unwrap().is_empty(),
+            "FastCGI request should be non-empty"
+        );
     }
 }
 
@@ -2913,13 +3229,19 @@ mod uwsgi_protocol_tests {
         let req = Request::builder()
             .method("GET")
             .uri("/app/")
-            .body(
-                Empty::<Bytes>::new(),
-            )
+            .body(Empty::<Bytes>::new())
             .unwrap();
-        let resp = serve_uwsgi("/", "/app/", "127.0.0.1:19902".to_string(), req, logger, "GET", "127.0.0.1")
-            .await
-            .unwrap();
+        let resp = serve_uwsgi(
+            "/",
+            "/app/",
+            "127.0.0.1:19902".to_string(),
+            req,
+            logger,
+            "GET",
+            "127.0.0.1",
+        )
+        .await
+        .unwrap();
         assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
     }
 
@@ -2944,12 +3266,18 @@ mod uwsgi_protocol_tests {
         let req = Request::builder()
             .method("GET")
             .uri("/hello?name=world")
-            .body(
-                Empty::<Bytes>::new(),
-            )
+            .body(Empty::<Bytes>::new())
             .unwrap();
-        let _ = serve_uwsgi("/", "/hello", addr.to_string(), req, logger, "GET", "10.1.2.3")
-            .await;
+        let _ = serve_uwsgi(
+            "/",
+            "/hello",
+            addr.to_string(),
+            req,
+            logger,
+            "GET",
+            "10.1.2.3",
+        )
+        .await;
 
         let received = tokio::time::timeout(std::time::Duration::from_secs(2), rx)
             .await
@@ -2964,7 +3292,11 @@ mod uwsgi_protocol_tests {
         assert_eq!(received[3], 0, "uWSGI modifier2 should be 0");
         // Data size (LE u16) should match actual payload
         let data_size = u16::from_le_bytes([received[1], received[2]]) as usize;
-        assert_eq!(received.len(), 4 + data_size, "uWSGI payload length must match header");
+        assert_eq!(
+            received.len(),
+            4 + data_size,
+            "uWSGI payload length must match header"
+        );
     }
 
     #[tokio::test]
@@ -2986,12 +3318,18 @@ mod uwsgi_protocol_tests {
         let req = Request::builder()
             .method("POST")
             .uri("/submit")
-            .body(
-                Empty::<Bytes>::new(),
-            )
+            .body(Empty::<Bytes>::new())
             .unwrap();
-        let _ = serve_uwsgi("/", "/submit", addr.to_string(), req, logger, "POST", "1.2.3.4")
-            .await;
+        let _ = serve_uwsgi(
+            "/",
+            "/submit",
+            addr.to_string(),
+            req,
+            logger,
+            "POST",
+            "1.2.3.4",
+        )
+        .await;
 
         let payload = tokio::time::timeout(std::time::Duration::from_secs(2), rx)
             .await
@@ -3000,15 +3338,23 @@ mod uwsgi_protocol_tests {
 
         // Verify "POST" appears in the payload (as value of REQUEST_METHOD)
         let payload_str = String::from_utf8_lossy(&payload[4..]);
-        assert!(payload_str.contains("POST"), "uWSGI params must contain REQUEST_METHOD=POST");
-        assert!(payload_str.contains("REQUEST_METHOD"), "uWSGI params must include REQUEST_METHOD key");
+        assert!(
+            payload_str.contains("POST"),
+            "uWSGI params must contain REQUEST_METHOD=POST"
+        );
+        assert!(
+            payload_str.contains("REQUEST_METHOD"),
+            "uWSGI params must include REQUEST_METHOD key"
+        );
     }
 }
 
 // ─── TCP Proxy Integration Tests ──────────────────────────────────────────────
 #[cfg(test)]
 mod tcp_proxy_integration_tests {
-    use ai_load_balancer::config::{AppConfig, UpstreamPoolConfig, BackendConfig, LoadBalancingAlgorithm};
+    use ai_load_balancer::config::{
+        AppConfig, BackendConfig, LoadBalancingAlgorithm, UpstreamPoolConfig,
+    };
     use ai_load_balancer::discovery::ServiceDiscovery;
     use ai_load_balancer::routing::UpstreamManager;
     use std::sync::Arc;
@@ -3021,13 +3367,17 @@ mod tcp_proxy_integration_tests {
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move {
             loop {
-                let Ok((mut conn, _)) = listener.accept().await else { break };
+                let Ok((mut conn, _)) = listener.accept().await else {
+                    break;
+                };
                 tokio::spawn(async move {
                     let mut buf = vec![0u8; 1024];
                     loop {
                         match conn.read(&mut buf).await {
                             Ok(0) => break,
-                            Ok(n) => { let _ = conn.write_all(&buf[..n]).await; }
+                            Ok(n) => {
+                                let _ = conn.write_all(&buf[..n]).await;
+                            }
                             Err(_) => break,
                         }
                     }
@@ -3055,7 +3405,11 @@ mod tcp_proxy_integration_tests {
             },
         );
         let discovery = Arc::new(ServiceDiscovery::new("/tmp/phalanx_tcp_test_discovery").unwrap());
-        Arc::new(UpstreamManager::new(&config, discovery, tokio_util::sync::CancellationToken::new()))
+        Arc::new(UpstreamManager::new(
+            &config,
+            discovery,
+            tokio_util::sync::CancellationToken::new(),
+        ))
     }
 
     #[tokio::test]
@@ -3075,31 +3429,43 @@ mod tcp_proxy_integration_tests {
                 &proxy_addr.to_string(),
                 upstreams_clone,
                 shutdown_clone,
-            ).await;
+            )
+            .await;
         });
 
         // Give proxy time to bind
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
         // Connect through proxy
-        let mut client = tokio::net::TcpStream::connect(proxy_addr).await.expect("connect to proxy");
+        let mut client = tokio::net::TcpStream::connect(proxy_addr)
+            .await
+            .expect("connect to proxy");
         client.write_all(b"hello from client").await.unwrap();
 
         let mut buf = vec![0u8; 64];
-        let n = tokio::time::timeout(
-            std::time::Duration::from_secs(2),
-            client.read(&mut buf),
-        ).await.expect("echo timeout").unwrap();
+        let n = tokio::time::timeout(std::time::Duration::from_secs(2), client.read(&mut buf))
+            .await
+            .expect("echo timeout")
+            .unwrap();
 
-        assert_eq!(&buf[..n], b"hello from client", "TCP proxy must forward data to backend and echo back");
+        assert_eq!(
+            &buf[..n],
+            b"hello from client",
+            "TCP proxy must forward data to backend and echo back"
+        );
         shutdown.cancel();
     }
 
     #[tokio::test]
     async fn test_tcp_proxy_graceful_shutdown() {
-        let discovery = Arc::new(ServiceDiscovery::new("/tmp/phalanx_tcp_shutdown_discovery").unwrap());
+        let discovery =
+            Arc::new(ServiceDiscovery::new("/tmp/phalanx_tcp_shutdown_discovery").unwrap());
         let config = AppConfig::default();
-        let upstreams = Arc::new(UpstreamManager::new(&config, discovery, tokio_util::sync::CancellationToken::new()));
+        let upstreams = Arc::new(UpstreamManager::new(
+            &config,
+            discovery,
+            tokio_util::sync::CancellationToken::new(),
+        ));
 
         let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let proxy_addr = proxy_listener.local_addr().unwrap();
@@ -3112,7 +3478,8 @@ mod tcp_proxy_integration_tests {
                 &proxy_addr.to_string(),
                 upstreams,
                 shutdown_clone,
-            ).await;
+            )
+            .await;
         });
 
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
@@ -3120,13 +3487,17 @@ mod tcp_proxy_integration_tests {
 
         // Proxy task should exit cleanly after cancellation
         let result = tokio::time::timeout(std::time::Duration::from_secs(2), handle).await;
-        assert!(result.is_ok(), "TCP proxy should shut down within 2 seconds after cancellation");
+        assert!(
+            result.is_ok(),
+            "TCP proxy should shut down within 2 seconds after cancellation"
+        );
     }
 
     #[tokio::test]
     async fn test_tcp_proxy_no_healthy_backend_drops_connection() {
         // Pool with no backends → proxy accepts connection then drops it
-        let discovery = Arc::new(ServiceDiscovery::new("/tmp/phalanx_tcp_no_backend_discovery").unwrap());
+        let discovery =
+            Arc::new(ServiceDiscovery::new("/tmp/phalanx_tcp_no_backend_discovery").unwrap());
         let mut config = AppConfig::default();
         config.upstreams.insert(
             "default".to_string(),
@@ -3139,7 +3510,11 @@ mod tcp_proxy_integration_tests {
                 health_check_timeout_secs: 3,
             },
         );
-        let upstreams = Arc::new(UpstreamManager::new(&config, discovery, tokio_util::sync::CancellationToken::new()));
+        let upstreams = Arc::new(UpstreamManager::new(
+            &config,
+            discovery,
+            tokio_util::sync::CancellationToken::new(),
+        ));
 
         let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let proxy_addr = proxy_listener.local_addr().unwrap();
@@ -3152,20 +3527,26 @@ mod tcp_proxy_integration_tests {
                 &proxy_addr.to_string(),
                 upstreams,
                 shutdown_clone,
-            ).await;
+            )
+            .await;
         });
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
-        let mut client = tokio::net::TcpStream::connect(proxy_addr).await.expect("proxy should accept");
+        let mut client = tokio::net::TcpStream::connect(proxy_addr)
+            .await
+            .expect("proxy should accept");
         client.write_all(b"test").await.unwrap();
 
         let mut buf = vec![0u8; 64];
         // With no backend, proxy drops the connection — read returns 0 bytes
-        let n = tokio::time::timeout(
-            std::time::Duration::from_secs(2),
-            client.read(&mut buf),
-        ).await.expect("timeout").unwrap_or(0);
-        assert_eq!(n, 0, "proxy should close connection when no backends available");
+        let n = tokio::time::timeout(std::time::Duration::from_secs(2), client.read(&mut buf))
+            .await
+            .expect("timeout")
+            .unwrap_or(0);
+        assert_eq!(
+            n, 0,
+            "proxy should close connection when no backends available"
+        );
 
         shutdown.cancel();
     }

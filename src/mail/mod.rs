@@ -56,8 +56,10 @@ pub struct MailProxyConfig {
     pub upstream_pool: String,
     /// Optional custom greeting banner injected before proxying.
     pub banner: Option<String>,
-    /// Whether to support STARTTLS upgrade.
+    /// Whether to support STARTTLS upgrade (client → Phalanx).
     pub starttls: bool,
+    /// Whether to negotiate STARTTLS with the backend (Phalanx → upstream).
+    pub backend_starttls: bool,
     /// Path to TLS certificate file for STARTTLS (PEM format).
     pub tls_cert_path: Option<String>,
     /// Path to TLS private key file for STARTTLS (PEM format).
@@ -79,6 +81,98 @@ fn build_backend_tls_connector() -> TlsConnector {
         .with_root_certificates(root_store)
         .with_no_client_auth();
     TlsConnector::from(Arc::new(config))
+}
+
+/// Negotiates STARTTLS with a mail backend server.
+///
+/// Connects over plain TCP, reads the banner, sends the protocol-specific
+/// STARTTLS command, waits for a positive response, then upgrades the
+/// connection to TLS.
+///
+/// # Returns
+/// A TLS-wrapped stream ready for proxying.
+async fn negotiate_backend_starttls(
+    tcp: TcpStream,
+    protocol: MailProtocol,
+) -> Result<tokio_rustls::client::TlsStream<TcpStream>, String> {
+    let (reader, mut writer) = tcp.into_split();
+    let mut buf_reader = BufReader::new(reader);
+    let mut line = String::new();
+
+    // Read backend banner
+    line.clear();
+    let n = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        buf_reader.read_line(&mut line),
+    )
+    .await
+    .map_err(|_| "backend banner timeout".to_string())?
+    .map_err(|e| format!("backend banner read error: {}", e))?;
+
+    if n == 0 {
+        return Err("backend disconnected before banner".to_string());
+    }
+
+    // Send STARTTLS command
+    let cmd = match protocol {
+        MailProtocol::Smtp => "STARTTLS\r\n",
+        MailProtocol::Imap => "A001 STARTTLS\r\n",
+        MailProtocol::Pop3 => "STLS\r\n",
+    };
+    writer
+        .write_all(cmd.as_bytes())
+        .await
+        .map_err(|e| format!("STARTTLS command write: {}", e))?;
+
+    // Read acknowledgment
+    line.clear();
+    let n = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        buf_reader.read_line(&mut line),
+    )
+    .await
+    .map_err(|_| "backend STARTTLS response timeout".to_string())?
+    .map_err(|e| format!("backend STARTTLS response read error: {}", e))?;
+
+    if n == 0 {
+        return Err("backend disconnected during STARTTLS negotiation".to_string());
+    }
+
+    let trimmed = line.trim();
+    if !is_backend_starttls_ack(trimmed, protocol) {
+        return Err(format!("backend refused STARTTLS: {}", trimmed));
+    }
+
+    // Reunite stream for TLS upgrade
+    let tcp = buf_reader
+        .into_inner()
+        .reunite(writer)
+        .map_err(|e| format!("stream reunite error: {}", e))?;
+
+    let hostname = match tcp.peer_addr() {
+        Ok(addr) => addr.ip().to_string(),
+        Err(_) => "localhost".to_string(),
+    };
+
+    let connector = build_backend_tls_connector();
+    let server_name = rustls::pki_types::ServerName::try_from(hostname)
+        .map_err(|e| format!("invalid backend hostname: {}", e))?;
+
+    let tls_stream = connector
+        .connect(server_name, tcp)
+        .await
+        .map_err(|e| format!("backend TLS handshake failed: {}", e))?;
+
+    Ok(tls_stream)
+}
+
+/// Checks whether a backend response line is a positive STARTTLS acknowledgment.
+fn is_backend_starttls_ack(line: &str, protocol: MailProtocol) -> bool {
+    match protocol {
+        MailProtocol::Smtp => line.starts_with("220"),
+        MailProtocol::Imap => line.contains(" OK ") || line.starts_with("A001 OK"),
+        MailProtocol::Pop3 => line.starts_with("+OK"),
+    }
 }
 
 /// Detects a STARTTLS command in a protocol line.
@@ -113,20 +207,17 @@ async fn negotiate_starttls(
 ) -> Result<tokio_rustls::server::TlsStream<TcpStream>, String> {
     // Send greeting with STARTTLS capability
     let greeting = match protocol {
-        MailProtocol::Smtp => format!(
-            "220 {} ESMTP Phalanx\r\n",
-            banner
-        ),
+        MailProtocol::Smtp => format!("220 {} ESMTP Phalanx\r\n", banner),
         MailProtocol::Imap => format!(
             "* OK [CAPABILITY IMAP4rev1 STARTTLS] {} Phalanx IMAP Proxy\r\n",
             banner
         ),
-        MailProtocol::Pop3 => format!(
-            "+OK {} Phalanx POP3 Proxy\r\n",
-            banner
-        ),
+        MailProtocol::Pop3 => format!("+OK {} Phalanx POP3 Proxy\r\n", banner),
     };
-    client.write_all(greeting.as_bytes()).await.map_err(|e| format!("banner write: {}", e))?;
+    client
+        .write_all(greeting.as_bytes())
+        .await
+        .map_err(|e| format!("banner write: {}", e))?;
 
     let (reader, mut writer) = client.into_split();
     let mut buf_reader = BufReader::new(reader);
@@ -156,10 +247,15 @@ async fn negotiate_starttls(
                 }
                 MailProtocol::Pop3 => "+OK Begin TLS negotiation\r\n".to_string(),
             };
-            writer.write_all(ack.as_bytes()).await.map_err(|e| format!("ack write: {}", e))?;
+            writer
+                .write_all(ack.as_bytes())
+                .await
+                .map_err(|e| format!("ack write: {}", e))?;
 
             // Reunite the split stream for TLS upgrade
-            let client = buf_reader.into_inner().reunite(writer)
+            let client = buf_reader
+                .into_inner()
+                .reunite(writer)
                 .map_err(|e| format!("reunite error: {}", e))?;
 
             // Perform TLS handshake
@@ -177,11 +273,11 @@ async fn negotiate_starttls(
                 let cmd = line.trim().to_uppercase();
                 if cmd.starts_with("EHLO") || cmd.starts_with("HELO") {
                     let host = banner;
-                    let resp = format!(
-                        "250-{}\r\n250-STARTTLS\r\n250 OK\r\n",
-                        host
-                    );
-                    writer.write_all(resp.as_bytes()).await.map_err(|e| format!("write: {}", e))?;
+                    let resp = format!("250-{}\r\n250-STARTTLS\r\n250 OK\r\n", host);
+                    writer
+                        .write_all(resp.as_bytes())
+                        .await
+                        .map_err(|e| format!("write: {}", e))?;
                 } else if cmd.starts_with("QUIT") {
                     writer.write_all(b"221 Bye\r\n").await.ok();
                     return Err("client quit before STARTTLS".to_string());
@@ -195,7 +291,10 @@ async fn negotiate_starttls(
             MailProtocol::Imap => {
                 let tag = extract_imap_tag(&line);
                 let resp = format!("{} BAD Must negotiate STARTTLS first\r\n", tag);
-                writer.write_all(resp.as_bytes()).await.map_err(|e| format!("write: {}", e))?;
+                writer
+                    .write_all(resp.as_bytes())
+                    .await
+                    .map_err(|e| format!("write: {}", e))?;
             }
             MailProtocol::Pop3 => {
                 let cmd = line.trim().to_uppercase();
@@ -258,18 +357,19 @@ pub async fn start_mail_proxy(
     // Build STARTTLS acceptor if configured
     let starttls_acceptor = if config.starttls {
         match (&config.tls_cert_path, &config.tls_key_path) {
-            (Some(cert), Some(key)) => {
-                match build_starttls_acceptor(cert, key) {
-                    Some(acceptor) => {
-                        info!("{} proxy: STARTTLS enabled", config.protocol.name());
-                        Some(Arc::new(acceptor))
-                    }
-                    None => {
-                        error!("{} proxy: failed to build STARTTLS acceptor", config.protocol.name());
-                        None
-                    }
+            (Some(cert), Some(key)) => match build_starttls_acceptor(cert, key) {
+                Some(acceptor) => {
+                    info!("{} proxy: STARTTLS enabled", config.protocol.name());
+                    Some(Arc::new(acceptor))
                 }
-            }
+                None => {
+                    error!(
+                        "{} proxy: failed to build STARTTLS acceptor",
+                        config.protocol.name()
+                    );
+                    None
+                }
+            },
             _ => {
                 error!(
                     "{} proxy: STARTTLS enabled but tls_cert_path/tls_key_path not configured",
@@ -282,11 +382,7 @@ pub async fn start_mail_proxy(
         None
     };
 
-    info!(
-        "{} proxy listening on {}",
-        config.protocol.name(),
-        addr
-    );
+    info!("{} proxy listening on {}", config.protocol.name(), addr);
 
     loop {
         let (client, peer) = tokio::select! {
@@ -336,7 +432,11 @@ pub async fn start_mail_proxy(
             }
 
             impl tokio::io::AsyncRead for BackendStream {
-                fn poll_read(self: Pin<&mut Self>, cx: &mut std::task::Context<'_>, buf: &mut tokio::io::ReadBuf<'_>) -> std::task::Poll<std::io::Result<()>> {
+                fn poll_read(
+                    self: Pin<&mut Self>,
+                    cx: &mut std::task::Context<'_>,
+                    buf: &mut tokio::io::ReadBuf<'_>,
+                ) -> std::task::Poll<std::io::Result<()>> {
                     match self.get_mut() {
                         BackendStream::Plain(s) => Pin::new(s).poll_read(cx, buf),
                         BackendStream::Tls(s) => Pin::new(s).poll_read(cx, buf),
@@ -345,19 +445,29 @@ pub async fn start_mail_proxy(
             }
 
             impl tokio::io::AsyncWrite for BackendStream {
-                fn poll_write(self: Pin<&mut Self>, cx: &mut std::task::Context<'_>, buf: &[u8]) -> std::task::Poll<std::io::Result<usize>> {
+                fn poll_write(
+                    self: Pin<&mut Self>,
+                    cx: &mut std::task::Context<'_>,
+                    buf: &[u8],
+                ) -> std::task::Poll<std::io::Result<usize>> {
                     match self.get_mut() {
                         BackendStream::Plain(s) => Pin::new(s).poll_write(cx, buf),
                         BackendStream::Tls(s) => Pin::new(s).poll_write(cx, buf),
                     }
                 }
-                fn poll_flush(self: Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> std::task::Poll<std::io::Result<()>> {
+                fn poll_flush(
+                    self: Pin<&mut Self>,
+                    cx: &mut std::task::Context<'_>,
+                ) -> std::task::Poll<std::io::Result<()>> {
                     match self.get_mut() {
                         BackendStream::Plain(s) => Pin::new(s).poll_flush(cx),
                         BackendStream::Tls(s) => Pin::new(s).poll_flush(cx),
                     }
                 }
-                fn poll_shutdown(self: Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> std::task::Poll<std::io::Result<()>> {
+                fn poll_shutdown(
+                    self: Pin<&mut Self>,
+                    cx: &mut std::task::Context<'_>,
+                ) -> std::task::Poll<std::io::Result<()>> {
                     match self.get_mut() {
                         BackendStream::Plain(s) => Pin::new(s).poll_shutdown(cx),
                         BackendStream::Tls(s) => Pin::new(s).poll_shutdown(cx),
@@ -376,31 +486,54 @@ pub async fn start_mail_proxy(
                 }
             };
 
-            let mut server = if verify_backend_tls {
-                let hostname = backend.config.address.split(':').next().unwrap_or(&backend.config.address);
+            let mut server = if cfg.backend_starttls {
+                match negotiate_backend_starttls(tcp, cfg.protocol).await {
+                    Ok(tls_stream) => {
+                        info!(
+                            "{} proxy: backend STARTTLS negotiated for {}",
+                            cfg.protocol.name(),
+                            backend.config.address
+                        );
+                        BackendStream::Tls(tls_stream)
+                    }
+                    Err(e) => {
+                        error!(
+                            "{} proxy: backend STARTTLS failed for {}: {}",
+                            cfg.protocol.name(),
+                            backend.config.address,
+                            e
+                        );
+                        return;
+                    }
+                }
+            } else if verify_backend_tls {
+                let hostname = backend
+                    .config
+                    .address
+                    .split(':')
+                    .next()
+                    .unwrap_or(&backend.config.address);
                 let connector = build_backend_tls_connector();
                 match rustls::pki_types::ServerName::try_from(hostname.to_string()) {
-                    Ok(name) => {
-                        match connector.connect(name, tcp).await {
-                            Ok(tls_stream) => {
-                                info!(
-                                    "{} proxy: backend TLS verified for {}",
-                                    cfg.protocol.name(),
-                                    backend.config.address
-                                );
-                                BackendStream::Tls(tls_stream)
-                            }
-                            Err(e) => {
-                                error!(
-                                    "{} proxy: backend TLS handshake failed for {}: {}",
-                                    cfg.protocol.name(),
-                                    backend.config.address,
-                                    e
-                                );
-                                return;
-                            }
+                    Ok(name) => match connector.connect(name, tcp).await {
+                        Ok(tls_stream) => {
+                            info!(
+                                "{} proxy: backend TLS verified for {}",
+                                cfg.protocol.name(),
+                                backend.config.address
+                            );
+                            BackendStream::Tls(tls_stream)
                         }
-                    }
+                        Err(e) => {
+                            error!(
+                                "{} proxy: backend TLS handshake failed for {}: {}",
+                                cfg.protocol.name(),
+                                backend.config.address,
+                                e
+                            );
+                            return;
+                        }
+                    },
                     Err(e) => {
                         error!(
                             "{} proxy: invalid backend hostname '{}': {}",
@@ -445,7 +578,10 @@ pub async fn start_mail_proxy(
                             Ok((from_client, from_server)) => {
                                 debug!(
                                     "{} STARTTLS session closed: {} sent {} bytes, server sent {} bytes",
-                                    cfg.protocol.name(), peer, from_client, from_server
+                                    cfg.protocol.name(),
+                                    peer,
+                                    from_client,
+                                    from_server
                                 );
                             }
                             Err(e) => {
@@ -454,7 +590,12 @@ pub async fn start_mail_proxy(
                         }
                     }
                     Err(e) => {
-                        debug!("{} STARTTLS negotiation failed for {}: {}", cfg.protocol.name(), peer, e);
+                        debug!(
+                            "{} STARTTLS negotiation failed for {}: {}",
+                            cfg.protocol.name(),
+                            peer,
+                            e
+                        );
                     }
                 }
                 return;
@@ -477,11 +618,9 @@ pub async fn start_mail_proxy(
 
                 // Read and discard the backend's own banner
                 let mut buf = vec![0u8; 512];
-                let _ = tokio::time::timeout(
-                    std::time::Duration::from_secs(5),
-                    server.read(&mut buf),
-                )
-                .await;
+                let _ =
+                    tokio::time::timeout(std::time::Duration::from_secs(5), server.read(&mut buf))
+                        .await;
             }
 
             // Bidirectional streaming
@@ -545,6 +684,7 @@ mod tests {
             upstream_pool: "mail_backend".to_string(),
             banner: Some("mx.example.com".to_string()),
             starttls: true,
+            backend_starttls: false,
             tls_cert_path: Some("/etc/phalanx/cert.pem".to_string()),
             tls_key_path: Some("/etc/phalanx/key.pem".to_string()),
         };
@@ -564,6 +704,7 @@ mod tests {
             upstream_pool: "imap".to_string(),
             banner: None,
             starttls: false,
+            backend_starttls: false,
             tls_cert_path: None,
             tls_key_path: None,
         };
@@ -585,7 +726,10 @@ mod tests {
         assert!(is_starttls_command("a001 STARTTLS\r\n", MailProtocol::Imap));
         assert!(is_starttls_command("tag STARTTLS", MailProtocol::Imap));
         assert!(!is_starttls_command("STARTTLS", MailProtocol::Imap)); // needs tag
-        assert!(!is_starttls_command("a001 LOGIN user pass", MailProtocol::Imap));
+        assert!(!is_starttls_command(
+            "a001 LOGIN user pass",
+            MailProtocol::Imap
+        ));
     }
 
     #[test]
@@ -611,11 +755,81 @@ mod tests {
             upstream_pool: "mail_backend".to_string(),
             banner: Some("mx.example.com".to_string()),
             starttls: true,
+            backend_starttls: false,
             tls_cert_path: Some("/etc/phalanx/cert.pem".to_string()),
             tls_key_path: Some("/etc/phalanx/key.pem".to_string()),
         };
         assert!(config.starttls);
+        assert!(!config.backend_starttls);
         // verify_backend_tls is passed as a separate parameter to start_mail_proxy(),
         // not stored in MailProxyConfig, for backwards compatibility
+    }
+
+    #[test]
+    fn test_mail_proxy_config_with_backend_starttls() {
+        let config = MailProxyConfig {
+            protocol: MailProtocol::Smtp,
+            bind_addr: "0.0.0.0:25".to_string(),
+            upstream_pool: "mail_backend".to_string(),
+            banner: None,
+            starttls: true,
+            backend_starttls: true,
+            tls_cert_path: Some("/etc/phalanx/cert.pem".to_string()),
+            tls_key_path: Some("/etc/phalanx/key.pem".to_string()),
+        };
+        assert!(config.backend_starttls);
+    }
+
+    #[test]
+    fn test_is_backend_starttls_ack_smtp() {
+        assert!(is_backend_starttls_ack(
+            "220 2.0.0 Ready to start TLS",
+            MailProtocol::Smtp
+        ));
+        assert!(is_backend_starttls_ack("220-go ahead", MailProtocol::Smtp));
+        assert!(!is_backend_starttls_ack(
+            "500 command not recognized",
+            MailProtocol::Smtp
+        ));
+        assert!(!is_backend_starttls_ack(
+            "454 TLS not available",
+            MailProtocol::Smtp
+        ));
+    }
+
+    #[test]
+    fn test_is_backend_starttls_ack_imap() {
+        assert!(is_backend_starttls_ack(
+            "A001 OK Begin TLS negotiation now",
+            MailProtocol::Imap
+        ));
+        assert!(is_backend_starttls_ack(
+            "tag OK STARTTLS completed",
+            MailProtocol::Imap
+        ));
+        assert!(!is_backend_starttls_ack(
+            "A001 BAD Command not recognized",
+            MailProtocol::Imap
+        ));
+        assert!(!is_backend_starttls_ack(
+            "A001 NO TLS not available",
+            MailProtocol::Imap
+        ));
+    }
+
+    #[test]
+    fn test_is_backend_starttls_ack_pop3() {
+        assert!(is_backend_starttls_ack(
+            "+OK Begin TLS negotiation",
+            MailProtocol::Pop3
+        ));
+        assert!(!is_backend_starttls_ack(
+            "-ERR TLS not available",
+            MailProtocol::Pop3
+        ));
+        assert!(!is_backend_starttls_ack(
+            "-ERR Command not recognized",
+            MailProtocol::Pop3
+        ));
     }
 }

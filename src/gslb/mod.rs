@@ -7,11 +7,11 @@
 //!
 //! Works alongside the existing GeoIP module to provide anycast-like routing.
 
+use parking_lot::RwLock;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
-use parking_lot::RwLock;
-use serde::{Deserialize, Serialize};
 use tokio::sync::Semaphore;
 
 /// A geographic data center (point of presence).
@@ -62,13 +62,69 @@ impl GeoRegion {
     /// Returns the default region ordering by proximity for fallback routing.
     pub fn proximity_order(&self) -> Vec<GeoRegion> {
         match self {
-            Self::NorthAmerica => vec![Self::NorthAmerica, Self::SouthAmerica, Self::Europe, Self::Asia, Self::Oceania, Self::MiddleEast, Self::Africa],
-            Self::SouthAmerica => vec![Self::SouthAmerica, Self::NorthAmerica, Self::Europe, Self::Africa, Self::Asia, Self::Oceania, Self::MiddleEast],
-            Self::Europe => vec![Self::Europe, Self::MiddleEast, Self::Africa, Self::NorthAmerica, Self::Asia, Self::SouthAmerica, Self::Oceania],
-            Self::Africa => vec![Self::Africa, Self::Europe, Self::MiddleEast, Self::SouthAmerica, Self::Asia, Self::NorthAmerica, Self::Oceania],
-            Self::MiddleEast => vec![Self::MiddleEast, Self::Europe, Self::Africa, Self::Asia, Self::NorthAmerica, Self::SouthAmerica, Self::Oceania],
-            Self::Asia => vec![Self::Asia, Self::Oceania, Self::MiddleEast, Self::Europe, Self::NorthAmerica, Self::SouthAmerica, Self::Africa],
-            Self::Oceania => vec![Self::Oceania, Self::Asia, Self::NorthAmerica, Self::SouthAmerica, Self::Europe, Self::MiddleEast, Self::Africa],
+            Self::NorthAmerica => vec![
+                Self::NorthAmerica,
+                Self::SouthAmerica,
+                Self::Europe,
+                Self::Asia,
+                Self::Oceania,
+                Self::MiddleEast,
+                Self::Africa,
+            ],
+            Self::SouthAmerica => vec![
+                Self::SouthAmerica,
+                Self::NorthAmerica,
+                Self::Europe,
+                Self::Africa,
+                Self::Asia,
+                Self::Oceania,
+                Self::MiddleEast,
+            ],
+            Self::Europe => vec![
+                Self::Europe,
+                Self::MiddleEast,
+                Self::Africa,
+                Self::NorthAmerica,
+                Self::Asia,
+                Self::SouthAmerica,
+                Self::Oceania,
+            ],
+            Self::Africa => vec![
+                Self::Africa,
+                Self::Europe,
+                Self::MiddleEast,
+                Self::SouthAmerica,
+                Self::Asia,
+                Self::NorthAmerica,
+                Self::Oceania,
+            ],
+            Self::MiddleEast => vec![
+                Self::MiddleEast,
+                Self::Europe,
+                Self::Africa,
+                Self::Asia,
+                Self::NorthAmerica,
+                Self::SouthAmerica,
+                Self::Oceania,
+            ],
+            Self::Asia => vec![
+                Self::Asia,
+                Self::Oceania,
+                Self::MiddleEast,
+                Self::Europe,
+                Self::NorthAmerica,
+                Self::SouthAmerica,
+                Self::Africa,
+            ],
+            Self::Oceania => vec![
+                Self::Oceania,
+                Self::Asia,
+                Self::NorthAmerica,
+                Self::SouthAmerica,
+                Self::Europe,
+                Self::MiddleEast,
+                Self::Africa,
+            ],
         }
     }
 }
@@ -111,43 +167,41 @@ impl GslbPolicy {
 pub fn country_to_region(country_code: &str) -> GeoRegion {
     match country_code.to_uppercase().as_str() {
         // North America (23 countries/territories)
-        "US" | "CA" | "MX" | "GT" | "BZ" | "HN" | "SV" | "NI" | "CR" | "PA"
-        | "CU" | "JM" | "HT" | "DO" | "PR" | "TT" | "BB" | "BS" | "AG" | "DM"
-        | "GD" | "KN" | "LC" => GeoRegion::NorthAmerica,
+        "US" | "CA" | "MX" | "GT" | "BZ" | "HN" | "SV" | "NI" | "CR" | "PA" | "CU" | "JM"
+        | "HT" | "DO" | "PR" | "TT" | "BB" | "BS" | "AG" | "DM" | "GD" | "KN" | "LC" => {
+            GeoRegion::NorthAmerica
+        }
 
         // South America (14 countries)
-        "BR" | "AR" | "CL" | "CO" | "PE" | "VE" | "EC" | "UY" | "PY" | "BO"
-        | "GY" | "SR" | "GF" | "FK" => GeoRegion::SouthAmerica,
+        "BR" | "AR" | "CL" | "CO" | "PE" | "VE" | "EC" | "UY" | "PY" | "BO" | "GY" | "SR"
+        | "GF" | "FK" => GeoRegion::SouthAmerica,
 
         // Europe (50 countries)
-        "GB" | "DE" | "FR" | "IT" | "ES" | "NL" | "BE" | "CH" | "AT" | "SE"
-        | "NO" | "DK" | "FI" | "PL" | "CZ" | "PT" | "IE" | "RO" | "HU" | "GR"
-        | "UA" | "RU" | "SK" | "BG" | "HR" | "RS" | "SI" | "LT" | "LV" | "EE"
-        | "IS" | "LU" | "MT" | "CY" | "AL" | "MK" | "BA" | "ME" | "MD" | "BY"
-        | "GE" | "AM" | "AZ" | "KZ" | "LI" | "MC" | "SM" | "AD" | "VA" | "XK"
-        => GeoRegion::Europe,
+        "GB" | "DE" | "FR" | "IT" | "ES" | "NL" | "BE" | "CH" | "AT" | "SE" | "NO" | "DK"
+        | "FI" | "PL" | "CZ" | "PT" | "IE" | "RO" | "HU" | "GR" | "UA" | "RU" | "SK" | "BG"
+        | "HR" | "RS" | "SI" | "LT" | "LV" | "EE" | "IS" | "LU" | "MT" | "CY" | "AL" | "MK"
+        | "BA" | "ME" | "MD" | "BY" | "GE" | "AM" | "AZ" | "KZ" | "LI" | "MC" | "SM" | "AD"
+        | "VA" | "XK" => GeoRegion::Europe,
 
         // Africa (54 countries)
-        "ZA" | "NG" | "KE" | "EG" | "GH" | "TZ" | "ET" | "MA" | "DZ" | "TN"
-        | "UG" | "CI" | "CM" | "MG" | "MZ" | "AO" | "SN" | "ML" | "BF" | "NE"
-        | "TD" | "SO" | "ZW" | "RW" | "BJ" | "BI" | "TG" | "SL" | "LR" | "MR"
-        | "ER" | "GM" | "GA" | "BW" | "NA" | "LS" | "SZ" | "DJ" | "KM" | "CV"
-        | "ST" | "SC" | "MU" | "GN" | "GW" | "GQ" | "CG" | "CD" | "CF" | "MW"
-        | "ZM" | "SS" | "LY" | "SD" => GeoRegion::Africa,
+        "ZA" | "NG" | "KE" | "EG" | "GH" | "TZ" | "ET" | "MA" | "DZ" | "TN" | "UG" | "CI"
+        | "CM" | "MG" | "MZ" | "AO" | "SN" | "ML" | "BF" | "NE" | "TD" | "SO" | "ZW" | "RW"
+        | "BJ" | "BI" | "TG" | "SL" | "LR" | "MR" | "ER" | "GM" | "GA" | "BW" | "NA" | "LS"
+        | "SZ" | "DJ" | "KM" | "CV" | "ST" | "SC" | "MU" | "GN" | "GW" | "GQ" | "CG" | "CD"
+        | "CF" | "MW" | "ZM" | "SS" | "LY" | "SD" => GeoRegion::Africa,
 
         // Middle East (16 countries)
-        "AE" | "SA" | "IL" | "TR" | "QA" | "KW" | "BH" | "OM" | "JO" | "LB"
-        | "IQ" | "IR" | "YE" | "SY" | "PS" | "AF" => GeoRegion::MiddleEast,
+        "AE" | "SA" | "IL" | "TR" | "QA" | "KW" | "BH" | "OM" | "JO" | "LB" | "IQ" | "IR"
+        | "YE" | "SY" | "PS" | "AF" => GeoRegion::MiddleEast,
 
         // Asia (30 countries)
-        "CN" | "JP" | "KR" | "IN" | "SG" | "TH" | "VN" | "MY" | "ID" | "PH"
-        | "TW" | "HK" | "PK" | "BD" | "LK" | "NP" | "MM" | "KH" | "LA" | "MN"
-        | "KP" | "BN" | "MO" | "BT" | "MV" | "TL" | "UZ" | "TM" | "TJ" | "KG"
-        => GeoRegion::Asia,
+        "CN" | "JP" | "KR" | "IN" | "SG" | "TH" | "VN" | "MY" | "ID" | "PH" | "TW" | "HK"
+        | "PK" | "BD" | "LK" | "NP" | "MM" | "KH" | "LA" | "MN" | "KP" | "BN" | "MO" | "BT"
+        | "MV" | "TL" | "UZ" | "TM" | "TJ" | "KG" => GeoRegion::Asia,
 
         // Oceania (14 countries/territories)
-        "AU" | "NZ" | "FJ" | "PG" | "WS" | "TO" | "VU" | "SB" | "KI" | "MH"
-        | "FM" | "PW" | "TV" | "NR" => GeoRegion::Oceania,
+        "AU" | "NZ" | "FJ" | "PG" | "WS" | "TO" | "VU" | "SB" | "KI" | "MH" | "FM" | "PW"
+        | "TV" | "NR" => GeoRegion::Oceania,
 
         _ => GeoRegion::NorthAmerica, // default fallback for unmapped territories
     }
@@ -216,7 +270,11 @@ impl GslbRouter {
     /// NaN latency values are sanitized to `f64::MAX` so they never pass
     /// the `max_latency_ms` check — a DC reporting NaN is always unhealthy.
     pub fn update_health(&self, dc_id: &str, healthy: bool, latency_ms: f64) {
-        let latency_ms = if latency_ms.is_nan() { f64::MAX } else { latency_ms };
+        let latency_ms = if latency_ms.is_nan() {
+            f64::MAX
+        } else {
+            latency_ms
+        };
         let mut health = self.health.write();
         if let Some(status) = health.get_mut(dc_id) {
             status.healthy = healthy && latency_ms <= self.max_latency_ms;
@@ -255,7 +313,11 @@ impl GslbRouter {
             if !dc.enabled {
                 continue;
             }
-            if dc.primary_countries.iter().any(|c| c.eq_ignore_ascii_case(country_code)) {
+            if dc
+                .primary_countries
+                .iter()
+                .any(|c| c.eq_ignore_ascii_case(country_code))
+            {
                 if let Some(status) = health.get(&dc.id) {
                     if status.healthy {
                         return Some(dc.upstream_pool.clone());
@@ -294,14 +356,16 @@ impl GslbRouter {
         let health = self.health.read();
 
         dcs.iter()
-            .filter(|dc| {
-                dc.enabled && health.get(&dc.id).map(|s| s.healthy).unwrap_or(false)
-            })
+            .filter(|dc| dc.enabled && health.get(&dc.id).map(|s| s.healthy).unwrap_or(false))
             .min_by(|a, b| {
                 let la = health.get(&a.id).map(|s| s.latency_ms).unwrap_or(f64::MAX);
                 let lb = health.get(&b.id).map(|s| s.latency_ms).unwrap_or(f64::MAX);
-                if la.is_nan() { return std::cmp::Ordering::Greater; }
-                if lb.is_nan() { return std::cmp::Ordering::Less; }
+                if la.is_nan() {
+                    return std::cmp::Ordering::Greater;
+                }
+                if lb.is_nan() {
+                    return std::cmp::Ordering::Less;
+                }
                 la.partial_cmp(&lb).unwrap_or(std::cmp::Ordering::Equal)
             })
             .map(|dc| dc.upstream_pool.clone())
@@ -314,9 +378,7 @@ impl GslbRouter {
 
         let healthy_dcs: Vec<&DataCenter> = dcs
             .iter()
-            .filter(|dc| {
-                dc.enabled && health.get(&dc.id).map(|s| s.healthy).unwrap_or(false)
-            })
+            .filter(|dc| dc.enabled && health.get(&dc.id).map(|s| s.healthy).unwrap_or(false))
             .collect();
 
         if healthy_dcs.is_empty() {
@@ -459,7 +521,10 @@ impl GslbRouter {
                         Some(pool) => {
                             let backends = pool.backends.load();
                             backends.first().map(|b| {
-                                let path = b.config.health_check_path.clone()
+                                let path = b
+                                    .config
+                                    .health_check_path
+                                    .clone()
                                     .unwrap_or_else(|| "/".to_string());
                                 (b.config.address.clone(), path)
                             })
@@ -483,14 +548,17 @@ impl GslbRouter {
                     // OwnedSemaphorePermit is 'static (holds an Arc<Semaphore>
                     // internally), so it can be moved into the spawned task.
                     // This bounds both spawn count and concurrent probe execution.
-                    let permit_guard = sem_clone.acquire_owned().await
+                    let permit_guard = sem_clone
+                        .acquire_owned()
+                        .await
                         .expect("semaphore is never closed");
                     tokio::spawn(async move {
                         let _permit = permit_guard;
                         let start = Instant::now();
                         let probe_result = tokio::time::timeout(
                             std::time::Duration::from_secs(5),
-                            probe_client.get(&format!("http://{}{}", addr, health_path))
+                            probe_client
+                                .get(&format!("http://{}{}", addr, health_path))
                                 .send(),
                         )
                         .await;
@@ -538,9 +606,24 @@ mod tests {
 
     fn make_router() -> GslbRouter {
         let router = GslbRouter::new(GslbPolicy::Geographic, 500.0, 3);
-        router.add_data_center(make_dc("us-east", GeoRegion::NorthAmerica, vec!["US", "CA"], 100));
-        router.add_data_center(make_dc("eu-west", GeoRegion::Europe, vec!["GB", "DE", "FR"], 100));
-        router.add_data_center(make_dc("ap-south", GeoRegion::Asia, vec!["IN", "SG", "JP"], 100));
+        router.add_data_center(make_dc(
+            "us-east",
+            GeoRegion::NorthAmerica,
+            vec!["US", "CA"],
+            100,
+        ));
+        router.add_data_center(make_dc(
+            "eu-west",
+            GeoRegion::Europe,
+            vec!["GB", "DE", "FR"],
+            100,
+        ));
+        router.add_data_center(make_dc(
+            "ap-south",
+            GeoRegion::Asia,
+            vec!["IN", "SG", "JP"],
+            100,
+        ));
         router
     }
 
@@ -743,8 +826,14 @@ mod tests {
     fn test_gslb_policy_from_str() {
         assert_eq!(GslbPolicy::from_str("geographic"), GslbPolicy::Geographic);
         assert_eq!(GslbPolicy::from_str("latency"), GslbPolicy::LatencyBased);
-        assert_eq!(GslbPolicy::from_str("weighted"), GslbPolicy::WeightedRoundRobin);
-        assert_eq!(GslbPolicy::from_str("geo_latency"), GslbPolicy::GeographicWithLatencyFailover);
+        assert_eq!(
+            GslbPolicy::from_str("weighted"),
+            GslbPolicy::WeightedRoundRobin
+        );
+        assert_eq!(
+            GslbPolicy::from_str("geo_latency"),
+            GslbPolicy::GeographicWithLatencyFailover
+        );
     }
 
     #[test]
@@ -840,7 +929,11 @@ mod tests {
             h.await.unwrap();
         }
         let max = max_seen.load(std::sync::atomic::Ordering::SeqCst);
-        assert!(max <= 10, "max concurrent tasks {} exceeded semaphore cap 10", max);
+        assert!(
+            max <= 10,
+            "max concurrent tasks {} exceeded semaphore cap 10",
+            max
+        );
         assert!(max > 0, "no tasks executed");
     }
 
@@ -853,7 +946,11 @@ mod tests {
         let statuses = router.health_statuses();
         let us = statuses.iter().find(|s| s.dc_id == "us-east").unwrap();
         assert!(!us.healthy, "NaN-latency DC should be marked unhealthy");
-        assert_eq!(us.latency_ms, f64::MAX, "NaN should be sanitized to f64::MAX");
+        assert_eq!(
+            us.latency_ms,
+            f64::MAX,
+            "NaN should be sanitized to f64::MAX"
+        );
     }
 
     #[test]

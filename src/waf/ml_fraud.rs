@@ -12,9 +12,9 @@
 use arc_swap::ArcSwap;
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use tokio::sync::{mpsc, RwLock};
+use std::sync::atomic::{AtomicBool, Ordering};
+use tokio::sync::{RwLock, mpsc};
 use tracing::{error, info, warn};
 use tract_onnx::prelude::*;
 
@@ -143,7 +143,9 @@ impl MlFraudEngine {
                     .model_for_path(&model_path_v)?
                     .into_optimized()?
                     .into_runnable()
-            }).await.unwrap_or_else(|e| Err(anyhow::anyhow!("JoinError: {}", e)));
+            })
+            .await
+            .unwrap_or_else(|e| Err(anyhow::anyhow!("JoinError: {}", e)));
 
             let model = match model_result {
                 Ok(m) => {
@@ -153,10 +155,15 @@ impl MlFraudEngine {
                 }
                 Err(e) => {
                     model_loaded_ref.store(false, Ordering::Relaxed);
-                    error!("ML Fraud Worker: Failed to load ONNX model, using rule-based fallback. Error: {}", e);
-                    warn!("ML Fraud Worker: ONNX model load failure — falling back to rule-based heuristic scoring. \
+                    error!(
+                        "ML Fraud Worker: Failed to load ONNX model, using rule-based fallback. Error: {}",
+                        e
+                    );
+                    warn!(
+                        "ML Fraud Worker: ONNX model load failure — falling back to rule-based heuristic scoring. \
                            Model path: '{}'. Fraud detection accuracy will be degraded until a valid model is loaded.",
-                           model_path_v_log);
+                        model_path_v_log
+                    );
                     if let Some(ref metric) = ml_load_failure_metric {
                         metric.inc();
                     }
@@ -225,7 +232,9 @@ impl MlFraudEngine {
                                 "Pass".to_string()
                             },
                         }
-                    }).await.unwrap_or_else(|_| MlLogEntry {
+                    })
+                    .await
+                    .unwrap_or_else(|_| MlLogEntry {
                         timestamp: event.timestamp,
                         ip: event.ip.clone(),
                         path: event.path.clone(),
@@ -241,7 +250,10 @@ impl MlFraudEngine {
 
                 // If Active Mode and marked fraud, ban the IP instantly
                 if log_entry.flagged && **mode_ref.load() == MlFraudMode::Active {
-                    warn!("ML Fraud Engine (ACTIVE): Detected fraud from IP {}, applying strike penalty", log_entry.ip);
+                    warn!(
+                        "ML Fraud Engine (ACTIVE): Detected fraud from IP {}, applying strike penalty",
+                        log_entry.ip
+                    );
                     reputation.add_strike(&log_entry.ip, 10); // Instant ban threshold
                 }
 
@@ -517,8 +529,14 @@ mod tests {
     #[test]
     fn test_model_loaded_flag_defaults_to_false() {
         let engine = MlFraudEngine::new();
-        assert!(!engine.is_model_loaded(), "model should not be loaded on fresh engine");
-        assert!(engine.is_fallback_mode(), "should be in fallback mode when no model loaded");
+        assert!(
+            !engine.is_model_loaded(),
+            "model should not be loaded on fresh engine"
+        );
+        assert!(
+            engine.is_fallback_mode(),
+            "should be in fallback mode when no model loaded"
+        );
     }
 
     #[tokio::test]
@@ -526,25 +544,36 @@ mod tests {
         let engine = MlFraudEngine::new();
         let reputation = IpReputationManager::new(10, 3600, None);
         // Load with a nonexistent model path — should trigger fallback
-        engine.load_model("/nonexistent/model.onnx", reputation, None).await;
+        engine
+            .load_model("/nonexistent/model.onnx", reputation, None)
+            .await;
         // Give the spawned worker a moment to attempt model load
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-        assert!(!engine.is_model_loaded(), "model should not be loaded for invalid path");
-        assert!(engine.is_fallback_mode(), "should be in fallback mode after load failure");
+        assert!(
+            !engine.is_model_loaded(),
+            "model should not be loaded for invalid path"
+        );
+        assert!(
+            engine.is_fallback_mode(),
+            "should be in fallback mode after load failure"
+        );
     }
 
     #[tokio::test]
     async fn test_load_model_failure_increments_metric() {
         let engine = MlFraudEngine::new();
         let reputation = IpReputationManager::new(10, 3600, None);
-        let counter = prometheus::IntCounter::new(
-            "test_ml_load_failures",
-            "test counter",
-        ).unwrap();
+        let counter = prometheus::IntCounter::new("test_ml_load_failures", "test counter").unwrap();
         assert_eq!(counter.get(), 0);
-        engine.load_model("/nonexistent/model.onnx", reputation, Some(counter.clone())).await;
+        engine
+            .load_model("/nonexistent/model.onnx", reputation, Some(counter.clone()))
+            .await;
         // Give the spawned worker time to attempt model load and increment counter
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-        assert_eq!(counter.get(), 1, "metric should be incremented on model load failure");
+        assert_eq!(
+            counter.get(),
+            1,
+            "metric should be incremented on model load failure"
+        );
     }
 }

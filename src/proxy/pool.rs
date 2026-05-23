@@ -146,7 +146,6 @@ impl ConnectionPool {
             .map(|kv| (kv.key().clone(), kv.value().len()))
             .collect()
     }
-
 }
 
 /// RAII wrapper around a pooled `TcpStream`. Implements `AsyncRead` and
@@ -216,10 +215,7 @@ impl AsyncWrite for PooledStream {
             .expect("PooledStream used after Drop began");
         Pin::new(inner).poll_write(cx, buf)
     }
-    fn poll_flush(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-    ) -> Poll<std::io::Result<()>> {
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
         let inner = self
             .get_mut()
             .stream
@@ -227,10 +223,7 @@ impl AsyncWrite for PooledStream {
             .expect("PooledStream used after Drop began");
         Pin::new(inner).poll_flush(cx)
     }
-    fn poll_shutdown(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-    ) -> Poll<std::io::Result<()>> {
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
         let inner = self
             .get_mut()
             .stream
@@ -243,7 +236,8 @@ impl AsyncWrite for PooledStream {
 impl Drop for PooledStream {
     fn drop(&mut self) {
         if let Some(stream) = self.stream.take() {
-            self.pool.release_sync(std::mem::take(&mut self.addr), stream);
+            self.pool
+                .release_sync(std::mem::take(&mut self.addr), stream);
         }
     }
 }
@@ -277,7 +271,10 @@ impl ConnectionPool {
             // Remove empty entries to avoid unbounded map growth
             idle.retain(|_, v| !v.is_empty());
             if total_reaped > 0 {
-                debug!("Connection pool reaper: removed {} expired connections", total_reaped);
+                debug!(
+                    "Connection pool reaper: removed {} expired connections",
+                    total_reaped
+                );
             }
         }
     }
@@ -347,8 +344,12 @@ mod tests {
         let a2 = l2.local_addr().unwrap().to_string();
 
         // Background acceptors so connect() completes
-        tokio::spawn(async move { let _ = l1.accept().await; });
-        tokio::spawn(async move { let _ = l2.accept().await; });
+        tokio::spawn(async move {
+            let _ = l1.accept().await;
+        });
+        tokio::spawn(async move {
+            let _ = l2.accept().await;
+        });
 
         let s1 = TcpStream::connect(&a1).await.unwrap();
         let s2 = TcpStream::connect(&a2).await.unwrap();
@@ -371,7 +372,9 @@ mod tests {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap().to_string();
         // Background acceptor so connect() succeeds.
-        tokio::spawn(async move { let _ = listener.accept().await; });
+        tokio::spawn(async move {
+            let _ = listener.accept().await;
+        });
 
         // Drop scope: acquire then drop.
         {
@@ -412,7 +415,9 @@ mod tests {
         let pool = Arc::new(ConnectionPool::new(4));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap().to_string();
-        tokio::spawn(async move { let _ = listener.accept().await; });
+        tokio::spawn(async move {
+            let _ = listener.accept().await;
+        });
 
         let pooled = pool.acquire_pooled(&addr).await.expect("acquire");
         let raw = pooled.take_stream();

@@ -54,7 +54,10 @@ pub enum ClusterBackend {
         client: Arc<tokio::sync::Mutex<Option<redis::Client>>>,
     },
     /// Gossip-based peer-to-peer sync (no external dependencies)
-    Gossip { bind_addr: String, seed_peers: Vec<String> },
+    Gossip {
+        bind_addr: String,
+        seed_peers: Vec<String>,
+    },
     /// Single-node mode (no-op)
     Standalone,
 }
@@ -62,9 +65,15 @@ pub enum ClusterBackend {
 impl std::fmt::Debug for ClusterBackend {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Etcd { endpoints, .. } => f.debug_struct("Etcd").field("endpoints", endpoints).finish(),
+            Self::Etcd { endpoints, .. } => f
+                .debug_struct("Etcd")
+                .field("endpoints", endpoints)
+                .finish(),
             Self::Redis { url, .. } => f.debug_struct("Redis").field("url", url).finish(),
-            Self::Gossip { bind_addr, seed_peers } => f
+            Self::Gossip {
+                bind_addr,
+                seed_peers,
+            } => f
                 .debug_struct("Gossip")
                 .field("bind_addr", bind_addr)
                 .field("seed_peers", seed_peers)
@@ -95,14 +104,18 @@ impl ClusterState {
     /// * `backend` - Which storage engine to use (etcd, Redis, Gossip, or Standalone).
     /// * `node_id` - A unique identifier for this Phalanx instance.
     pub fn new(backend: ClusterBackend, node_id: String, bind_addr: String) -> Self {
-        let gossip_state = if let ClusterBackend::Gossip { ref bind_addr, ref seed_peers } = backend {
-            let seed_addrs: Vec<std::net::SocketAddr> = seed_peers
-                .iter()
-                .filter_map(|s| s.parse().ok())
-                .collect();
+        let gossip_state = if let ClusterBackend::Gossip {
+            ref bind_addr,
+            ref seed_peers,
+        } = backend
+        {
+            let seed_addrs: Vec<std::net::SocketAddr> =
+                seed_peers.iter().filter_map(|s| s.parse().ok()).collect();
             let config = GossipConfig {
                 node_id: node_id.clone(),
-                bind_addr: bind_addr.parse().unwrap_or_else(|_| "0.0.0.0:7946".parse().unwrap()),
+                bind_addr: bind_addr
+                    .parse()
+                    .unwrap_or_else(|_| "0.0.0.0:7946".parse().unwrap()),
                 seed_peers: seed_addrs,
                 ..Default::default()
             };
@@ -113,8 +126,16 @@ impl ClusterState {
             None
         };
 
-        info!("Cluster state initialized: node_id={}, backend={:?}", node_id, backend);
-        Self { backend, node_id, gossip_state, bind_addr }
+        info!(
+            "Cluster state initialized: node_id={}, backend={:?}",
+            node_id, backend
+        );
+        Self {
+            backend,
+            node_id,
+            gossip_state,
+            bind_addr,
+        }
     }
 
     /// Stores a key-value pair in the cluster KV store with an optional TTL.
@@ -270,8 +291,8 @@ impl ClusterState {
             ClusterBackend::Gossip { .. } => {
                 if let Some(gs) = &self.gossip_state {
                     if let Some(val) = gs.get(key) {
-                        let entry: ClusterEntry =
-                            serde_json::from_str(&val).map_err(|e| format!("deserialize: {}", e))?;
+                        let entry: ClusterEntry = serde_json::from_str(&val)
+                            .map_err(|e| format!("deserialize: {}", e))?;
                         Ok(Some(entry))
                     } else {
                         Ok(None)
@@ -429,20 +450,32 @@ mod tests {
 
     #[test]
     fn test_cluster_state_standalone_creation() {
-        let state = ClusterState::new(ClusterBackend::Standalone, "node-1".to_string(), "127.0.0.1:9090".to_string());
+        let state = ClusterState::new(
+            ClusterBackend::Standalone,
+            "node-1".to_string(),
+            "127.0.0.1:9090".to_string(),
+        );
         assert_eq!(state.node_id(), "node-1");
     }
 
     #[tokio::test]
     async fn test_standalone_put_ok() {
-        let state = ClusterState::new(ClusterBackend::Standalone, "n1".to_string(), "127.0.0.1:9090".to_string());
+        let state = ClusterState::new(
+            ClusterBackend::Standalone,
+            "n1".to_string(),
+            "127.0.0.1:9090".to_string(),
+        );
         let result = state.put("key", "value", Some(60)).await;
         assert!(result.is_ok());
     }
 
     #[tokio::test]
     async fn test_standalone_get_returns_none() {
-        let state = ClusterState::new(ClusterBackend::Standalone, "n1".to_string(), "127.0.0.1:9090".to_string());
+        let state = ClusterState::new(
+            ClusterBackend::Standalone,
+            "n1".to_string(),
+            "127.0.0.1:9090".to_string(),
+        );
         let result = state.get("key").await;
         assert!(result.is_ok());
         assert!(result.unwrap().is_none());
@@ -450,42 +483,64 @@ mod tests {
 
     #[tokio::test]
     async fn test_standalone_delete_ok() {
-        let state = ClusterState::new(ClusterBackend::Standalone, "n1".to_string(), "127.0.0.1:9090".to_string());
+        let state = ClusterState::new(
+            ClusterBackend::Standalone,
+            "n1".to_string(),
+            "127.0.0.1:9090".to_string(),
+        );
         let result = state.delete("key").await;
         assert!(result.is_ok());
     }
 
     #[tokio::test]
     async fn test_standalone_sticky_session_returns_none() {
-        let state = ClusterState::new(ClusterBackend::Standalone, "n1".to_string(), "127.0.0.1:9090".to_string());
+        let state = ClusterState::new(
+            ClusterBackend::Standalone,
+            "n1".to_string(),
+            "127.0.0.1:9090".to_string(),
+        );
         let result = state.lookup_sticky_session("sess-1").await;
         assert!(result.is_none());
     }
 
     #[tokio::test]
     async fn test_standalone_share_sticky_session_ok() {
-        let state = ClusterState::new(ClusterBackend::Standalone, "n1".to_string(), "127.0.0.1:9090".to_string());
+        let state = ClusterState::new(
+            ClusterBackend::Standalone,
+            "n1".to_string(),
+            "127.0.0.1:9090".to_string(),
+        );
         let result = state.share_sticky_session("sess", "10.0.0.1:80", 60).await;
         assert!(result.is_ok());
     }
 
     #[tokio::test]
     async fn test_standalone_heartbeat() {
-        let state = ClusterState::new(ClusterBackend::Standalone, "n1".to_string(), "127.0.0.1:9090".to_string());
+        let state = ClusterState::new(
+            ClusterBackend::Standalone,
+            "n1".to_string(),
+            "127.0.0.1:9090".to_string(),
+        );
         let result = state.heartbeat(30).await;
         assert!(result.is_ok());
     }
 
     #[test]
     fn test_redis_backend_debug() {
-        let backend = ClusterBackend::Redis { url: "redis://localhost".to_string(), client: Arc::new(tokio::sync::Mutex::new(None)) };
+        let backend = ClusterBackend::Redis {
+            url: "redis://localhost".to_string(),
+            client: Arc::new(tokio::sync::Mutex::new(None)),
+        };
         let debug_str = format!("{:?}", backend);
         assert!(debug_str.contains("Redis"));
     }
 
     #[test]
     fn test_etcd_backend_debug() {
-        let backend = ClusterBackend::Etcd { endpoints: vec!["http://localhost:2379".to_string()], client: Arc::new(tokio::sync::Mutex::new(None)) };
+        let backend = ClusterBackend::Etcd {
+            endpoints: vec!["http://localhost:2379".to_string()],
+            client: Arc::new(tokio::sync::Mutex::new(None)),
+        };
         let debug_str = format!("{:?}", backend);
         assert!(debug_str.contains("Etcd"));
     }
@@ -503,8 +558,15 @@ mod tests {
         assert!(state.gossip_state.is_some());
 
         // put + get
-        state.put("test-key", "test-value", Some(300)).await.unwrap();
-        let entry = state.get("test-key").await.unwrap().expect("should find key");
+        state
+            .put("test-key", "test-value", Some(300))
+            .await
+            .unwrap();
+        let entry = state
+            .get("test-key")
+            .await
+            .unwrap()
+            .expect("should find key");
         assert_eq!(entry.value, "test-value");
         assert_eq!(entry.node_id, "gossip-node-1");
 
@@ -523,7 +585,10 @@ mod tests {
             "gossip-node-1".to_string(),
             "127.0.0.1:9090".to_string(),
         );
-        state.share_sticky_session("user-42", "10.0.0.5:8080", 60).await.unwrap();
+        state
+            .share_sticky_session("user-42", "10.0.0.5:8080", 60)
+            .await
+            .unwrap();
         let backend = state.lookup_sticky_session("user-42").await;
         assert_eq!(backend, Some("10.0.0.5:8080".to_string()));
     }

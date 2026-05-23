@@ -107,7 +107,11 @@ impl ResponseCache {
             .store
             .invalidate_entries_if(move |k, _v| k.starts_with(&prefix_owned))
         {
-            tracing::warn!("Failed to purge cache entries by prefix '{}': {}", prefix, e);
+            tracing::warn!(
+                "Failed to purge cache entries by prefix '{}': {}",
+                prefix,
+                e
+            );
             return 0;
         }
         self.store.run_pending_tasks().await;

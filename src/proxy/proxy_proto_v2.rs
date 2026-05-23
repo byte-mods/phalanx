@@ -214,12 +214,7 @@ mod tests {
     use super::*;
 
     /// Build a minimal valid PP v2 packet for IPv4 PROXY command.
-    fn ipv4_packet(
-        src: [u8; 4],
-        dst: [u8; 4],
-        src_port: u16,
-        dst_port: u16,
-    ) -> Vec<u8> {
+    fn ipv4_packet(src: [u8; 4], dst: [u8; 4], src_port: u16, dst_port: u16) -> Vec<u8> {
         let mut buf = PP2_SIGNATURE.to_vec();
         buf.push(0x21); // version=2 (0x2), command=PROXY (0x1)
         buf.push(0x11); // AF_INET (0x1), STREAM (0x1)
@@ -231,12 +226,7 @@ mod tests {
         buf
     }
 
-    fn ipv6_packet(
-        src: [u8; 16],
-        dst: [u8; 16],
-        src_port: u16,
-        dst_port: u16,
-    ) -> Vec<u8> {
+    fn ipv6_packet(src: [u8; 16], dst: [u8; 16], src_port: u16, dst_port: u16) -> Vec<u8> {
         let mut buf = PP2_SIGNATURE.to_vec();
         buf.push(0x21); // version=2, PROXY
         buf.push(0x21); // AF_INET6 (0x2), STREAM (0x1)

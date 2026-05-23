@@ -1,3 +1,4 @@
+use base64::Engine;
 /// Advanced bot classification beyond the regex-based detection in `rules.rs`.
 ///
 /// This module provides:
@@ -5,11 +6,10 @@
 /// - Rate-anomaly scoring for bot-like traffic patterns
 /// - A CAPTCHA challenge interface with provider-specific rendering and verification hooks
 use dashmap::DashMap;
+use rand::RngExt;
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
-use base64::Engine;
-use rand::RngExt;
 
 /// Classification of a detected bot.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -33,10 +33,26 @@ pub fn classify_user_agent(ua: &str) -> BotClass {
 
     // ── Known-bad scanners / attack tools ────────────────────────────────────
     const BAD_BOTS: &[&str] = &[
-        "sqlmap", "nikto", "masscan", "nmap", "nuclei", "zgrab",
-        "dirbuster", "gobuster", "wfuzz", "burpsuite", "hydra",
-        "acunetix", "nessus", "openvas", "w3af", "whatweb",
-        "httprint", "havij", "pangolin", "jbrofuzz",
+        "sqlmap",
+        "nikto",
+        "masscan",
+        "nmap",
+        "nuclei",
+        "zgrab",
+        "dirbuster",
+        "gobuster",
+        "wfuzz",
+        "burpsuite",
+        "hydra",
+        "acunetix",
+        "nessus",
+        "openvas",
+        "w3af",
+        "whatweb",
+        "httprint",
+        "havij",
+        "pangolin",
+        "jbrofuzz",
     ];
     for sig in BAD_BOTS {
         if ua_lower.contains(sig) {
@@ -46,13 +62,22 @@ pub fn classify_user_agent(ua: &str) -> BotClass {
 
     // ── Known-good crawlers ────────────────────────────────────────────────
     const GOOD_BOTS: &[&str] = &[
-        "googlebot", "bingbot", "slurp",          // major search engines
-        "duckduckbot", "baiduspider", "yandexbot",
-        "applebot", "facebot", "twitterbot",       // social
-        "linkedinbot", "pinterestbot",
-        "ia_archiver",                              // Internet Archive
-        "screaming frog",                           // SEO tool (intentional)
-        "uptimerobot", "pingdom", "statuscake",    // monitoring
+        "googlebot",
+        "bingbot",
+        "slurp", // major search engines
+        "duckduckbot",
+        "baiduspider",
+        "yandexbot",
+        "applebot",
+        "facebot",
+        "twitterbot", // social
+        "linkedinbot",
+        "pinterestbot",
+        "ia_archiver",    // Internet Archive
+        "screaming frog", // SEO tool (intentional)
+        "uptimerobot",
+        "pingdom",
+        "statuscake", // monitoring
     ];
     for sig in GOOD_BOTS {
         if ua_lower.contains(sig) {
@@ -62,9 +87,21 @@ pub fn classify_user_agent(ua: &str) -> BotClass {
 
     // ── Generic / unknown bots ────────────────────────────────────────────
     const GENERIC_BOT_SIGS: &[&str] = &[
-        "bot", "crawler", "spider", "scraper", "archiver",
-        "fetch", "wget", "curl", "python-requests", "go-http-client",
-        "libwww", "java/", "okhttp", "axios", "got/",
+        "bot",
+        "crawler",
+        "spider",
+        "scraper",
+        "archiver",
+        "fetch",
+        "wget",
+        "curl",
+        "python-requests",
+        "go-http-client",
+        "libwww",
+        "java/",
+        "okhttp",
+        "axios",
+        "got/",
     ];
     for sig in GENERIC_BOT_SIGS {
         if ua_lower.contains(sig) {
@@ -559,7 +596,10 @@ mod tests {
 
     #[test]
     fn test_classify_generic_bot_python_requests() {
-        assert_eq!(classify_user_agent("python-requests/2.28.0"), BotClass::Unknown);
+        assert_eq!(
+            classify_user_agent("python-requests/2.28.0"),
+            BotClass::Unknown
+        );
     }
 
     #[test]
@@ -570,7 +610,9 @@ mod tests {
     #[test]
     fn test_classify_human_chrome() {
         assert_eq!(
-            classify_user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0"),
+            classify_user_agent(
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0"
+            ),
             BotClass::Human
         );
     }
@@ -578,7 +620,9 @@ mod tests {
     #[test]
     fn test_classify_human_firefox() {
         assert_eq!(
-            classify_user_agent("Mozilla/5.0 (X11; Linux x86_64; rv:121.0) Gecko/20100101 Firefox/121.0"),
+            classify_user_agent(
+                "Mozilla/5.0 (X11; Linux x86_64; rv:121.0) Gecko/20100101 Firefox/121.0"
+            ),
             BotClass::Human
         );
     }
@@ -640,20 +684,43 @@ mod tests {
 
     #[test]
     fn test_captcha_provider_from_str() {
-        assert_eq!(CaptchaProvider::from_str("hcaptcha"), CaptchaProvider::HCaptcha);
-        assert_eq!(CaptchaProvider::from_str("turnstile"), CaptchaProvider::Turnstile);
-        assert_eq!(CaptchaProvider::from_str("cloudflare"), CaptchaProvider::Turnstile);
-        assert_eq!(CaptchaProvider::from_str("recaptcha"), CaptchaProvider::RecaptchaV2);
-        assert_eq!(CaptchaProvider::from_str("unknown"), CaptchaProvider::HCaptcha);
+        assert_eq!(
+            CaptchaProvider::from_str("hcaptcha"),
+            CaptchaProvider::HCaptcha
+        );
+        assert_eq!(
+            CaptchaProvider::from_str("turnstile"),
+            CaptchaProvider::Turnstile
+        );
+        assert_eq!(
+            CaptchaProvider::from_str("cloudflare"),
+            CaptchaProvider::Turnstile
+        );
+        assert_eq!(
+            CaptchaProvider::from_str("recaptcha"),
+            CaptchaProvider::RecaptchaV2
+        );
+        assert_eq!(
+            CaptchaProvider::from_str("unknown"),
+            CaptchaProvider::HCaptcha
+        );
     }
 
     #[test]
     fn test_captcha_provider_urls() {
         assert!(CaptchaProvider::HCaptcha.script_url().contains("hcaptcha"));
-        assert!(CaptchaProvider::Turnstile.script_url().contains("cloudflare"));
+        assert!(
+            CaptchaProvider::Turnstile
+                .script_url()
+                .contains("cloudflare")
+        );
         assert!(CaptchaProvider::RecaptchaV2.script_url().contains("google"));
         assert!(CaptchaProvider::HCaptcha.verify_url().contains("hcaptcha"));
-        assert!(CaptchaProvider::Turnstile.verify_url().contains("cloudflare"));
+        assert!(
+            CaptchaProvider::Turnstile
+                .verify_url()
+                .contains("cloudflare")
+        );
         assert!(CaptchaProvider::RecaptchaV2.verify_url().contains("google"));
     }
 
@@ -667,8 +734,14 @@ mod tests {
     #[test]
     fn test_captcha_provider_form_field() {
         assert_eq!(CaptchaProvider::HCaptcha.form_field(), "h-captcha-response");
-        assert_eq!(CaptchaProvider::Turnstile.form_field(), "cf-turnstile-response");
-        assert_eq!(CaptchaProvider::RecaptchaV2.form_field(), "g-recaptcha-response");
+        assert_eq!(
+            CaptchaProvider::Turnstile.form_field(),
+            "cf-turnstile-response"
+        );
+        assert_eq!(
+            CaptchaProvider::RecaptchaV2.form_field(),
+            "g-recaptcha-response"
+        );
     }
 
     #[test]
@@ -726,7 +799,10 @@ mod tests {
     fn test_captcha_verified_ip_bypasses_challenge() {
         let mgr = CaptchaManager::new("k".into(), "s".into(), CaptchaProvider::HCaptcha, 0.01);
         // Manually mark as verified
-        mgr.verified_ips.lock().unwrap().insert("10.0.0.3".to_string());
+        mgr.verified_ips
+            .lock()
+            .unwrap()
+            .insert("10.0.0.3".to_string());
         // Even with high rate, verified IPs pass
         for _ in 0..10 {
             mgr.evaluate("10.0.0.3", "python-requests/2.28");
@@ -739,14 +815,20 @@ mod tests {
     fn test_captcha_is_verified() {
         let mgr = CaptchaManager::new("k".into(), "s".into(), CaptchaProvider::HCaptcha, 5.0);
         assert!(!mgr.is_verified("10.0.0.1"));
-        mgr.verified_ips.lock().unwrap().insert("10.0.0.1".to_string());
+        mgr.verified_ips
+            .lock()
+            .unwrap()
+            .insert("10.0.0.1".to_string());
         assert!(mgr.is_verified("10.0.0.1"));
     }
 
     #[test]
     fn test_captcha_revoke() {
         let mgr = CaptchaManager::new("k".into(), "s".into(), CaptchaProvider::HCaptcha, 5.0);
-        mgr.verified_ips.lock().unwrap().insert("10.0.0.1".to_string());
+        mgr.verified_ips
+            .lock()
+            .unwrap()
+            .insert("10.0.0.1".to_string());
         assert!(mgr.is_verified("10.0.0.1"));
         mgr.revoke("10.0.0.1");
         assert!(!mgr.is_verified("10.0.0.1"));
@@ -755,8 +837,14 @@ mod tests {
     #[test]
     fn test_captcha_clear_all() {
         let mgr = CaptchaManager::new("k".into(), "s".into(), CaptchaProvider::HCaptcha, 5.0);
-        mgr.verified_ips.lock().unwrap().insert("10.0.0.1".to_string());
-        mgr.verified_ips.lock().unwrap().insert("10.0.0.2".to_string());
+        mgr.verified_ips
+            .lock()
+            .unwrap()
+            .insert("10.0.0.1".to_string());
+        mgr.verified_ips
+            .lock()
+            .unwrap()
+            .insert("10.0.0.2".to_string());
         mgr.clear_all();
         assert!(!mgr.is_verified("10.0.0.1"));
         assert!(!mgr.is_verified("10.0.0.2"));
@@ -764,7 +852,12 @@ mod tests {
 
     #[test]
     fn test_captcha_challenge_html_contains_provider_elements() {
-        let mgr = CaptchaManager::new("my-site-key".into(), "s".into(), CaptchaProvider::HCaptcha, 5.0);
+        let mgr = CaptchaManager::new(
+            "my-site-key".into(),
+            "s".into(),
+            CaptchaProvider::HCaptcha,
+            5.0,
+        );
         let html = mgr.challenge_html();
         assert!(html.contains("my-site-key"));
         assert!(html.contains("hcaptcha.com"));
@@ -783,7 +876,12 @@ mod tests {
 
     #[test]
     fn test_captcha_challenge_html_recaptcha() {
-        let mgr = CaptchaManager::new("rc-key".into(), "s".into(), CaptchaProvider::RecaptchaV2, 5.0);
+        let mgr = CaptchaManager::new(
+            "rc-key".into(),
+            "s".into(),
+            CaptchaProvider::RecaptchaV2,
+            5.0,
+        );
         let html = mgr.challenge_html();
         assert!(html.contains("rc-key"));
         assert!(html.contains("google.com/recaptcha"));

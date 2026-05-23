@@ -18,11 +18,11 @@
 //!   backends between UP/DOWN and advance the circuit breaker state machine.
 
 use arc_swap::ArcSwap;
-use smallvec::SmallVec;
 use dashmap::DashMap;
+use smallvec::SmallVec;
 use std::collections::HashSet;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::net::TcpStream;
 use tokio::time::{Duration, sleep};
@@ -149,7 +149,8 @@ impl BackendNode {
             // Fresh trip from CLOSED: reset to initial backoff
             _ => self.config.circuit_initial_backoff_secs,
         };
-        self.circuit_backoff_secs.store(new_backoff, Ordering::Release);
+        self.circuit_backoff_secs
+            .store(new_backoff, Ordering::Release);
         self.circuit_open_at.store(now_secs(), Ordering::Release);
         warn!(
             "Circuit breaker OPEN for backend {} (backoff: {}s)",
@@ -453,15 +454,13 @@ impl UpstreamPool {
             // Selects the backend with the fewest active connections,
             // breaking ties by preferring higher effective weight as a proxy for
             // capacity. This combines connection awareness with weight awareness.
-            LoadBalancingAlgorithm::LeastTime => healthy
-                .into_iter()
-                .min_by(|a, b| {
-                    let a_conns = a.active_connections.load(Ordering::Relaxed);
-                    let b_conns = b.active_connections.load(Ordering::Relaxed);
-                    a_conns
-                        .cmp(&b_conns)
-                        .then_with(|| a.effective_weight().cmp(&b.effective_weight()).reverse())
-                }),
+            LoadBalancingAlgorithm::LeastTime => healthy.into_iter().min_by(|a, b| {
+                let a_conns = a.active_connections.load(Ordering::Relaxed);
+                let b_conns = b.active_connections.load(Ordering::Relaxed);
+                a_conns
+                    .cmp(&b_conns)
+                    .then_with(|| a.effective_weight().cmp(&b.effective_weight()).reverse())
+            }),
 
             // ── Algorithm 8: Consistent Hashing ──────────────────────
             // Builds a virtual-node ring where each backend gets
@@ -513,9 +512,7 @@ impl UpstreamPool {
         // address-sorted order so reordering of `healthy` doesn't invalidate.
         // Sort indices instead of cloning addresses.
         let mut order: SmallVec<[usize; 8]> = (0..healthy.len()).collect();
-        order.sort_unstable_by(|&a, &b| {
-            healthy[a].config.address.cmp(&healthy[b].config.address)
-        });
+        order.sort_unstable_by(|&a, &b| healthy[a].config.address.cmp(&healthy[b].config.address));
         let sig: u64 = {
             let mut h = rustc_hash::FxHasher::default();
             for &i in &order {
@@ -548,7 +545,10 @@ impl UpstreamPool {
             }
         }
         entries.sort_unstable_by_key(|(hash, _)| *hash);
-        let new_ring = ConsistentHashRing { signature: sig, entries };
+        let new_ring = ConsistentHashRing {
+            signature: sig,
+            entries,
+        };
         self.consistent_hash_ring.store(Arc::new(Some(new_ring)));
         // Re-load to return the just-stored value with the right Arc identity.
         self.consistent_hash_ring.load_full()
@@ -829,7 +829,9 @@ async fn health_check_loop(
     let _timeout = Duration::from_secs(if timeout_secs > 0 { timeout_secs } else { 3 });
     info!(
         "Starting health check loop for pool: {} (interval: {}s, timeout: {}s)",
-        pool_name, interval.as_secs(), _timeout.as_secs()
+        pool_name,
+        interval.as_secs(),
+        _timeout.as_secs()
     );
 
     let client = reqwest::Client::builder()
@@ -936,7 +938,10 @@ async fn health_check_loop(
                 if !still_ok {
                     backend.is_healthy.store(false, Ordering::Release);
                     backend.trip_circuit();
-                    warn!("Backend {} in pool {} is DOWN (health check)", address, pool_name);
+                    warn!(
+                        "Backend {} in pool {} is DOWN (health check)",
+                        address, pool_name
+                    );
                 }
             }
         }
@@ -944,7 +949,11 @@ async fn health_check_loop(
 }
 
 /// Perform an HTTP GET to `url`; return `Ok(true)` if status matches `expected`.
-async fn reqwest_health_get(client: &reqwest::Client, url: &str, expected_status: u16) -> Result<bool, String> {
+async fn reqwest_health_get(
+    client: &reqwest::Client,
+    url: &str,
+    expected_status: u16,
+) -> Result<bool, String> {
     let resp = client.get(url).send().await.map_err(|e| e.to_string())?;
     Ok(resp.status().as_u16() == expected_status)
 }
@@ -1127,7 +1136,10 @@ mod tests {
 
         assert!(node.is_circuit_closed(), "circuit should start closed");
         node.trip_circuit();
-        assert!(!node.is_circuit_closed(), "circuit should be OPEN after trip");
+        assert!(
+            !node.is_circuit_closed(),
+            "circuit should be OPEN after trip"
+        );
     }
 
     #[test]
@@ -1136,7 +1148,10 @@ mod tests {
         node.config.circuit_breaker = false;
 
         node.trip_circuit(); // Should be no-op
-        assert!(node.is_circuit_closed(), "circuit should always be closed when disabled");
+        assert!(
+            node.is_circuit_closed(),
+            "circuit should always be closed when disabled"
+        );
     }
 
     #[test]
@@ -1150,7 +1165,10 @@ mod tests {
         assert!(!node.is_circuit_closed());
 
         node.record_circuit_success();
-        assert!(node.is_circuit_closed(), "circuit should close after successful probe");
+        assert!(
+            node.is_circuit_closed(),
+            "circuit should close after successful probe"
+        );
     }
 
     // ── Helper functions ──────────────────────────────────────────────────────
@@ -1243,7 +1261,12 @@ mod tests {
         // 10.0.0.1 with weight 3 should be picked ~75% of the time
         let a_count = *counts.get("10.0.0.1:8080").unwrap_or(&0);
         let b_count = *counts.get("10.0.0.2:8080").unwrap_or(&0);
-        assert!(a_count > b_count * 2, "higher weight should be picked more often: a={}, b={}", a_count, b_count);
+        assert!(
+            a_count > b_count * 2,
+            "higher weight should be picked more often: a={}, b={}",
+            a_count,
+            b_count
+        );
     }
 
     // ── IP hash ─────────────────────────────────────────────────────────────
@@ -1253,9 +1276,18 @@ mod tests {
         let pool_config = crate::config::UpstreamPoolConfig {
             algorithm: LoadBalancingAlgorithm::IpHash,
             backends: vec![
-                BackendConfig { address: "10.0.0.1:8080".to_string(), ..Default::default() },
-                BackendConfig { address: "10.0.0.2:8080".to_string(), ..Default::default() },
-                BackendConfig { address: "10.0.0.3:8080".to_string(), ..Default::default() },
+                BackendConfig {
+                    address: "10.0.0.1:8080".to_string(),
+                    ..Default::default()
+                },
+                BackendConfig {
+                    address: "10.0.0.2:8080".to_string(),
+                    ..Default::default()
+                },
+                BackendConfig {
+                    address: "10.0.0.3:8080".to_string(),
+                    ..Default::default()
+                },
             ],
             keepalive: 0,
             srv_discover: None,
@@ -1283,9 +1315,18 @@ mod tests {
         let pool_config = UpstreamPoolConfig {
             algorithm: LoadBalancingAlgorithm::ConsistentHash,
             backends: vec![
-                BackendConfig { address: "10.0.0.1:8080".to_string(), ..Default::default() },
-                BackendConfig { address: "10.0.0.2:8080".to_string(), ..Default::default() },
-                BackendConfig { address: "10.0.0.3:8080".to_string(), ..Default::default() },
+                BackendConfig {
+                    address: "10.0.0.1:8080".to_string(),
+                    ..Default::default()
+                },
+                BackendConfig {
+                    address: "10.0.0.2:8080".to_string(),
+                    ..Default::default()
+                },
+                BackendConfig {
+                    address: "10.0.0.3:8080".to_string(),
+                    ..Default::default()
+                },
             ],
             keepalive: 0,
             srv_discover: None,
@@ -1323,10 +1364,22 @@ mod tests {
         let pool_config = UpstreamPoolConfig {
             algorithm: LoadBalancingAlgorithm::Random,
             backends: vec![
-                BackendConfig { address: "10.0.0.1:8080".to_string(), ..Default::default() },
-                BackendConfig { address: "10.0.0.2:8080".to_string(), ..Default::default() },
-                BackendConfig { address: "10.0.0.3:8080".to_string(), ..Default::default() },
-                BackendConfig { address: "10.0.0.4:8080".to_string(), ..Default::default() },
+                BackendConfig {
+                    address: "10.0.0.1:8080".to_string(),
+                    ..Default::default()
+                },
+                BackendConfig {
+                    address: "10.0.0.2:8080".to_string(),
+                    ..Default::default()
+                },
+                BackendConfig {
+                    address: "10.0.0.3:8080".to_string(),
+                    ..Default::default()
+                },
+                BackendConfig {
+                    address: "10.0.0.4:8080".to_string(),
+                    ..Default::default()
+                },
             ],
             keepalive: 0,
             srv_discover: None,
@@ -1342,6 +1395,10 @@ mod tests {
         }
         // 1000 picks across 4 backends — chance of missing one is ≈ 4 * (3/4)^1000,
         // i.e. astronomically small. If this ever flakes, the RNG is broken.
-        assert_eq!(seen.len(), 4, "Random LB must hit every backend; saw {seen:?}");
+        assert_eq!(
+            seen.len(),
+            4,
+            "Random LB must hit every backend; saw {seen:?}"
+        );
     }
 }

@@ -4,8 +4,8 @@
 //! background tasks (e.g. for multiplexed stream handling). This module
 //! provides a thin wrapper that delegates to `tokio::spawn`.
 
-use std::future::Future;
 use hyper::rt::Executor;
+use std::future::Future;
 
 /// A zero-sized executor that bridges hyper's `Executor` trait to Tokio.
 ///

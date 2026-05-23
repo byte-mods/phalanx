@@ -91,7 +91,11 @@ pub fn translate_request(
 fn base64_decode(input: &[u8]) -> Result<Vec<u8>, ()> {
     use base64::Engine;
     // Strip whitespace that browsers may include
-    let trimmed: Vec<u8> = input.iter().copied().filter(|b| !b.is_ascii_whitespace()).collect();
+    let trimmed: Vec<u8> = input
+        .iter()
+        .copied()
+        .filter(|b| !b.is_ascii_whitespace())
+        .collect();
     base64::engine::general_purpose::STANDARD
         .decode(&trimmed)
         .map_err(|_| ())
@@ -181,10 +185,7 @@ pub fn cors_preflight_response() -> Response<BoxBody<Bytes, hyper::Error>> {
     Response::builder()
         .status(StatusCode::NO_CONTENT)
         .header(hyper::header::ACCESS_CONTROL_ALLOW_ORIGIN, "*")
-        .header(
-            hyper::header::ACCESS_CONTROL_ALLOW_METHODS,
-            "POST, OPTIONS",
-        )
+        .header(hyper::header::ACCESS_CONTROL_ALLOW_METHODS, "POST, OPTIONS")
         .header(
             hyper::header::ACCESS_CONTROL_ALLOW_HEADERS,
             "content-type,x-grpc-web,x-user-agent,grpc-timeout",
@@ -203,7 +204,7 @@ mod tests {
     use super::*;
     use bytes::Bytes;
     use http_body_util::{BodyExt, Full};
-    use hyper::{header, Request, Response, StatusCode};
+    use hyper::{Request, Response, StatusCode, header};
 
     #[test]
     fn test_is_grpc_web_true() {
@@ -317,12 +318,7 @@ mod tests {
             .unwrap();
 
         let translated = translate_response(resp, false).await;
-        let body = translated
-            .into_body()
-            .collect()
-            .await
-            .unwrap()
-            .to_bytes();
+        let body = translated.into_body().collect().await.unwrap().to_bytes();
 
         // Body should contain original data + trailer frame (0x80 + len + trailer text)
         assert!(body.len() > 10);
@@ -331,7 +327,9 @@ mod tests {
         assert!(trailer_pos.is_some(), "trailer frame must be present");
         let pos = trailer_pos.unwrap();
         // 4 bytes of length after the 0x80 flag
-        let trailer_len = u32::from_be_bytes([body[pos + 1], body[pos + 2], body[pos + 3], body[pos + 4]]) as usize;
+        let trailer_len =
+            u32::from_be_bytes([body[pos + 1], body[pos + 2], body[pos + 3], body[pos + 4]])
+                as usize;
         let trailer_text = std::str::from_utf8(&body[pos + 5..pos + 5 + trailer_len]).unwrap();
         assert!(trailer_text.contains("grpc-status: 0"));
         assert!(trailer_text.contains("grpc-message: OK"));
@@ -351,18 +349,10 @@ mod tests {
             .unwrap();
 
         let translated = translate_response(resp, true).await;
-        let body = translated
-            .into_body()
-            .collect()
-            .await
-            .unwrap()
-            .to_bytes();
+        let body = translated.into_body().collect().await.unwrap().to_bytes();
 
         // Text encoding should produce valid base64
-        let decoded = base64::Engine::decode(
-            &base64::engine::general_purpose::STANDARD,
-            &body,
-        );
+        let decoded = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, &body);
         assert!(decoded.is_ok(), "body must be valid base64");
     }
 
@@ -379,12 +369,7 @@ mod tests {
             .unwrap();
 
         let translated = translate_response(resp, false).await;
-        let body = translated
-            .into_body()
-            .collect()
-            .await
-            .unwrap()
-            .to_bytes();
+        let body = translated.into_body().collect().await.unwrap().to_bytes();
 
         // No grpc-status/grpc-message headers → no trailer frame appended
         assert_eq!(&body[..], b"data");

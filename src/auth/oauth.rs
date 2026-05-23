@@ -134,7 +134,10 @@ pub async fn check(
         Ok(resp) => {
             let sub = resp.sub.clone();
             // Cache the result (include exp for TTL capping)
-            cache.insert(token.clone(), (resp.active, sub.clone(), Instant::now(), resp.exp));
+            cache.insert(
+                token.clone(),
+                (resp.active, sub.clone(), Instant::now(), resp.exp),
+            );
             if resp.active {
                 debug!("OAuth token active, scope={:?}", resp.scope);
                 (AuthResult::Allowed, sub)
@@ -276,7 +279,10 @@ mod tests {
     #[test]
     fn test_cache_hit_inactive_denied() {
         let cache = new_cache();
-        cache.insert("inactive-token".to_string(), (false, None, Instant::now(), None));
+        cache.insert(
+            "inactive-token".to_string(),
+            (false, None, Instant::now(), None),
+        );
         let rt = tokio::runtime::Runtime::new().unwrap();
         let (result, _) = rt.block_on(check(
             &bearer_headers("inactive-token"),
@@ -338,7 +344,12 @@ mod tests {
             - 10;
         cache.insert(
             "expired-token".to_string(),
-            (true, Some("user-1".to_string()), Instant::now(), Some(past_exp)),
+            (
+                true,
+                Some("user-1".to_string()),
+                Instant::now(),
+                Some(past_exp),
+            ),
         );
         let rt = tokio::runtime::Runtime::new().unwrap();
         let (result, _) = rt.block_on(check(

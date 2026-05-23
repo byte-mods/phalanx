@@ -48,7 +48,10 @@ fn shared_upstream_client() -> &'static reqwest::Client {
             .pool_max_idle_per_host(64)
             .build()
             .unwrap_or_else(|e| {
-                warn!("shared_upstream_client builder failed, falling back to default: {}", e);
+                warn!(
+                    "shared_upstream_client builder failed, falling back to default: {}",
+                    e
+                );
                 reqwest::Client::new()
             })
     })
@@ -71,7 +74,10 @@ fn shared_grpc_upstream_client() -> &'static reqwest::Client {
             .http2_prior_knowledge()
             .build()
             .unwrap_or_else(|e| {
-                warn!("shared_grpc_upstream_client builder failed, falling back to default: {}", e);
+                warn!(
+                    "shared_grpc_upstream_client builder failed, falling back to default: {}",
+                    e
+                );
                 reqwest::Client::new()
             })
     })
@@ -159,6 +165,121 @@ fn build_h3_grpc_web_response_body(
     }
 }
 
+/// Longest-prefix route resolution for HTTP/3.
+///
+/// Checks `dynamic_routes` (admin API CRUD) first, then falls back to
+/// `app_config.routes`. Returns `None` only when no routes exist at all.
+fn resolve_h3_route(
+    path: &str,
+    dynamic_routes: &dashmap::DashMap<String, crate::config::RouteConfig>,
+    app_config: &AppConfig,
+) -> Option<(String, crate::config::RouteConfig)> {
+    let mut best: Option<(String, crate::config::RouteConfig)> = None;
+    let mut best_len = 0usize;
+    for entry in dynamic_routes.iter() {
+        let (r_path, r_cfg) = entry.pair();
+        if path.starts_with(r_path.as_str()) && r_path.len() > best_len {
+            best = Some((r_path.clone(), r_cfg.clone()));
+            best_len = r_path.len();
+        }
+    }
+    for (r_path, r_cfg) in &app_config.routes {
+        if path.starts_with(r_path.as_str()) && r_path.len() > best_len {
+            best = Some((r_path.clone(), r_cfg.clone()));
+            best_len = r_path.len();
+        }
+    }
+    best.or_else(|| {
+        app_config
+            .routes
+            .get_key_value("/")
+            .map(|(k, v)| (k.clone(), v.clone()))
+    })
+}
+
+/// Builds a CORS preflight response for HTTP/3.
+///
+/// Returns `Some(response)` when the route has CORS enabled and the origin
+/// is allowed. Returns `None` when CORS is disabled or the origin is not
+/// in the allowed list.
+fn build_h3_cors_preflight_response(
+    r_config: &crate::config::RouteConfig,
+    origin: Option<&str>,
+) -> Option<hyper::Response<()>> {
+    if !r_config.cors_enabled {
+        return None;
+    }
+
+    let is_origin_allowed = if let Some(orig) = origin {
+        r_config.cors_allowed_origins.is_empty()
+            || r_config.cors_allowed_origins.iter().any(|o| o == orig)
+    } else {
+        false
+    };
+
+    if !is_origin_allowed {
+        return None;
+    }
+
+    let allowed_origin = if r_config.cors_allowed_origins.is_empty() {
+        "*".to_string()
+    } else {
+        origin.unwrap_or("").to_string()
+    };
+    let methods_str = r_config.cors_allowed_methods.join(", ");
+    let headers_str = r_config.cors_allowed_headers.join(", ");
+    let max_age_str = r_config.cors_max_age_secs.to_string();
+
+    let mut resp = hyper::Response::builder().status(hyper::StatusCode::NO_CONTENT);
+    if let Ok(hv) = allowed_origin.parse::<hyper::header::HeaderValue>() {
+        resp = resp.header("access-control-allow-origin", hv);
+    }
+    if let Ok(hv) = methods_str.parse::<hyper::header::HeaderValue>() {
+        resp = resp.header("access-control-allow-methods", hv);
+    }
+    if let Ok(hv) = headers_str.parse::<hyper::header::HeaderValue>() {
+        resp = resp.header("access-control-allow-headers", hv);
+    }
+    if let Ok(hv) = max_age_str.parse::<hyper::header::HeaderValue>() {
+        resp = resp.header("access-control-max-age", hv);
+    }
+    if r_config.cors_allow_credentials {
+        resp = resp.header(
+            "access-control-allow-credentials",
+            hyper::header::HeaderValue::from_static("true"),
+        );
+    }
+    Some(resp.body(()).unwrap())
+}
+
+/// Injects CORS response headers into an HTTP/3 response builder for
+/// normal (non-preflight) requests.
+fn inject_h3_cors_response_headers(
+    mut response: hyper::http::response::Builder,
+    r_config: &crate::config::RouteConfig,
+) -> hyper::http::response::Builder {
+    if !r_config.cors_enabled {
+        return response;
+    }
+    let cors_origin = if r_config.cors_allowed_origins.is_empty() {
+        "*".to_string()
+    } else if let Some(first) = r_config.cors_allowed_origins.first() {
+        first.clone()
+    } else {
+        "*".to_string()
+    };
+    if let Ok(hv) = cors_origin.parse::<hyper::header::HeaderValue>() {
+        response = response.header("access-control-allow-origin", hv);
+    }
+    if r_config.cors_allow_credentials {
+        response = response.header(
+            "access-control-allow-credentials",
+            hyper::header::HeaderValue::from_static("true"),
+        );
+    }
+    response
+}
+
 /// Starts the HTTP/3 QUIC server on the configured UDP bind address.
 pub async fn start_http3_proxy(
     bind_addr: &str,
@@ -180,6 +301,7 @@ pub async fn start_http3_proxy(
     bandwidth: Arc<crate::telemetry::bandwidth::BandwidthTracker>,
     oidc_sessions: crate::auth::oidc::OidcSessionStore,
     trusted_proxies: crate::proxy::realip::TrustedProxies,
+    dynamic_routes: Arc<dashmap::DashMap<String, crate::config::RouteConfig>>,
     shutdown: CancellationToken,
 ) {
     let addr: SocketAddr = match bind_addr.parse() {
@@ -241,6 +363,7 @@ pub async fn start_http3_proxy(
                 let bw_c = Arc::clone(&bandwidth);
                 let oidc_c = Arc::clone(&oidc_sessions);
                 let trusted_proxies_c = trusted_proxies.clone();
+                let dynamic_routes_c = Arc::clone(&dynamic_routes);
                 tokio::spawn(async move {
                     let conn = match incoming.await {
                         Ok(c) => c,
@@ -297,6 +420,7 @@ pub async fn start_http3_proxy(
                         bw_c,
                         oidc_c,
                         trusted_proxies_c,
+                        dynamic_routes_c,
                     )
                     .await;
                 });
@@ -332,6 +456,7 @@ async fn serve_h3_connection(
     bandwidth: Arc<crate::telemetry::bandwidth::BandwidthTracker>,
     oidc_sessions: crate::auth::oidc::OidcSessionStore,
     trusted_proxies: crate::proxy::realip::TrustedProxies,
+    dynamic_routes: Arc<dashmap::DashMap<String, crate::config::RouteConfig>>,
 ) {
     let webtransport_enabled = app_config.webtransport_enabled;
 
@@ -363,6 +488,14 @@ async fn serve_h3_connection(
                     let route = {
                         let mut best: Option<(String, crate::config::RouteConfig)> = None;
                         let mut best_len = 0usize;
+                        // Check admin API CRUD routes first
+                        for entry in dynamic_routes.iter() {
+                            let (r_path, r_cfg) = entry.pair();
+                            if path.starts_with(r_path.as_str()) && r_path.len() > best_len {
+                                best = Some((r_path.clone(), r_cfg.clone()));
+                                best_len = r_path.len();
+                            }
+                        }
                         for (r_path, r_cfg) in &app_config.routes {
                             if path.starts_with(r_path.as_str()) && r_path.len() > best_len {
                                 best = Some((r_path.clone(), r_cfg.clone()));
@@ -388,16 +521,25 @@ async fn serve_h3_connection(
                     .await
                     {
                         H3AuthOutcome::Allowed(_) => {
-                            crate::proxy::wt::serve_session(req, stream, conn, remote_addr, Arc::clone(&metrics)).await;
+                            crate::proxy::wt::serve_session(
+                                req,
+                                stream,
+                                conn,
+                                remote_addr,
+                                Arc::clone(&metrics),
+                            )
+                            .await;
                             return;
                         }
-                        H3AuthOutcome::Denied { status, www_authenticate, body } => {
+                        H3AuthOutcome::Denied {
+                            status,
+                            www_authenticate,
+                            body,
+                        } => {
                             let mut stream = stream;
                             if let Some(b) = body {
-                                let resp = hyper::Response::builder()
-                                    .status(status)
-                                    .body(())
-                                    .unwrap();
+                                let resp =
+                                    hyper::Response::builder().status(status).body(()).unwrap();
                                 let _ = stream.send_response(resp).await;
                                 let _ = stream.send_data(Bytes::from(b)).await;
                                 let _ = stream.finish().await;
@@ -438,6 +580,7 @@ async fn serve_h3_connection(
                 let bw = Arc::clone(&bandwidth);
                 let oidc = Arc::clone(&oidc_sessions);
                 let trusted_proxies_spawn = trusted_proxies.clone();
+                let dynamic_routes_spawn = Arc::clone(&dynamic_routes);
                 tokio::spawn(async move {
                     handle_h3_request(
                         req,
@@ -461,6 +604,7 @@ async fn serve_h3_connection(
                         bw,
                         oidc,
                         trusted_proxies_spawn,
+                        dynamic_routes_spawn,
                     )
                     .await;
                 });
@@ -522,6 +666,7 @@ async fn handle_h3_request(
     bandwidth: Arc<crate::telemetry::bandwidth::BandwidthTracker>,
     oidc_sessions: crate::auth::oidc::OidcSessionStore,
     trusted_proxies: crate::proxy::realip::TrustedProxies,
+    dynamic_routes: Arc<dashmap::DashMap<String, crate::config::RouteConfig>>,
 ) {
     let mut path = req.uri().path().to_string();
     let query = req.uri().query().map(String::from);
@@ -582,8 +727,16 @@ async fn handle_h3_request(
             .with_label_values(&["ip_or_global"])
             .inc();
         h3_log_rejected(
-            &access_logger, &ip_str, method.as_str(), &path,
-            429, start, user_agent.as_deref().unwrap_or(""), "", &trace_id, 0,
+            &access_logger,
+            &ip_str,
+            method.as_str(),
+            &path,
+            429,
+            start,
+            user_agent.as_deref().unwrap_or(""),
+            "",
+            &trace_id,
+            0,
         );
         send_h3_error(&mut stream, StatusCode::TOO_MANY_REQUESTS).await;
         return;
@@ -593,8 +746,16 @@ async fn handle_h3_request(
     let _zone_guard = {
         if !zone_limiter.acquire_connection(&ip_str) {
             h3_log_rejected(
-                &access_logger, &ip_str, method.as_str(), &path,
-                503, start, user_agent.as_deref().unwrap_or(""), "", &trace_id, 0,
+                &access_logger,
+                &ip_str,
+                method.as_str(),
+                &path,
+                503,
+                start,
+                user_agent.as_deref().unwrap_or(""),
+                "",
+                &trace_id,
+                0,
             );
             send_h3_error(&mut stream, StatusCode::SERVICE_UNAVAILABLE).await;
             return;
@@ -609,7 +770,10 @@ async fn handle_h3_request(
         if let Some(cl) = req.headers().get(hyper::header::CONTENT_LENGTH) {
             if let Ok(len) = cl.to_str().unwrap_or("0").parse::<usize>() {
                 if len > max_body {
-                    warn!("HTTP/3 request body too large from {}: {} > {} bytes", ip_str, len, max_body);
+                    warn!(
+                        "HTTP/3 request body too large from {}: {} > {} bytes",
+                        ip_str, len, max_body
+                    );
                     send_h3_error(&mut stream, StatusCode::PAYLOAD_TOO_LARGE).await;
                     return;
                 }
@@ -619,7 +783,10 @@ async fn handle_h3_request(
     let request_body = match read_h3_request_body(&mut stream, max_body).await {
         Ok(Some(body)) => body,
         Ok(None) => {
-            warn!("HTTP/3 request body exceeded limit {} from {}", max_body, ip_str);
+            warn!(
+                "HTTP/3 request body exceeded limit {} from {}",
+                max_body, ip_str
+            );
             send_h3_error(&mut stream, StatusCode::PAYLOAD_TOO_LARGE).await;
             return;
         }
@@ -666,11 +833,12 @@ async fn handle_h3_request(
     if is_h3_extended_connect(&method, req.headers()) {
         if is_h3_websocket_connect(&method, req.headers()) {
             // Select a backend from the default pool (or first available pool)
-            let pool = upstreams.get_pool("default").or_else(|| {
-                upstreams.first_pool()
-            });
+            let pool = upstreams
+                .get_pool("default")
+                .or_else(|| upstreams.first_pool());
             let backend_addr = match pool.as_ref() {
-                Some(p) => p.get_next_backend(None, Some(Arc::clone(&ai_engine)))
+                Some(p) => p
+                    .get_next_backend(None, Some(Arc::clone(&ai_engine)))
                     .map(|b| b.config.address.clone()),
                 None => None,
             };
@@ -679,7 +847,13 @@ async fn handle_h3_request(
                     Ok(mut tcp) => {
                         let response = hyper::Response::builder()
                             .status(StatusCode::OK)
-                            .header("sec-websocket-protocol", req.headers().get("sec-websocket-protocol").and_then(|v| v.to_str().ok()).unwrap_or(""))
+                            .header(
+                                "sec-websocket-protocol",
+                                req.headers()
+                                    .get("sec-websocket-protocol")
+                                    .and_then(|v| v.to_str().ok())
+                                    .unwrap_or(""),
+                            )
                             .body(())
                             .unwrap();
                         if let Err(e) = stream.send_response(response).await {
@@ -693,8 +867,16 @@ async fn handle_h3_request(
                     Err(e) => {
                         warn!("H3 WebSocket backend handshake failed for {}: {}", addr, e);
                         h3_log_rejected(
-                            &access_logger, &ip_str, method.as_str(), &path,
-                            502, start, user_agent.as_deref().unwrap_or(""), &referer, &trace_id, 0,
+                            &access_logger,
+                            &ip_str,
+                            method.as_str(),
+                            &path,
+                            502,
+                            start,
+                            user_agent.as_deref().unwrap_or(""),
+                            &referer,
+                            &trace_id,
+                            0,
                         );
                         send_h3_error(&mut stream, StatusCode::BAD_GATEWAY).await;
                         return;
@@ -702,15 +884,23 @@ async fn handle_h3_request(
                 }
             } else {
                 h3_log_rejected(
-                    &access_logger, &ip_str, method.as_str(), &path,
-                    502, start, user_agent.as_deref().unwrap_or(""), &referer, &trace_id, 0,
+                    &access_logger,
+                    &ip_str,
+                    method.as_str(),
+                    &path,
+                    502,
+                    start,
+                    user_agent.as_deref().unwrap_or(""),
+                    &referer,
+                    &trace_id,
+                    0,
                 );
                 send_h3_error(&mut stream, StatusCode::BAD_GATEWAY).await;
                 return;
             }
         }
-        let target = h3_extended_connect_protocol(req.headers())
-            .unwrap_or_else(|| "<unknown>".to_string());
+        let target =
+            h3_extended_connect_protocol(req.headers()).unwrap_or_else(|| "<unknown>".to_string());
         let status_value = if target == "webtransport" {
             "disabled"
         } else {
@@ -774,8 +964,16 @@ async fn handle_h3_request(
             let sc = StatusCode::from_u16(direct.status_code)
                 .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
             h3_log_rejected(
-                &access_logger, &ip_str, method.as_str(), &path,
-                sc.as_u16(), start, user_agent.as_deref().unwrap_or(""), &referer, &trace_id, 0,
+                &access_logger,
+                &ip_str,
+                method.as_str(),
+                &path,
+                sc.as_u16(),
+                start,
+                user_agent.as_deref().unwrap_or(""),
+                &referer,
+                &trace_id,
+                0,
             );
             send_h3_error(&mut stream, sc).await;
             return;
@@ -791,6 +989,11 @@ async fn handle_h3_request(
             }
         }
     }
+
+    // Inject forwarding headers on the outbound upstream request.
+    // H3 always runs over TLS (QUIC requires TLS 1.3), so X-Forwarded-Proto
+    // is set to "https".
+    crate::proxy::realip::inject_forwarding_headers(req.headers_mut(), &ip, true);
 
     // ── PreRoute hooks (Rhai scripting) ──
     if hook_engine.has_hooks(HookPhase::PreRoute) {
@@ -812,8 +1015,7 @@ async fn handle_h3_request(
         };
         for result in hook_engine.execute(HookPhase::PreRoute, &hook_ctx) {
             if let HookResult::Respond { status, .. } = result {
-                let sc = StatusCode::from_u16(status)
-                    .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+                let sc = StatusCode::from_u16(status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
                 send_h3_error(&mut stream, sc).await;
                 return;
             }
@@ -830,8 +1032,16 @@ async fn handle_h3_request(
                     .with_label_values(&["captcha_bot_block"])
                     .inc();
                 h3_log_rejected(
-                    &access_logger, &ip_str, method.as_str(), &path,
-                    403, start, user_agent.as_deref().unwrap_or(""), &referer, &trace_id, 0,
+                    &access_logger,
+                    &ip_str,
+                    method.as_str(),
+                    &path,
+                    403,
+                    start,
+                    user_agent.as_deref().unwrap_or(""),
+                    &referer,
+                    &trace_id,
+                    0,
                 );
                 send_h3_error(&mut stream, StatusCode::FORBIDDEN).await;
                 return;
@@ -851,25 +1061,56 @@ async fn handle_h3_request(
 
     // ── WAF inspection ──
     if waf_enabled {
-        let req_headers_map: std::collections::HashMap<String, String> = req.headers().iter().map(|(k, v)| (k.to_string(), v.to_str().unwrap_or("").to_string())).collect();
-        if let crate::waf::WafAction::Block(reason) = waf.inspect(&ip_str, &path, query_opt, &req_headers_map, user_agent.as_deref()) {
+        let req_headers_map: std::collections::HashMap<String, String> = req
+            .headers()
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_str().unwrap_or("").to_string()))
+            .collect();
+        if let crate::waf::WafAction::Block(reason) = waf.inspect(
+            &ip_str,
+            &path,
+            query_opt,
+            &req_headers_map,
+            user_agent.as_deref(),
+        ) {
             warn!("WAF blocked HTTP/3 request from {}: {}", ip_str, reason);
             metrics.waf_blocks_total.with_label_values(&[&reason]).inc();
             h3_log_rejected(
-                &access_logger, &ip_str, method.as_str(), &path,
-                403, start, user_agent.as_deref().unwrap_or(""), &referer, &trace_id, 0,
+                &access_logger,
+                &ip_str,
+                method.as_str(),
+                &path,
+                403,
+                start,
+                user_agent.as_deref().unwrap_or(""),
+                &referer,
+                &trace_id,
+                0,
             );
             send_h3_error(&mut stream, StatusCode::FORBIDDEN).await;
             return;
         }
-        if matches!(method, hyper::Method::POST | hyper::Method::PUT | hyper::Method::PATCH) {
+        if matches!(
+            method,
+            hyper::Method::POST | hyper::Method::PUT | hyper::Method::PATCH
+        ) {
             if let Ok(body_text) = std::str::from_utf8(&request_body) {
-                if let crate::waf::WafAction::Block(reason) = waf.inspect_body(&ip_str, body_text, &path, query_opt) {
+                if let crate::waf::WafAction::Block(reason) =
+                    waf.inspect_body(&ip_str, body_text, &path, query_opt)
+                {
                     warn!("WAF blocked HTTP/3 body from {}: {}", ip_str, reason);
                     metrics.waf_blocks_total.with_label_values(&[&reason]).inc();
                     h3_log_rejected(
-                        &access_logger, &ip_str, method.as_str(), &path,
-                        403, start, user_agent.as_deref().unwrap_or(""), &referer, &trace_id, 0,
+                        &access_logger,
+                        &ip_str,
+                        method.as_str(),
+                        &path,
+                        403,
+                        start,
+                        user_agent.as_deref().unwrap_or(""),
+                        &referer,
+                        &trace_id,
+                        0,
                     );
                     send_h3_error(&mut stream, StatusCode::FORBIDDEN).await;
                     return;
@@ -884,12 +1125,19 @@ async fn handle_h3_request(
             if !geo_policy.is_allowed(&result.country_code) {
                 warn!(
                     "GeoIP blocked HTTP/3 request from {} (country: {})",
-                    ip_str,
-                    result.country_code
+                    ip_str, result.country_code
                 );
                 h3_log_rejected(
-                    &access_logger, &ip_str, method.as_str(), &path,
-                    403, start, user_agent.as_deref().unwrap_or(""), &referer, &trace_id, 0,
+                    &access_logger,
+                    &ip_str,
+                    method.as_str(),
+                    &path,
+                    403,
+                    start,
+                    user_agent.as_deref().unwrap_or(""),
+                    &referer,
+                    &trace_id,
+                    0,
                 );
                 send_h3_error(&mut stream, StatusCode::FORBIDDEN).await;
                 return;
@@ -929,16 +1177,7 @@ async fn handle_h3_request(
     // path, but before final route resolution + auth so the rewritten path
     // drives auth, backend selection, hook contexts, and forwarding.
     'rewrite: loop {
-        // Pick the best-matching route for the *current* path.
-        let mut best_match: Option<&crate::config::RouteConfig> = None;
-        let mut best_len = 0usize;
-        for (r_path, r_cfg) in &app_config.routes {
-            if path.starts_with(r_path.as_str()) && r_path.len() > best_len {
-                best_match = Some(r_cfg);
-                best_len = r_path.len();
-            }
-        }
-        if let Some(r_cfg) = best_match {
+        if let Some((_, r_cfg)) = resolve_h3_route(&path, &dynamic_routes, &app_config) {
             if !r_cfg.rewrite_rules.is_empty() {
                 let rules = match crate::proxy::rewrite::compile_rules(&r_cfg.rewrite_rules) {
                     Ok(r) => r,
@@ -950,7 +1189,10 @@ async fn handle_h3_request(
                 };
                 match crate::proxy::rewrite::apply_rewrites(&rules, &path) {
                     crate::proxy::rewrite::RewriteResult::Redirect { status, location } => {
-                        debug!("HTTP/3 rewrite redirect {} -> {} ({})", path, location, status);
+                        debug!(
+                            "HTTP/3 rewrite redirect {} -> {} ({})",
+                            path, location, status
+                        );
                         let location_hv = location
                             .parse()
                             .unwrap_or_else(|_| hyper::header::HeaderValue::from_static("/"));
@@ -992,22 +1234,25 @@ async fn handle_h3_request(
     let final_path_arc: Arc<str> = Arc::from(path.as_str());
 
     // ── Route matching — longest-prefix match (uses possibly-rewritten path) ──
-    let route = {
-        let mut best: Option<(String, crate::config::RouteConfig)> = None;
-        let mut best_len = 0usize;
-        for (r_path, r_cfg) in &app_config.routes {
-            if path.starts_with(r_path.as_str()) && r_path.len() > best_len {
-                best = Some((r_path.clone(), r_cfg.clone()));
-                best_len = r_path.len();
+    let route = resolve_h3_route(&path, &dynamic_routes, &app_config);
+
+    // ── CORS Middleware (parity with HTTP/1 + HTTP/2) ──
+    // After route matching, before auth: handle CORS preflight and response headers.
+    if let Some((_r_path, r_config)) = route.as_ref() {
+        let origin = req
+            .headers()
+            .get("origin")
+            .and_then(|v| v.to_str().ok());
+        if method == hyper::Method::OPTIONS {
+            if let Some(resp) = build_h3_cors_preflight_response(r_config, origin) {
+                if let Err(e) = stream.send_response(resp).await {
+                    debug!("HTTP/3 CORS preflight response failed: {}", e);
+                }
+                let _ = stream.finish().await;
+                return;
             }
         }
-        best.or_else(|| {
-            app_config
-                .routes
-                .get_key_value("/")
-                .map(|(k, v)| (k.clone(), v.clone()))
-        })
-    };
+    }
 
     let pool_name = route
         .as_ref()
@@ -1035,18 +1280,26 @@ async fn handle_h3_request(
     .await
     {
         H3AuthOutcome::Allowed(hs) => hs,
-        H3AuthOutcome::Denied { status, www_authenticate, body } => {
+        H3AuthOutcome::Denied {
+            status,
+            www_authenticate,
+            body,
+        } => {
             debug!("HTTP/3 auth denied from {} → {}", ip_str, status);
             h3_log_rejected(
-                &access_logger, &ip_str, method.as_str(), &path,
-                status.as_u16(), start, user_agent.as_deref().unwrap_or(""), &referer, &trace_id,
+                &access_logger,
+                &ip_str,
+                method.as_str(),
+                &path,
+                status.as_u16(),
+                start,
+                user_agent.as_deref().unwrap_or(""),
+                &referer,
+                &trace_id,
                 body.as_ref().map(|b| b.len() as u64).unwrap_or(0),
             );
             if let Some(b) = body {
-                let resp = hyper::Response::builder()
-                    .status(status)
-                    .body(())
-                    .unwrap();
+                let resp = hyper::Response::builder().status(status).body(()).unwrap();
                 if let Err(e) = stream.send_response(resp).await {
                     debug!("H3 auth denial response failed: {}", e);
                     return;
@@ -1090,8 +1343,7 @@ async fn handle_h3_request(
         };
         for result in hook_engine.execute(HookPhase::PreUpstream, &hook_ctx) {
             if let HookResult::Respond { status, .. } = result {
-                let sc = StatusCode::from_u16(status)
-                    .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+                let sc = StatusCode::from_u16(status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
                 send_h3_error(&mut stream, sc).await;
                 return;
             }
@@ -1138,9 +1390,7 @@ async fn handle_h3_request(
         } else {
             None
         };
-        match sticky_preferred
-            .or_else(|| p.get_next_backend(None, Some(Arc::clone(&ai_engine))))
-        {
+        match sticky_preferred.or_else(|| p.get_next_backend(None, Some(Arc::clone(&ai_engine)))) {
             Some(b) => b,
             None => {
                 send_h3_error(&mut stream, StatusCode::BAD_GATEWAY).await;
@@ -1237,16 +1487,15 @@ async fn handle_h3_request(
 
     let method_str = method.as_str().to_string();
     // Bandwidth: in-bytes (request body)
-    bandwidth.protocol("http3").add_in(request_body.len() as u64);
+    bandwidth
+        .protocol("http3")
+        .add_in(request_body.len() as u64);
     bandwidth.pool(&pool_name).add_in(request_body.len() as u64);
 
     // Only allocate mirror copies when there's actually a mirror pool configured
-    let mirror_payload = mirror_pool.as_ref().map(|_| {
-        (
-            req.headers().clone(),
-            Bytes::copy_from_slice(&request_body),
-        )
-    });
+    let mirror_payload = mirror_pool
+        .as_ref()
+        .map(|_| (req.headers().clone(), Bytes::copy_from_slice(&request_body)));
 
     // gRPC-Web body translation: text variant carries base64-encoded
     // protobuf — decode before forwarding upstream.
@@ -1254,7 +1503,10 @@ async fn handle_h3_request(
         match translate_h3_grpc_web_request_body(&request_body, req_is_grpc_web_text) {
             Some(b) => b,
             None => {
-                debug!("HTTP/3 grpc-web-text body base64 decode failed from {}", ip_str);
+                debug!(
+                    "HTTP/3 grpc-web-text body base64 decode failed from {}",
+                    ip_str
+                );
                 send_h3_error(&mut stream, StatusCode::BAD_REQUEST).await;
                 return;
             }
@@ -1267,9 +1519,7 @@ async fn handle_h3_request(
         reqwest::Method::from_bytes(method.as_str().as_bytes()).unwrap_or(reqwest::Method::GET),
         &backend_url,
     );
-    backend_request = backend_request
-        .headers(forward_headers)
-        .body(outgoing_body);
+    backend_request = backend_request.headers(forward_headers).body(outgoing_body);
 
     let mut backend_resp = match backend_request.send().await {
         Ok(r) => r,
@@ -1317,7 +1567,11 @@ async fn handle_h3_request(
         let resp_hdrs: std::collections::HashMap<String, String> = backend_resp
             .headers()
             .iter()
-            .filter_map(|(k, v)| v.to_str().ok().map(|vs| (k.as_str().to_string(), vs.to_string())))
+            .filter_map(|(k, v)| {
+                v.to_str()
+                    .ok()
+                    .map(|vs| (k.as_str().to_string(), vs.to_string()))
+            })
             .collect();
         let hook_ctx = crate::scripting::HookContext {
             client_ip: Arc::clone(&ip_arc),
@@ -1331,7 +1585,8 @@ async fn handle_h3_request(
         for result in hook_engine.execute(crate::scripting::HookPhase::PostUpstream, &hook_ctx) {
             match result {
                 crate::scripting::HookResult::Respond { status: s, .. } => {
-                    let sc = hyper::StatusCode::from_u16(s).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+                    let sc =
+                        hyper::StatusCode::from_u16(s).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
                     send_h3_error(&mut stream, sc).await;
                     return;
                 }
@@ -1372,7 +1627,11 @@ async fn handle_h3_request(
     // ── Read upstream response body (streamed with size limit) ──
     // Use client_max_body_size as the response buffer limit to prevent OOM
     // on large upstream responses. Falls back to 64 MiB when unconfigured.
-    let resp_buffer_limit = if max_body > 0 { max_body } else { 64 * 1024 * 1024 };
+    let resp_buffer_limit = if max_body > 0 {
+        max_body
+    } else {
+        64 * 1024 * 1024
+    };
     let raw_backend_body = {
         let mut body = BytesMut::with_capacity(8192);
         let mut total = 0usize;
@@ -1431,7 +1690,11 @@ async fn handle_h3_request(
             .as_ref()
             .map(|(_, r)| r.proxy_cache_valid_secs)
             .unwrap_or(0);
-        let max_age_secs = if route_ttl_secs > 0 { route_ttl_secs } else { 60 };
+        let max_age_secs = if route_ttl_secs > 0 {
+            route_ttl_secs
+        } else {
+            60
+        };
         let cache_key = build_cache_key("GET", &host, &path, query.as_deref(), &[]);
         cache
             .insert(
@@ -1491,17 +1754,12 @@ async fn handle_h3_request(
         .and_then(|v| v.to_str().ok());
     let route_gzip = route.as_ref().map(|(_, r)| r.gzip).unwrap_or(false);
     let route_brotli = route.as_ref().map(|(_, r)| r.brotli).unwrap_or(false);
-    let route_gzip_min = route
-        .as_ref()
-        .map(|(_, r)| r.gzip_min_length)
-        .unwrap_or(0);
+    let route_gzip_min = route.as_ref().map(|(_, r)| r.gzip_min_length).unwrap_or(0);
 
-    let accepts_gzip = route_gzip
-        && crate::middleware::compression::accepts_gzip(accept_encoding);
+    let accepts_gzip = route_gzip && crate::middleware::compression::accepts_gzip(accept_encoding);
     let accepts_brotli = (route_brotli || app_config.brotli_enabled)
         && crate::middleware::brotli::accepts_brotli(accept_encoding);
-    let is_compressible =
-        crate::middleware::compression::is_compressible(Some(&content_type));
+    let is_compressible = crate::middleware::compression::is_compressible(Some(&content_type));
     let body_len_pre = body_bytes.len();
 
     let (body_to_send, content_encoding) = if accepts_brotli
@@ -1514,8 +1772,7 @@ async fn handle_h3_request(
         }
     } else if accepts_gzip
         && is_compressible
-        && body_len_pre
-            >= route_gzip_min.max(crate::middleware::compression::MIN_COMPRESS_SIZE)
+        && body_len_pre >= route_gzip_min.max(crate::middleware::compression::MIN_COMPRESS_SIZE)
     {
         match crate::middleware::compression::gzip_compress_async(body_bytes.clone()).await {
             Some(c) => (c, "gzip"),
@@ -1545,9 +1802,7 @@ async fn handle_h3_request(
     // HSTS header injection — matches HTTP/1 behavior at proxy/mod.rs:2208.
     // Only emitted when the operator opts in via `hsts_max_age`.
     if let Some(max_age) = app_config.hsts_max_age {
-        if let Ok(hv) =
-            hyper::header::HeaderValue::from_str(&format!("max-age={}", max_age))
-        {
+        if let Ok(hv) = hyper::header::HeaderValue::from_str(&format!("max-age={}", max_age)) {
             response = response.header(hyper::header::STRICT_TRANSPORT_SECURITY, hv);
         }
     }
@@ -1576,6 +1831,11 @@ async fn handle_h3_request(
                 response = response.header(hk, hv);
             }
         }
+    }
+
+    // CORS response headers for normal (non-preflight) requests
+    if let Some((_, r)) = route.as_ref() {
+        response = inject_h3_cors_response_headers(response, r);
     }
 
     let response = response.body(()).unwrap();
@@ -1766,11 +2026,17 @@ async fn send_h3_html_response(
         .body(())
         .unwrap();
     if let Err(e) = stream.send_response(response).await {
-        debug!("send_h3_html_response: failed to send headers {}: {}", status, e);
+        debug!(
+            "send_h3_html_response: failed to send headers {}: {}",
+            status, e
+        );
         return;
     }
     if let Err(e) = stream.send_data(Bytes::from(html)).await {
-        debug!("send_h3_html_response: failed to send body {}: {}", status, e);
+        debug!(
+            "send_h3_html_response: failed to send body {}: {}",
+            status, e
+        );
         return;
     }
     let _ = stream.finish().await;
@@ -1802,7 +2068,10 @@ async fn send_h3_response_with_header(
         .body(())
         .unwrap();
     if let Err(e) = stream.send_response(resp).await {
-        debug!("send_h3_response_with_header: failed to send {}: {}", status, e);
+        debug!(
+            "send_h3_response_with_header: failed to send {}: {}",
+            status, e
+        );
     }
     let _ = stream.finish().await;
 }
@@ -1875,7 +2144,11 @@ async fn h3_ws_backend_handshake(
             if response.starts_with("HTTP/1.1 101") {
                 return Ok(stream);
             } else {
-                return Err(format!("backend WS handshake failed: {}", response.lines().next().unwrap_or("unknown")).into());
+                return Err(format!(
+                    "backend WS handshake failed: {}",
+                    response.lines().next().unwrap_or("unknown")
+                )
+                .into());
             }
         }
         if total >= buf.len() {
@@ -1931,10 +2204,8 @@ async fn relay_h3_websocket(
         }
     };
     if idle_timeout_secs > 0 {
-        let _ = tokio::time::timeout(
-            std::time::Duration::from_secs(idle_timeout_secs),
-            relay,
-        ).await;
+        let _ =
+            tokio::time::timeout(std::time::Duration::from_secs(idle_timeout_secs), relay).await;
     } else {
         relay.await;
     }
@@ -1989,7 +2260,11 @@ async fn apply_h3_auth_chain(
                         .unwrap_or_else(|_| {
                             hyper::header::HeaderValue::from_static("Basic realm=\"protected\"")
                         });
-                    H3AuthOutcome::Denied { status, www_authenticate: Some(www), body: None }
+                    H3AuthOutcome::Denied {
+                        status,
+                        www_authenticate: Some(www),
+                        body: None,
+                    }
                 }
             };
         }
@@ -2022,14 +2297,9 @@ async fn apply_h3_auth_chain(
             let cache = OAUTH_CACHE.get_or_init(crate::auth::oauth::new_cache);
             let client_id = r_config.auth_oauth_client_id.as_deref().unwrap_or("");
             let client_secret = r_config.auth_oauth_client_secret.as_deref().unwrap_or("");
-            let (result, sub) = crate::auth::oauth::check(
-                headers,
-                introspect_url,
-                client_id,
-                client_secret,
-                cache,
-            )
-            .await;
+            let (result, sub) =
+                crate::auth::oauth::check(headers, introspect_url, client_id, client_secret, cache)
+                    .await;
             return match result {
                 AuthResult::Allowed => {
                     if let Some(sub_val) = sub {
@@ -2049,9 +2319,8 @@ async fn apply_h3_auth_chain(
             use std::sync::OnceLock;
             static JWKS_MGR: OnceLock<std::sync::Arc<crate::auth::jwks::JwksManager>> =
                 OnceLock::new();
-            let mgr = JWKS_MGR.get_or_init(|| {
-                std::sync::Arc::new(crate::auth::jwks::JwksManager::new())
-            });
+            let mgr =
+                JWKS_MGR.get_or_init(|| std::sync::Arc::new(crate::auth::jwks::JwksManager::new()));
             return apply_h3_jwks(jwks_uri, mgr.as_ref(), headers, &mut injected).await;
         }
         // 5. OIDC session check
@@ -2194,17 +2463,16 @@ async fn apply_h3_jwks(
         }
     };
 
-    let (decoding_key, algo) =
-        match crate::auth::jwks::JwksManager::decoding_key_from_jwk(&jwk) {
-            Ok(pair) => pair,
-            Err(_) => {
-                return H3AuthOutcome::Denied {
-                    status: StatusCode::UNAUTHORIZED,
-                    www_authenticate: bearer_challenge,
-                    body: None,
-                };
-            }
-        };
+    let (decoding_key, algo) = match crate::auth::jwks::JwksManager::decoding_key_from_jwk(&jwk) {
+        Ok(pair) => pair,
+        Err(_) => {
+            return H3AuthOutcome::Denied {
+                status: StatusCode::UNAUTHORIZED,
+                www_authenticate: bearer_challenge,
+                body: None,
+            };
+        }
+    };
 
     use jsonwebtoken::{Validation, decode};
     let mut validation = Validation::new(algo);
@@ -2392,16 +2660,19 @@ fn build_quic_tls_config(app_config: &AppConfig) -> Option<rustls::ServerConfig>
 #[cfg(test)]
 mod tests {
     use super::{
-        apply_h3_auth_chain, build_h3_grpc_web_response_body, build_h3_grpc_web_trailer_frame,
-        h3_extended_connect_protocol, is_h3_extended_connect, is_h3_grpc_web,
-        is_h3_grpc_web_preflight, is_h3_grpc_web_text, is_h3_websocket_connect,
-        shared_grpc_upstream_client, shared_upstream_client, translate_h3_grpc_web_request_body,
-        H3AuthOutcome,
+        H3AuthOutcome, apply_h3_auth_chain, build_h3_cors_preflight_response,
+        build_h3_grpc_web_response_body, build_h3_grpc_web_trailer_frame,
+        h3_extended_connect_protocol, inject_h3_cors_response_headers, is_h3_extended_connect,
+        is_h3_grpc_web, is_h3_grpc_web_preflight, is_h3_grpc_web_text, is_h3_websocket_connect,
+        resolve_h3_route, shared_grpc_upstream_client, shared_upstream_client,
+        translate_h3_grpc_web_request_body,
     };
-    use crate::proxy::{build_return_to, decode_form_component, generate_trace_context_ids, parse_urlencoded_form};
-    use bytes::Bytes;
     use crate::config::{AppConfig, RouteConfig};
+    use crate::proxy::{
+        build_return_to, decode_form_component, generate_trace_context_ids, parse_urlencoded_form,
+    };
     use crate::telemetry::bandwidth::BandwidthTracker;
+    use bytes::Bytes;
     use hyper::StatusCode;
     use std::collections::HashMap;
     use std::sync::atomic::Ordering;
@@ -2422,7 +2693,10 @@ mod tests {
             parsed.get("phalanx_challenge_nonce").map(String::as_str),
             Some("abc+123")
         );
-        assert_eq!(parsed.get("return_to").map(String::as_str), Some("/docs?a=1+2"));
+        assert_eq!(
+            parsed.get("return_to").map(String::as_str),
+            Some("/docs?a=1+2")
+        );
     }
 
     #[test]
@@ -2535,7 +2809,10 @@ mod tests {
         cfg.tls_key_path = Some(key_path.to_str().unwrap().to_string());
 
         let tls = super::build_quic_tls_config(&cfg);
-        assert!(tls.is_some(), "valid cert should load despite malformed sibling in H3 path");
+        assert!(
+            tls.is_some(),
+            "valid cert should load despite malformed sibling in H3 path"
+        );
 
         std::fs::remove_dir_all(&tmp).ok();
     }
@@ -2559,7 +2836,10 @@ mod tests {
         cfg.tls_key_path = Some(key_path.to_str().unwrap().to_string());
 
         let tls = super::build_quic_tls_config(&cfg);
-        assert!(tls.is_none(), "all certs malformed → H3 TLS config must fail");
+        assert!(
+            tls.is_none(),
+            "all certs malformed → H3 TLS config must fail"
+        );
 
         std::fs::remove_dir_all(&tmp).ok();
     }
@@ -2607,10 +2887,21 @@ mod tests {
             r.auth_basic_users = HashMap::new();
         });
         let h = hyper::HeaderMap::new();
-        let out =
-            apply_h3_auth_chain(route.as_ref(), &cfg, &h, &hyper::Method::GET, "/p", &empty_oidc_store()).await;
+        let out = apply_h3_auth_chain(
+            route.as_ref(),
+            &cfg,
+            &h,
+            &hyper::Method::GET,
+            "/p",
+            &empty_oidc_store(),
+        )
+        .await;
         match out {
-            H3AuthOutcome::Denied { status, www_authenticate, .. } => {
+            H3AuthOutcome::Denied {
+                status,
+                www_authenticate,
+                ..
+            } => {
                 assert_eq!(status, StatusCode::UNAUTHORIZED);
                 let v = www_authenticate.expect("WWW-Authenticate must be set on Basic 401");
                 assert!(v.to_str().unwrap().contains("Basic realm="));
@@ -2636,8 +2927,15 @@ mod tests {
             hyper::header::AUTHORIZATION,
             "Basic YWxpY2U6d29uZGVybGFuZA==".parse().unwrap(),
         );
-        let out =
-            apply_h3_auth_chain(route.as_ref(), &cfg, &h, &hyper::Method::GET, "/p", &empty_oidc_store()).await;
+        let out = apply_h3_auth_chain(
+            route.as_ref(),
+            &cfg,
+            &h,
+            &hyper::Method::GET,
+            "/p",
+            &empty_oidc_store(),
+        )
+        .await;
         assert!(
             matches!(out, H3AuthOutcome::Allowed(ref v) if v.is_empty()),
             "valid creds should be allowed with no injected headers, got {out:?}"
@@ -2651,10 +2949,21 @@ mod tests {
             r.auth_jwt_secret = Some("secret".to_string());
         });
         let h = hyper::HeaderMap::new();
-        let out =
-            apply_h3_auth_chain(route.as_ref(), &cfg, &h, &hyper::Method::GET, "/p", &empty_oidc_store()).await;
+        let out = apply_h3_auth_chain(
+            route.as_ref(),
+            &cfg,
+            &h,
+            &hyper::Method::GET,
+            "/p",
+            &empty_oidc_store(),
+        )
+        .await;
         match out {
-            H3AuthOutcome::Denied { status, www_authenticate, .. } => {
+            H3AuthOutcome::Denied {
+                status,
+                www_authenticate,
+                ..
+            } => {
                 assert_eq!(status, StatusCode::UNAUTHORIZED);
                 let v = www_authenticate.expect("Bearer challenge expected");
                 assert_eq!(v, "Bearer");
@@ -2697,8 +3006,15 @@ mod tests {
             hyper::header::AUTHORIZATION,
             format!("Bearer {token}").parse().unwrap(),
         );
-        let out =
-            apply_h3_auth_chain(route.as_ref(), &cfg, &h, &hyper::Method::GET, "/p", &empty_oidc_store()).await;
+        let out = apply_h3_auth_chain(
+            route.as_ref(),
+            &cfg,
+            &h,
+            &hyper::Method::GET,
+            "/p",
+            &empty_oidc_store(),
+        )
+        .await;
         let injected = match out {
             H3AuthOutcome::Allowed(v) => v,
             other => panic!("expected Allowed, got {:?}", other),
@@ -2741,8 +3057,15 @@ mod tests {
             hyper::header::AUTHORIZATION,
             format!("Bearer {token}").parse().unwrap(),
         );
-        let out =
-            apply_h3_auth_chain(route.as_ref(), &cfg, &h, &hyper::Method::GET, "/p", &empty_oidc_store()).await;
+        let out = apply_h3_auth_chain(
+            route.as_ref(),
+            &cfg,
+            &h,
+            &hyper::Method::GET,
+            "/p",
+            &empty_oidc_store(),
+        )
+        .await;
         assert!(matches!(out, H3AuthOutcome::Denied { .. }));
     }
 
@@ -2755,10 +3078,21 @@ mod tests {
             r.auth_jwks_uri = Some("https://example.invalid/.well-known/jwks.json".into());
         });
         let h = hyper::HeaderMap::new();
-        let out =
-            apply_h3_auth_chain(route.as_ref(), &cfg, &h, &hyper::Method::GET, "/p", &empty_oidc_store()).await;
+        let out = apply_h3_auth_chain(
+            route.as_ref(),
+            &cfg,
+            &h,
+            &hyper::Method::GET,
+            "/p",
+            &empty_oidc_store(),
+        )
+        .await;
         match out {
-            H3AuthOutcome::Denied { status, www_authenticate, .. } => {
+            H3AuthOutcome::Denied {
+                status,
+                www_authenticate,
+                ..
+            } => {
                 assert_eq!(status, StatusCode::UNAUTHORIZED);
                 assert_eq!(www_authenticate.unwrap(), "Bearer");
             }
@@ -2800,8 +3134,15 @@ mod tests {
             hyper::header::AUTHORIZATION,
             format!("Bearer {token}").parse().unwrap(),
         );
-        let out =
-            apply_h3_auth_chain(route.as_ref(), &cfg, &h, &hyper::Method::GET, "/p", &empty_oidc_store()).await;
+        let out = apply_h3_auth_chain(
+            route.as_ref(),
+            &cfg,
+            &h,
+            &hyper::Method::GET,
+            "/p",
+            &empty_oidc_store(),
+        )
+        .await;
         assert!(matches!(out, H3AuthOutcome::Denied { .. }));
     }
 
@@ -2813,16 +3154,26 @@ mod tests {
     async fn test_h3_oauth_missing_bearer_denied() {
         let cfg = AppConfig::default();
         let route = route_with(|r| {
-            r.auth_oauth_introspect_url =
-                Some("https://example.invalid/oauth/introspect".into());
+            r.auth_oauth_introspect_url = Some("https://example.invalid/oauth/introspect".into());
             r.auth_oauth_client_id = Some("cid".into());
             r.auth_oauth_client_secret = Some("csecret".into());
         });
         let h = hyper::HeaderMap::new();
-        let out =
-            apply_h3_auth_chain(route.as_ref(), &cfg, &h, &hyper::Method::GET, "/p", &empty_oidc_store()).await;
+        let out = apply_h3_auth_chain(
+            route.as_ref(),
+            &cfg,
+            &h,
+            &hyper::Method::GET,
+            "/p",
+            &empty_oidc_store(),
+        )
+        .await;
         match out {
-            H3AuthOutcome::Denied { status, www_authenticate, .. } => {
+            H3AuthOutcome::Denied {
+                status,
+                www_authenticate,
+                ..
+            } => {
                 assert_eq!(status, StatusCode::UNAUTHORIZED);
                 assert_eq!(www_authenticate.unwrap(), "Bearer");
             }
@@ -2836,10 +3187,8 @@ mod tests {
     #[test]
     fn test_h3_compression_prefers_brotli_when_both_accepted() {
         // Predicates that drive the H3 compression branch
-        let accepts_gzip =
-            crate::middleware::compression::accepts_gzip(Some("gzip, br"));
-        let accepts_brotli =
-            crate::middleware::brotli::accepts_brotli(Some("gzip, br"));
+        let accepts_gzip = crate::middleware::compression::accepts_gzip(Some("gzip, br"));
+        let accepts_brotli = crate::middleware::brotli::accepts_brotli(Some("gzip, br"));
         assert!(accepts_gzip);
         assert!(accepts_brotli);
         // Both true → brotli branch fires first in handle_h3_request.
@@ -2849,9 +3198,13 @@ mod tests {
     #[test]
     fn test_h3_compression_skips_uncompressible_types() {
         // image/png is NOT in the compressible whitelist.
-        assert!(!crate::middleware::compression::is_compressible(Some("image/png")));
+        assert!(!crate::middleware::compression::is_compressible(Some(
+            "image/png"
+        )));
         // text/html and application/json are.
-        assert!(crate::middleware::compression::is_compressible(Some("text/html")));
+        assert!(crate::middleware::compression::is_compressible(Some(
+            "text/html"
+        )));
         assert!(crate::middleware::compression::is_compressible(Some(
             "application/json"
         )));
@@ -2875,8 +3228,7 @@ mod tests {
         let h = hyper::HeaderMap::new();
         let store = empty_oidc_store();
         let out =
-            apply_h3_auth_chain(route.as_ref(), &cfg, &h, &hyper::Method::GET, "/p", &store)
-                .await;
+            apply_h3_auth_chain(route.as_ref(), &cfg, &h, &hyper::Method::GET, "/p", &store).await;
         assert!(matches!(out, H3AuthOutcome::Denied { .. }));
     }
 
@@ -2913,8 +3265,7 @@ mod tests {
             format!("PHALANX_SESSION={session_id}").parse().unwrap(),
         );
         let out =
-            apply_h3_auth_chain(route.as_ref(), &cfg, &h, &hyper::Method::GET, "/p", &store)
-                .await;
+            apply_h3_auth_chain(route.as_ref(), &cfg, &h, &hyper::Method::GET, "/p", &store).await;
         let injected = match out {
             H3AuthOutcome::Allowed(v) => v,
             other => panic!("expected Allowed, got {:?}", other),
@@ -2960,8 +3311,7 @@ mod tests {
             format!("PHALANX_SESSION={session_id}").parse().unwrap(),
         );
         let out =
-            apply_h3_auth_chain(route.as_ref(), &cfg, &h, &hyper::Method::GET, "/p", &store)
-                .await;
+            apply_h3_auth_chain(route.as_ref(), &cfg, &h, &hyper::Method::GET, "/p", &store).await;
         assert!(matches!(out, H3AuthOutcome::Denied { .. }));
     }
 
@@ -3192,8 +3542,7 @@ mod tests {
     fn test_h3_grpc_web_request_body_decodes_text() {
         // base64("hello") = "aGVsbG8="
         let encoded = Bytes::from_static(b"aGVsbG8=");
-        let out =
-            translate_h3_grpc_web_request_body(&encoded, true).expect("valid base64 decodes");
+        let out = translate_h3_grpc_web_request_body(&encoded, true).expect("valid base64 decodes");
         assert_eq!(out.as_ref(), b"hello");
     }
 
@@ -3248,9 +3597,10 @@ mod tests {
         let h = reqwest::header::HeaderMap::new();
         let out = build_h3_grpc_web_response_body(upstream_body, &h, true);
         // text mode → base64 ASCII; only valid base64 chars
-        assert!(out
-            .iter()
-            .all(|b| b.is_ascii_alphanumeric() || *b == b'+' || *b == b'/' || *b == b'='));
+        assert!(
+            out.iter()
+                .all(|b| b.is_ascii_alphanumeric() || *b == b'+' || *b == b'/' || *b == b'=')
+        );
         // Round-trip: decoding it should reproduce the binary form
         use base64::Engine;
         let decoded = base64::engine::general_purpose::STANDARD
@@ -3282,14 +3632,20 @@ mod tests {
     /// regressing the H3 path.
     #[test]
     fn test_h3_rewrite_loop_helpers_apply_a_simple_regex() {
-        use crate::proxy::rewrite::{apply_rewrites, compile_rules, RewriteResult};
+        use crate::proxy::rewrite::{RewriteResult, apply_rewrites, compile_rules};
         // (pattern, replacement, flag) — `last` means restart routing.
-        let rules =
-            compile_rules(&[("^/old(.*)$".to_string(), "/new$1".to_string(), "last".to_string())])
-                .expect("rule should compile");
+        let rules = compile_rules(&[(
+            "^/old(.*)$".to_string(),
+            "/new$1".to_string(),
+            "last".to_string(),
+        )])
+        .expect("rule should compile");
         let outcome = apply_rewrites(&rules, "/old/profile");
         match outcome {
-            RewriteResult::Rewritten { new_uri, restart_routing } => {
+            RewriteResult::Rewritten {
+                new_uri,
+                restart_routing,
+            } => {
                 assert_eq!(new_uri, "/new/profile");
                 assert!(restart_routing, "`last` flag must request a re-match");
             }
@@ -3299,7 +3655,7 @@ mod tests {
 
     #[test]
     fn test_h3_rewrite_loop_helpers_yield_redirect() {
-        use crate::proxy::rewrite::{apply_rewrites, compile_rules, RewriteResult};
+        use crate::proxy::rewrite::{RewriteResult, apply_rewrites, compile_rules};
         let rules = compile_rules(&[(
             "^/legacy(.*)$".to_string(),
             "https://new.example.com$1".to_string(),
@@ -3320,7 +3676,7 @@ mod tests {
     /// branch breaks out without modifying `path`.
     #[test]
     fn test_h3_rewrite_loop_no_match_leaves_path_unchanged() {
-        use crate::proxy::rewrite::{apply_rewrites, compile_rules, RewriteResult};
+        use crate::proxy::rewrite::{RewriteResult, apply_rewrites, compile_rules};
         let rules = compile_rules(&[(
             "^/match-me$".to_string(),
             "/somewhere".to_string(),
@@ -3355,7 +3711,11 @@ mod tests {
         let result = mgr.execute_response_headers(&ctx);
         // No plugins → no header overrides — result.headers should be None or empty.
         assert!(
-            result.headers.as_ref().map(|h| h.is_empty()).unwrap_or(true),
+            result
+                .headers
+                .as_ref()
+                .map(|h| h.is_empty())
+                .unwrap_or(true),
             "empty plugin chain should not synthesize headers"
         );
     }
@@ -3431,10 +3791,19 @@ mod tests {
             r.auth_jwt_secret = Some("ignored".into());
         });
         let h = hyper::HeaderMap::new();
-        let out =
-            apply_h3_auth_chain(route.as_ref(), &cfg, &h, &hyper::Method::GET, "/", &empty_oidc_store()).await;
+        let out = apply_h3_auth_chain(
+            route.as_ref(),
+            &cfg,
+            &h,
+            &hyper::Method::GET,
+            "/",
+            &empty_oidc_store(),
+        )
+        .await;
         match out {
-            H3AuthOutcome::Denied { www_authenticate, .. } => {
+            H3AuthOutcome::Denied {
+                www_authenticate, ..
+            } => {
                 let v = www_authenticate.unwrap();
                 let s = v.to_str().unwrap();
                 assert!(
@@ -3444,5 +3813,176 @@ mod tests {
             }
             other => panic!("expected Denied, got {:?}", other),
         }
+    }
+
+    // ── Dynamic route resolution (parity with HTTP/1 + HTTP/2) ────────────
+
+    #[test]
+    fn test_resolve_h3_route_static_only() {
+        let mut cfg = AppConfig::default();
+        let mut rc = RouteConfig::default();
+        rc.upstream = Some("static-pool".to_string());
+        cfg.routes.insert("/api".to_string(), rc.clone());
+
+        let dynamic = dashmap::DashMap::new();
+        let (path, route) = resolve_h3_route("/api/v1", &dynamic, &cfg).unwrap();
+        assert_eq!(path, "/api");
+        assert_eq!(route.upstream.as_deref(), Some("static-pool"));
+    }
+
+    #[test]
+    fn test_resolve_h3_route_dynamic_overrides_static() {
+        let mut cfg = AppConfig::default();
+        let mut static_rc = RouteConfig::default();
+        static_rc.upstream = Some("static-pool".to_string());
+        cfg.routes.insert("/api".to_string(), static_rc);
+
+        let dynamic = dashmap::DashMap::new();
+        let mut dyn_rc = RouteConfig::default();
+        dyn_rc.upstream = Some("dynamic-pool".to_string());
+        dynamic.insert("/api/v2".to_string(), dyn_rc);
+
+        // /api/v2 matches the dynamic route (longer prefix)
+        let (path, route) = resolve_h3_route("/api/v2/users", &dynamic, &cfg).unwrap();
+        assert_eq!(path, "/api/v2");
+        assert_eq!(route.upstream.as_deref(), Some("dynamic-pool"));
+
+        // /api/v1 only matches the static route
+        let (path, route) = resolve_h3_route("/api/v1/users", &dynamic, &cfg).unwrap();
+        assert_eq!(path, "/api");
+        assert_eq!(route.upstream.as_deref(), Some("static-pool"));
+    }
+
+    #[test]
+    fn test_resolve_h3_route_dynamic_takes_priority_even_when_shorter() {
+        // When a dynamic route and static route both match, the longest prefix wins
+        // regardless of which map it came from.
+        let mut cfg = AppConfig::default();
+        let mut static_rc = RouteConfig::default();
+        static_rc.upstream = Some("static-pool".to_string());
+        cfg.routes.insert("/api/v2/special".to_string(), static_rc);
+
+        let dynamic = dashmap::DashMap::new();
+        let mut dyn_rc = RouteConfig::default();
+        dyn_rc.upstream = Some("dynamic-pool".to_string());
+        dynamic.insert("/api/v2".to_string(), dyn_rc);
+
+        // Longest match is /api/v2/special from static config
+        let (path, route) = resolve_h3_route("/api/v2/special/case", &dynamic, &cfg).unwrap();
+        assert_eq!(path, "/api/v2/special");
+        assert_eq!(route.upstream.as_deref(), Some("static-pool"));
+    }
+
+    #[test]
+    fn test_resolve_h3_route_fallback_to_root() {
+        let mut cfg = AppConfig::default();
+        let mut root_rc = RouteConfig::default();
+        root_rc.upstream = Some("root-pool".to_string());
+        cfg.routes.insert("/".to_string(), root_rc.clone());
+
+        let dynamic = dashmap::DashMap::new();
+        let (path, route) = resolve_h3_route("/no-match-here", &dynamic, &cfg).unwrap();
+        assert_eq!(path, "/");
+        assert_eq!(route.upstream.as_deref(), Some("root-pool"));
+    }
+
+    #[test]
+    fn test_resolve_h3_route_no_routes_at_all() {
+        let mut cfg = AppConfig::default();
+        cfg.routes.clear(); // remove the default "/" route
+        let dynamic = dashmap::DashMap::new();
+        assert!(resolve_h3_route("/anything", &dynamic, &cfg).is_none());
+    }
+
+    // ── CORS parity tests (HTTP/3 mirrors HTTP/1 + HTTP/2) ────────────────
+
+    #[test]
+    fn test_build_h3_cors_preflight_disabled_returns_none() {
+        let mut route = RouteConfig::default();
+        route.cors_enabled = false;
+        assert!(build_h3_cors_preflight_response(&route, Some("https://example.com")).is_none());
+    }
+
+    #[test]
+    fn test_build_h3_cors_preflight_no_origin_returns_none() {
+        let mut route = RouteConfig::default();
+        route.cors_enabled = true;
+        assert!(build_h3_cors_preflight_response(&route, None).is_none());
+    }
+
+    #[test]
+    fn test_build_h3_cors_preflight_denied_origin_returns_none() {
+        let mut route = RouteConfig::default();
+        route.cors_enabled = true;
+        route.cors_allowed_origins = vec!["https://trusted.com".to_string()];
+        assert!(build_h3_cors_preflight_response(&route, Some("https://evil.com")).is_none());
+    }
+
+    #[test]
+    fn test_build_h3_cors_preflight_wildcard_origin() {
+        let mut route = RouteConfig::default();
+        route.cors_enabled = true;
+        route.cors_allowed_methods = vec!["GET".to_string(), "POST".to_string()];
+        route.cors_allowed_headers = vec!["Content-Type".to_string()];
+        route.cors_max_age_secs = 86400;
+        route.cors_allow_credentials = true;
+
+        let resp = build_h3_cors_preflight_response(&route, Some("https://any.com")).unwrap();
+        assert_eq!(resp.status(), hyper::StatusCode::NO_CONTENT);
+        let h = resp.headers();
+        assert_eq!(h["access-control-allow-origin"], "*");
+        assert_eq!(h["access-control-allow-methods"], "GET, POST");
+        assert_eq!(h["access-control-allow-headers"], "Content-Type");
+        assert_eq!(h["access-control-max-age"], "86400");
+        assert_eq!(h["access-control-allow-credentials"], "true");
+    }
+
+    #[test]
+    fn test_build_h3_cors_preflight_specific_origin() {
+        let mut route = RouteConfig::default();
+        route.cors_enabled = true;
+        route.cors_allowed_origins = vec!["https://app.example.com".to_string()];
+        route.cors_allowed_methods = vec!["PUT".to_string()];
+
+        let resp = build_h3_cors_preflight_response(&route, Some("https://app.example.com")).unwrap();
+        assert_eq!(resp.headers()["access-control-allow-origin"], "https://app.example.com");
+        assert_eq!(resp.headers()["access-control-allow-methods"], "PUT");
+    }
+
+    #[test]
+    fn test_inject_h3_cors_response_headers_wildcard() {
+        let mut route = RouteConfig::default();
+        route.cors_enabled = true;
+        route.cors_allow_credentials = false;
+
+        let builder = inject_h3_cors_response_headers(hyper::Response::builder(), &route);
+        let resp = builder.body(()).unwrap();
+        let h = resp.headers();
+        assert_eq!(h["access-control-allow-origin"], "*");
+        assert!(!h.contains_key("access-control-allow-credentials"));
+    }
+
+    #[test]
+    fn test_inject_h3_cors_response_headers_specific_origin_with_credentials() {
+        let mut route = RouteConfig::default();
+        route.cors_enabled = true;
+        route.cors_allowed_origins = vec!["https://a.com".to_string()];
+        route.cors_allow_credentials = true;
+
+        let builder = inject_h3_cors_response_headers(hyper::Response::builder(), &route);
+        let resp = builder.body(()).unwrap();
+        let h = resp.headers();
+        assert_eq!(h["access-control-allow-origin"], "https://a.com");
+        assert_eq!(h["access-control-allow-credentials"], "true");
+    }
+
+    #[test]
+    fn test_inject_h3_cors_response_headers_disabled_is_noop() {
+        let mut route = RouteConfig::default();
+        route.cors_enabled = false;
+
+        let builder = inject_h3_cors_response_headers(hyper::Response::builder(), &route);
+        let resp = builder.body(()).unwrap();
+        assert!(!resp.headers().contains_key("access-control-allow-origin"));
     }
 }

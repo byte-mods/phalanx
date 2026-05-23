@@ -31,8 +31,20 @@ struct GeoTrie {
 
 impl GeoTrie {
     /// Insert a CIDR range with its country metadata.
-    fn insert(&mut self, network: u128, _mask: u128, prefix_len: u8, is_v4: bool, code: &str, name: &str) {
-        let root = if is_v4 { &mut self.v4_root } else { &mut self.v6_root };
+    fn insert(
+        &mut self,
+        network: u128,
+        _mask: u128,
+        prefix_len: u8,
+        is_v4: bool,
+        code: &str,
+        name: &str,
+    ) {
+        let root = if is_v4 {
+            &mut self.v4_root
+        } else {
+            &mut self.v6_root
+        };
         let total_bits: u8 = if is_v4 { 32 } else { 128 };
         let mut node = root;
 
@@ -162,10 +174,7 @@ impl GeoIpDatabase {
         let entries = count_trie_entries(&trie);
         self.trie.store(Arc::new(trie));
         self.cache.clear();
-        info!(
-            "GeoIP database reloaded: {} entries from {}",
-            entries, path
-        );
+        info!("GeoIP database reloaded: {} entries from {}", entries, path);
         Ok(())
     }
 
@@ -308,10 +317,7 @@ pub fn inject_geo_headers(headers: &mut hyper::HeaderMap, geo: &GeoResult) {
         );
     }
     if let Ok(val) = geo.country_name.parse() {
-        headers.insert(
-            hyper::header::HeaderName::from_static("x-geo-country"),
-            val,
-        );
+        headers.insert(hyper::header::HeaderName::from_static("x-geo-country"), val);
     }
 }
 
@@ -525,7 +531,9 @@ mod tests {
             "XX"
         );
         assert_eq!(
-            db.lookup(&"255.255.255.255".parse().unwrap()).unwrap().country_code,
+            db.lookup(&"255.255.255.255".parse().unwrap())
+                .unwrap()
+                .country_code,
             "XX"
         );
     }

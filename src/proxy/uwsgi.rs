@@ -74,7 +74,8 @@ where
 {
     let start_time = std::time::Instant::now();
 
-    let stream = match tokio::time::timeout(CONNECT_TIMEOUT, TcpStream::connect(&uwsgi_pass)).await {
+    let stream = match tokio::time::timeout(CONNECT_TIMEOUT, TcpStream::connect(&uwsgi_pass)).await
+    {
         Ok(Ok(s)) => s,
         Ok(Err(e)) => {
             error!("Failed to connect to uWSGI server {}: {}", uwsgi_pass, e);
@@ -158,7 +159,7 @@ where
     let mut header = vec![0; 4];
     header[0] = 0; // modifier1=0 (WSGI Python application)
     let data_size = payload.len() as u16;
-    header[1] = (data_size & 0xff) as u8;       // low byte of payload size
+    header[1] = (data_size & 0xff) as u8; // low byte of payload size
     header[2] = ((data_size >> 8) & 0xff) as u8; // high byte of payload size
     header[3] = 0; // modifier2 (unused for standard WSGI)
 
@@ -210,10 +211,14 @@ where
                 Err(_) => break,
             }
         }
-    }).await;
+    })
+    .await;
 
     if header_read.is_err() {
-        error!("uWSGI response header read timeout ({}s)", EXEC_TIMEOUT.as_secs());
+        error!(
+            "uWSGI response header read timeout ({}s)",
+            EXEC_TIMEOUT.as_secs()
+        );
         return Ok(empty_response(StatusCode::GATEWAY_TIMEOUT));
     }
 
@@ -279,10 +284,11 @@ where
         }
     };
 
-    let stream_body = BodyExt::boxed(BodyExt::map_err(
-        StreamBody::new(uwsgi_stream),
-        |never| match never {},
-    ));
+    let stream_body =
+        BodyExt::boxed(BodyExt::map_err(
+            StreamBody::new(uwsgi_stream),
+            |never| match never {},
+        ));
     let response = builder.body(stream_body).unwrap();
 
     let latency = start_time.elapsed().as_millis() as u64;

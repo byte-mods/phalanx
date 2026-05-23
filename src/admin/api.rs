@@ -2,7 +2,7 @@
 //! certificate management, upstream listing, cache purge, and ML fraud-detection
 //! model lifecycle endpoints.
 
-use actix_web::{delete, get, post, put, web, HttpResponse, Responder};
+use actix_web::{HttpResponse, Responder, delete, get, post, put, web};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -24,7 +24,10 @@ impl ExtendedAdminState {
     /// The `admin_api_tokens` map in AppConfig stores `token → role_name` pairs
     /// parsed from `api_token TOKEN ROLE;` directives. Role names are matched
     /// case-insensitively: "admin", "operator", "readonly".
-    pub fn new(base: super::AdminState, config_tokens: &std::collections::HashMap<String, String>) -> Self {
+    pub fn new(
+        base: super::AdminState,
+        config_tokens: &std::collections::HashMap<String, String>,
+    ) -> Self {
         let api_tokens = Arc::new(dashmap::DashMap::new());
         for (token, role_str) in config_tokens {
             let role = match role_str.to_lowercase().as_str() {
@@ -43,10 +46,7 @@ impl ExtendedAdminState {
             api_tokens.insert(token.clone(), role);
         }
 
-        Self {
-            base,
-            api_tokens,
-        }
+        Self { base, api_tokens }
     }
 }
 
@@ -197,7 +197,7 @@ pub async fn list_routes(
 }
 
 /// DELETE /api/routes/{path} -- removes a dynamic route (requires Operator+).
-#[delete("/api/routes/{path}")]
+#[delete("/api/routes/{path:.*}")]
 pub async fn delete_route(
     state: web::Data<ExtendedAdminState>,
     path: web::Path<String>,
@@ -364,20 +364,26 @@ pub async fn ml_upload(
     match write_result {
         Ok(Ok(())) => {}
         Ok(Err(e)) => {
-            return HttpResponse::InternalServerError().json(serde_json::json!({ "error": format!("Failed to write model: {}", e) }));
+            return HttpResponse::InternalServerError()
+                .json(serde_json::json!({ "error": format!("Failed to write model: {}", e) }));
         }
         Err(_) => {
-            return HttpResponse::InternalServerError().json(serde_json::json!({ "error": "spawn_blocking failed for model write" }));
+            return HttpResponse::InternalServerError()
+                .json(serde_json::json!({ "error": "spawn_blocking failed for model write" }));
         }
     }
 
     let model_path = "models/fraud_model.onnx";
 
-    state.waf.ml_engine.load_model(
-        model_path,
-        Arc::clone(&state.waf.reputation),
-        Some(state.metrics.ml_model_load_failures.clone()),
-    ).await;
+    state
+        .waf
+        .ml_engine
+        .load_model(
+            model_path,
+            Arc::clone(&state.waf.reputation),
+            Some(state.metrics.ml_model_load_failures.clone()),
+        )
+        .await;
 
     HttpResponse::Ok().json(serde_json::json!({
         "status": "model_loaded",
@@ -387,9 +393,7 @@ pub async fn ml_upload(
 
 /// GET /api/ml/logs -- returns the in-memory ML inference audit log.
 #[get("/api/ml/logs")]
-pub async fn ml_logs(
-    state: web::Data<crate::admin::AdminState>,
-) -> impl Responder {
+pub async fn ml_logs(state: web::Data<crate::admin::AdminState>) -> impl Responder {
     let logs_guard = state.waf.ml_engine.logs.read().await;
     let logs: Vec<_> = logs_guard.iter().cloned().collect();
     HttpResponse::Ok().json(serde_json::json!({ "logs": logs }))
@@ -404,7 +408,10 @@ pub async fn ml_mode(
     let mode = match req.mode.to_lowercase().as_str() {
         "active" => crate::waf::ml_fraud::MlFraudMode::Active,
         "shadow" => crate::waf::ml_fraud::MlFraudMode::Shadow,
-        _ => return HttpResponse::BadRequest().json(serde_json::json!({ "error": "Invalid mode. Use 'shadow' or 'active'." })),
+        _ => {
+            return HttpResponse::BadRequest()
+                .json(serde_json::json!({ "error": "Invalid mode. Use 'shadow' or 'active'." }));
+        }
     };
 
     state.waf.ml_engine.mode.store(Arc::new(mode));
@@ -513,21 +520,36 @@ mod tests {
 
         // Verify role parsing
         assert_eq!(
-            match config_tokens.get("token-admin").unwrap().to_lowercase().as_str() {
+            match config_tokens
+                .get("token-admin")
+                .unwrap()
+                .to_lowercase()
+                .as_str()
+            {
                 "admin" => ApiRole::Admin,
                 _ => ApiRole::ReadOnly,
             },
             ApiRole::Admin
         );
         assert_eq!(
-            match config_tokens.get("token-op").unwrap().to_lowercase().as_str() {
+            match config_tokens
+                .get("token-op")
+                .unwrap()
+                .to_lowercase()
+                .as_str()
+            {
                 "operator" => ApiRole::Operator,
                 _ => ApiRole::ReadOnly,
             },
             ApiRole::Operator
         );
         assert_eq!(
-            match config_tokens.get("token-ro").unwrap().to_lowercase().as_str() {
+            match config_tokens
+                .get("token-ro")
+                .unwrap()
+                .to_lowercase()
+                .as_str()
+            {
                 "readonly" => ApiRole::ReadOnly,
                 _ => ApiRole::ReadOnly,
             },

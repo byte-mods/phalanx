@@ -9,8 +9,8 @@
 //! Optional webhook (`webhook_url`) receives a JSON POST for every new alert.
 
 use crate::telemetry::bandwidth::{AlertLevel, BandwidthAlert, BandwidthTracker};
-use serde::{Deserialize, Serialize};
 use dashmap::DashMap;
+use serde::{Deserialize, Serialize};
 use std::{
     collections::VecDeque,
     sync::Arc,
@@ -99,7 +99,7 @@ pub struct SystemThresholds {
 impl Default for SystemThresholds {
     fn default() -> Self {
         Self {
-            memory_warn_bytes: 512 * 1024 * 1024,       // 512 MiB
+            memory_warn_bytes: 512 * 1024 * 1024,          // 512 MiB
             memory_critical_bytes: 2 * 1024 * 1024 * 1024, // 2 GiB
             fd_warn: 10_000,
             fd_critical: 60_000,
@@ -176,15 +176,25 @@ impl AlertEngine {
                                     let bytes = kb * 1024;
                                     if bytes >= thresholds.memory_critical_bytes {
                                         alerts.push(AlertRecord::system(
-                                            "critical", "memory",
-                                            format!("Process RSS {:.1} GiB exceeds critical threshold", bytes as f64 / (1024.0 * 1024.0 * 1024.0)),
-                                            bytes as f64, thresholds.memory_critical_bytes as f64,
+                                            "critical",
+                                            "memory",
+                                            format!(
+                                                "Process RSS {:.1} GiB exceeds critical threshold",
+                                                bytes as f64 / (1024.0 * 1024.0 * 1024.0)
+                                            ),
+                                            bytes as f64,
+                                            thresholds.memory_critical_bytes as f64,
                                         ));
                                     } else if bytes >= thresholds.memory_warn_bytes {
                                         alerts.push(AlertRecord::system(
-                                            "warning", "memory",
-                                            format!("Process RSS {:.1} MiB exceeds warning threshold", bytes as f64 / (1024.0 * 1024.0)),
-                                            bytes as f64, thresholds.memory_warn_bytes as f64,
+                                            "warning",
+                                            "memory",
+                                            format!(
+                                                "Process RSS {:.1} MiB exceeds warning threshold",
+                                                bytes as f64 / (1024.0 * 1024.0)
+                                            ),
+                                            bytes as f64,
+                                            thresholds.memory_warn_bytes as f64,
                                         ));
                                     }
                                 }
@@ -203,15 +213,25 @@ impl AlertEngine {
                     let bytes = usage.ru_maxrss as u64;
                     if bytes >= thresholds.memory_critical_bytes {
                         alerts.push(AlertRecord::system(
-                            "critical", "memory",
-                            format!("Process RSS {:.1} GiB exceeds critical threshold", bytes as f64 / (1024.0 * 1024.0 * 1024.0)),
-                            bytes as f64, thresholds.memory_critical_bytes as f64,
+                            "critical",
+                            "memory",
+                            format!(
+                                "Process RSS {:.1} GiB exceeds critical threshold",
+                                bytes as f64 / (1024.0 * 1024.0 * 1024.0)
+                            ),
+                            bytes as f64,
+                            thresholds.memory_critical_bytes as f64,
                         ));
                     } else if bytes >= thresholds.memory_warn_bytes {
                         alerts.push(AlertRecord::system(
-                            "warning", "memory",
-                            format!("Process RSS {:.1} MiB exceeds warning threshold", bytes as f64 / (1024.0 * 1024.0)),
-                            bytes as f64, thresholds.memory_warn_bytes as f64,
+                            "warning",
+                            "memory",
+                            format!(
+                                "Process RSS {:.1} MiB exceeds warning threshold",
+                                bytes as f64 / (1024.0 * 1024.0)
+                            ),
+                            bytes as f64,
+                            thresholds.memory_warn_bytes as f64,
                         ));
                     }
                 }
@@ -224,15 +244,25 @@ impl AlertEngine {
                     let fd_count = entries.count() as u64;
                     if fd_count >= thresholds.fd_critical {
                         alerts.push(AlertRecord::system(
-                            "critical", "file_descriptors",
-                            format!("Open FD count {} exceeds critical threshold {}", fd_count, thresholds.fd_critical),
-                            fd_count as f64, thresholds.fd_critical as f64,
+                            "critical",
+                            "file_descriptors",
+                            format!(
+                                "Open FD count {} exceeds critical threshold {}",
+                                fd_count, thresholds.fd_critical
+                            ),
+                            fd_count as f64,
+                            thresholds.fd_critical as f64,
                         ));
                     } else if fd_count >= thresholds.fd_warn {
                         alerts.push(AlertRecord::system(
-                            "warning", "file_descriptors",
-                            format!("Open FD count {} exceeds warning threshold {}", fd_count, thresholds.fd_warn),
-                            fd_count as f64, thresholds.fd_warn as f64,
+                            "warning",
+                            "file_descriptors",
+                            format!(
+                                "Open FD count {} exceeds warning threshold {}",
+                                fd_count, thresholds.fd_warn
+                            ),
+                            fd_count as f64,
+                            thresholds.fd_warn as f64,
                         ));
                     }
                 }
@@ -245,22 +275,34 @@ impl AlertEngine {
                     let fd_count = entries.count() as u64;
                     if fd_count >= thresholds.fd_critical {
                         alerts.push(AlertRecord::system(
-                            "critical", "file_descriptors",
-                            format!("Open FD count {} exceeds critical threshold {}", fd_count, thresholds.fd_critical),
-                            fd_count as f64, thresholds.fd_critical as f64,
+                            "critical",
+                            "file_descriptors",
+                            format!(
+                                "Open FD count {} exceeds critical threshold {}",
+                                fd_count, thresholds.fd_critical
+                            ),
+                            fd_count as f64,
+                            thresholds.fd_critical as f64,
                         ));
                     } else if fd_count >= thresholds.fd_warn {
                         alerts.push(AlertRecord::system(
-                            "warning", "file_descriptors",
-                            format!("Open FD count {} exceeds warning threshold {}", fd_count, thresholds.fd_warn),
-                            fd_count as f64, thresholds.fd_warn as f64,
+                            "warning",
+                            "file_descriptors",
+                            format!(
+                                "Open FD count {} exceeds warning threshold {}",
+                                fd_count, thresholds.fd_warn
+                            ),
+                            fd_count as f64,
+                            thresholds.fd_warn as f64,
                         ));
                     }
                 }
             }
 
             alerts
-        }).await {
+        })
+        .await
+        {
             new_alerts.extend(sys_alerts);
         }
 
@@ -317,10 +359,13 @@ impl AlertEngine {
 
     /// Spawn a background task that calls `check()` every `interval_secs` seconds.
     /// The task exits cleanly when `cancel` is signalled.
-    pub fn spawn_background_check(self: Arc<Self>, interval_secs: u64, cancel: tokio_util::sync::CancellationToken) {
+    pub fn spawn_background_check(
+        self: Arc<Self>,
+        interval_secs: u64,
+        cancel: tokio_util::sync::CancellationToken,
+    ) {
         tokio::spawn(async move {
-            let mut ticker =
-                tokio::time::interval(std::time::Duration::from_secs(interval_secs));
+            let mut ticker = tokio::time::interval(std::time::Duration::from_secs(interval_secs));
             loop {
                 tokio::select! {
                     _ = cancel.cancelled() => {
@@ -361,11 +406,7 @@ async fn send_webhook(url: &str, alert: &AlertRecord) {
             if resp.status().is_success() {
                 tracing::debug!("Alert webhook delivered to {}", url);
             } else {
-                tracing::warn!(
-                    "Alert webhook to {} returned HTTP {}",
-                    url,
-                    resp.status()
-                );
+                tracing::warn!("Alert webhook to {} returned HTTP {}", url, resp.status());
             }
         }
         Err(e) => {
@@ -430,12 +471,15 @@ mod tests {
     #[tokio::test]
     async fn test_bandwidth_alert_fires() {
         let tracker = Arc::new(BandwidthTracker::new());
-        tracker.set_threshold("tcp", ProtocolThreshold {
-            bandwidth_bps_warn: 100,
-            bandwidth_bps_critical: 1_000_000,
-            connections_warn: 999_999,
-            connections_critical: 9_999_999,
-        });
+        tracker.set_threshold(
+            "tcp",
+            ProtocolThreshold {
+                bandwidth_bps_warn: 100,
+                bandwidth_bps_critical: 1_000_000,
+                connections_warn: 999_999,
+                connections_critical: 9_999_999,
+            },
+        );
         let engine = AlertEngine::new(Arc::clone(&tracker));
         engine.check().await; // establish baseline
         tokio::time::sleep(std::time::Duration::from_millis(5)).await;
@@ -443,24 +487,35 @@ mod tests {
         engine.check().await; // rate now exceeds threshold
         assert!(engine.count().await > 0);
         let recent = engine.recent(10).await;
-        assert!(recent.iter().any(|a| a.protocol == "tcp" && a.metric == "bandwidth"));
+        assert!(
+            recent
+                .iter()
+                .any(|a| a.protocol == "tcp" && a.metric == "bandwidth")
+        );
     }
 
     #[tokio::test]
     async fn test_connection_alert_fires() {
         let tracker = BandwidthTracker::new();
-        tracker.set_threshold("websocket", ProtocolThreshold {
-            bandwidth_bps_warn: u64::MAX,
-            bandwidth_bps_critical: u64::MAX,
-            connections_warn: 1,
-            connections_critical: 100,
-        });
+        tracker.set_threshold(
+            "websocket",
+            ProtocolThreshold {
+                bandwidth_bps_warn: u64::MAX,
+                bandwidth_bps_critical: u64::MAX,
+                connections_warn: 1,
+                connections_critical: 100,
+            },
+        );
         tracker.protocol("websocket").conn_open();
         tracker.protocol("websocket").conn_open();
         let engine = AlertEngine::new(tracker);
         engine.check().await;
         let recent = engine.recent(10).await;
-        assert!(recent.iter().any(|a| a.protocol == "websocket" && a.metric == "connections"));
+        assert!(
+            recent
+                .iter()
+                .any(|a| a.protocol == "websocket" && a.metric == "connections")
+        );
     }
 
     #[tokio::test]
@@ -468,12 +523,15 @@ mod tests {
         let tracker = Arc::new(BandwidthTracker::new());
         // Set tiny thresholds
         for proto in &["http1", "http2"] {
-            tracker.set_threshold(proto, ProtocolThreshold {
-                bandwidth_bps_warn: 1,
-                bandwidth_bps_critical: u64::MAX,
-                connections_warn: 999_999,
-                connections_critical: 9_999_999,
-            });
+            tracker.set_threshold(
+                proto,
+                ProtocolThreshold {
+                    bandwidth_bps_warn: 1,
+                    bandwidth_bps_critical: u64::MAX,
+                    connections_warn: 999_999,
+                    connections_critical: 9_999_999,
+                },
+            );
         }
         let engine = AlertEngine::new(Arc::clone(&tracker));
         engine.check().await; // establish baseline
@@ -496,12 +554,15 @@ mod tests {
         // Set low threshold on many protocols to generate lots of alerts
         for i in 0..10 {
             let proto = format!("proto_{}", i);
-            tracker.set_threshold(&proto, ProtocolThreshold {
-                bandwidth_bps_warn: 1,
-                bandwidth_bps_critical: u64::MAX,
-                connections_warn: 999_999,
-                connections_critical: 9_999_999,
-            });
+            tracker.set_threshold(
+                &proto,
+                ProtocolThreshold {
+                    bandwidth_bps_warn: 1,
+                    bandwidth_bps_critical: u64::MAX,
+                    connections_warn: 999_999,
+                    connections_critical: 9_999_999,
+                },
+            );
             tracker.protocol(&proto).add_in(5);
         }
         let engine = AlertEngine::new(Arc::clone(&tracker));
@@ -519,27 +580,38 @@ mod tests {
         let engine = make_engine_with_thresholds(
             tracker,
             SystemThresholds {
-                memory_warn_bytes: 1,       // 1 byte — will always trigger
+                memory_warn_bytes: 1, // 1 byte — will always trigger
                 memory_critical_bytes: u64::MAX,
-                fd_warn: 1,                 // 1 FD — will always trigger
+                fd_warn: 1, // 1 FD — will always trigger
                 fd_critical: u64::MAX,
             },
         );
         engine.check().await;
         let recent = engine.recent(10).await;
-        assert!(recent.iter().any(|a| a.category == "system" && a.metric == "memory"));
-        assert!(recent.iter().any(|a| a.category == "system" && a.metric == "file_descriptors"));
+        assert!(
+            recent
+                .iter()
+                .any(|a| a.category == "system" && a.metric == "memory")
+        );
+        assert!(
+            recent
+                .iter()
+                .any(|a| a.category == "system" && a.metric == "file_descriptors")
+        );
     }
 
     #[tokio::test]
     async fn test_alert_record_fields() {
         let tracker = Arc::new(BandwidthTracker::new());
-        tracker.set_threshold("grpc", ProtocolThreshold {
-            bandwidth_bps_warn: 1,
-            bandwidth_bps_critical: u64::MAX,
-            connections_warn: 999_999,
-            connections_critical: 9_999_999,
-        });
+        tracker.set_threshold(
+            "grpc",
+            ProtocolThreshold {
+                bandwidth_bps_warn: 1,
+                bandwidth_bps_critical: u64::MAX,
+                connections_warn: 999_999,
+                connections_critical: 9_999_999,
+            },
+        );
         let engine = AlertEngine::new(Arc::clone(&tracker));
         engine.check().await; // establish baseline
         tokio::time::sleep(std::time::Duration::from_millis(5)).await;
@@ -557,12 +629,15 @@ mod tests {
     #[tokio::test]
     async fn test_alert_deduplication() {
         let tracker = Arc::new(BandwidthTracker::new());
-        tracker.set_threshold("tcp", ProtocolThreshold {
-            bandwidth_bps_warn: 100,
-            bandwidth_bps_critical: u64::MAX,
-            connections_warn: 999_999,
-            connections_critical: 9_999_999,
-        });
+        tracker.set_threshold(
+            "tcp",
+            ProtocolThreshold {
+                bandwidth_bps_warn: 100,
+                bandwidth_bps_critical: u64::MAX,
+                connections_warn: 999_999,
+                connections_critical: 9_999_999,
+            },
+        );
         let engine = AlertEngine::new(Arc::clone(&tracker));
         engine.check().await; // baseline
         tokio::time::sleep(std::time::Duration::from_millis(5)).await;
@@ -576,6 +651,9 @@ mod tests {
         tracker.protocol("tcp").add_in(200);
         engine.check().await;
         let count2 = engine.count().await;
-        assert_eq!(count1, count2, "duplicate alert within cooldown must be suppressed");
+        assert_eq!(
+            count1, count2,
+            "duplicate alert within cooldown must be suppressed"
+        );
     }
 }

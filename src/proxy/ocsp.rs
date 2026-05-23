@@ -107,7 +107,11 @@ impl OcspStapler {
         let resp = if let Some(ref issuer) = self.issuer_der {
             // Build a proper OCSP request body (DER-encoded, minimal ASN.1)
             let ocsp_request = build_ocsp_request(&self.cert_der, issuer)?;
-            debug!("Sending OCSP POST request ({} bytes) to {}", ocsp_request.len(), url);
+            debug!(
+                "Sending OCSP POST request ({} bytes) to {}",
+                ocsp_request.len(),
+                url
+            );
 
             client
                 .post(&url)
@@ -182,10 +186,10 @@ impl OcspStapler {
 fn build_ocsp_request(cert_der: &[u8], issuer_der: &[u8]) -> Result<Vec<u8>, String> {
     use x509_parser::parse_x509_certificate;
 
-    let (_, issuer_cert) =
-        parse_x509_certificate(issuer_der).map_err(|e| format!("Failed to parse issuer certificate: {}", e))?;
-    let (_, server_cert) =
-        parse_x509_certificate(cert_der).map_err(|e| format!("Failed to parse server certificate: {}", e))?;
+    let (_, issuer_cert) = parse_x509_certificate(issuer_der)
+        .map_err(|e| format!("Failed to parse issuer certificate: {}", e))?;
+    let (_, server_cert) = parse_x509_certificate(cert_der)
+        .map_err(|e| format!("Failed to parse server certificate: {}", e))?;
 
     // Hash of the DER encoding of the issuer's distinguished name
     let issuer_name_hash = simple_hash(issuer_cert.tbs_certificate.issuer.as_raw());
@@ -269,7 +273,7 @@ fn der_encode_length(buf: &mut Vec<u8>, len: usize) {
 /// Produces a 20-byte SHA-1 hash of `data` for use as a certificate identifier
 /// in OCSP request URLs, as required by RFC 6960.
 fn simple_hash(data: &[u8]) -> [u8; 20] {
-    use sha1::{Sha1, Digest};
+    use sha1::{Digest, Sha1};
     let mut hasher = Sha1::new();
     hasher.update(data);
     hasher.finalize().into()
@@ -328,7 +332,10 @@ mod tests {
         );
         assert_eq!(stapler.cert_der, vec![1, 2, 3]);
         assert_eq!(stapler.issuer_der, Some(vec![4, 5, 6]));
-        assert_eq!(stapler.responder_url, Some("http://ocsp.example.com".to_string()));
+        assert_eq!(
+            stapler.responder_url,
+            Some("http://ocsp.example.com".to_string())
+        );
     }
 
     #[test]
@@ -356,7 +363,9 @@ mod tests {
         let params = rcgen::CertificateParams::new(vec![common_name.to_string()])
             .expect("Failed to create cert params");
         let key_pair = rcgen::KeyPair::generate().expect("Failed to generate key pair");
-        let cert = params.self_signed(&key_pair).expect("Failed to self-sign cert");
+        let cert = params
+            .self_signed(&key_pair)
+            .expect("Failed to self-sign cert");
         let der = cert.der().to_vec();
         // For self-signed certs, issuer == cert
         (der.clone(), der)
@@ -376,10 +385,8 @@ mod tests {
     #[test]
     fn test_build_ocsp_request_deterministic() {
         let (cert_der, issuer_der) = generate_test_cert("test.example.com");
-        let r1 = build_ocsp_request(&cert_der, &issuer_der)
-            .expect("should produce valid request");
-        let r2 = build_ocsp_request(&cert_der, &issuer_der)
-            .expect("should produce valid request");
+        let r1 = build_ocsp_request(&cert_der, &issuer_der).expect("should produce valid request");
+        let r2 = build_ocsp_request(&cert_der, &issuer_der).expect("should produce valid request");
         assert_eq!(r1, r2);
     }
 
@@ -387,10 +394,8 @@ mod tests {
     fn test_build_ocsp_request_different_for_different_certs() {
         let (cert_a, issuer_a) = generate_test_cert("a.example.com");
         let (cert_b, issuer_b) = generate_test_cert("b.example.com");
-        let r1 = build_ocsp_request(&cert_a, &issuer_a)
-            .expect("should produce valid request");
-        let r2 = build_ocsp_request(&cert_b, &issuer_b)
-            .expect("should produce valid request");
+        let r1 = build_ocsp_request(&cert_a, &issuer_a).expect("should produce valid request");
+        let r2 = build_ocsp_request(&cert_b, &issuer_b).expect("should produce valid request");
         assert_ne!(r1, r2);
     }
 
@@ -405,7 +410,7 @@ mod tests {
         let inner = &[0x04, 0x02, 0x41, 0x42]; // OCTET STRING "AB"
         let seq = der_sequence(&[inner]);
         assert_eq!(seq[0], 0x30); // SEQUENCE tag
-        assert_eq!(seq[1], 4);    // length of inner
+        assert_eq!(seq[1], 4); // length of inner
         assert_eq!(&seq[2..], inner);
     }
 

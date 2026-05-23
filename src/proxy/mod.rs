@@ -527,18 +527,18 @@ pub async fn start_proxy(
 
             // Try to parse as PROXY Protocol v2. On success, override `peer` with
             // the real source address. On failure/mismatch, put all bytes back.
-            let (real_peer, remaining_bytes) =
-                match proxy_proto_v2::parse_v2_header(&pp2_peek[..n]) {
-                    Ok((hdr, consumed)) => {
-                        let real_peer = hdr.src_addr.unwrap_or(peer);
-                        (real_peer, &pp2_peek[consumed..n])
-                    }
-                    Err(proxy_proto_v2::ParseError::NotProxyProtocol) => {
-                        // Not a PP2 connection — treat all peeked bytes as normal traffic
-                        (peer, &pp2_peek[..n])
-                    }
-                    Err(_) => return, // Malformed PP2 header — drop the connection
-                };
+            let (real_peer, remaining_bytes) = match proxy_proto_v2::parse_v2_header(&pp2_peek[..n])
+            {
+                Ok((hdr, consumed)) => {
+                    let real_peer = hdr.src_addr.unwrap_or(peer);
+                    (real_peer, &pp2_peek[consumed..n])
+                }
+                Err(proxy_proto_v2::ParseError::NotProxyProtocol) => {
+                    // Not a PP2 connection — treat all peeked bytes as normal traffic
+                    (peer, &pp2_peek[..n])
+                }
+                Err(_) => return, // Malformed PP2 header — drop the connection
+            };
             let peer = real_peer;
 
             let mut prefix_buf = BytesMut::with_capacity(64);
@@ -982,9 +982,16 @@ async fn handle_http_request(
     let _zone_guard = {
         if !zone_limiter.acquire_connection(&ip_str) {
             log_rejected(
-                &access_logger, &ip_str, &method_str, &path,
-                503, start_time, user_agent.as_deref().unwrap_or(""),
-                &referer, &req_trace_id, 0,
+                &access_logger,
+                &ip_str,
+                &method_str,
+                &path,
+                503,
+                start_time,
+                user_agent.as_deref().unwrap_or(""),
+                &referer,
+                &req_trace_id,
+                0,
             );
             return Ok(error_response(
                 hyper::StatusCode::SERVICE_UNAVAILABLE,
@@ -993,7 +1000,10 @@ async fn handle_http_request(
                 req_accepts_json,
             ));
         }
-        crate::middleware::connlimit::ConnectionGuard::new(Arc::clone(&zone_limiter), ip_str.clone())
+        crate::middleware::connlimit::ConnectionGuard::new(
+            Arc::clone(&zone_limiter),
+            ip_str.clone(),
+        )
     };
 
     // ── Step 2: gRPC-Web Detection ────────────────────────────────────────────
@@ -1028,7 +1038,11 @@ async fn handle_http_request(
                 .unwrap_or(hyper::StatusCode::INTERNAL_SERVER_ERROR);
             return Ok(Response::builder()
                 .status(sc)
-                .body(Full::new(Bytes::from(direct.body)).map_err(|never| match never {}).boxed())
+                .body(
+                    Full::new(Bytes::from(direct.body))
+                        .map_err(|never| match never {})
+                        .boxed(),
+                )
                 .expect("Response::builder is infallible for Full<Bytes> body"));
         }
         if let Some(hdrs) = result.headers {
@@ -1069,7 +1083,11 @@ async fn handle_http_request(
                         .unwrap_or(hyper::StatusCode::INTERNAL_SERVER_ERROR);
                     return Ok(Response::builder()
                         .status(sc)
-                        .body(Full::new(Bytes::from(body)).map_err(|never| match never {}).boxed())
+                        .body(
+                            Full::new(Bytes::from(body))
+                                .map_err(|never| match never {})
+                                .boxed(),
+                        )
                         .expect("Response::builder is infallible for Full<Bytes> body"));
                 }
                 crate::scripting::HookResult::RewritePath(new_path) => {
@@ -1111,9 +1129,16 @@ async fn handle_http_request(
                     .with_label_values(&["captcha_bot_block"])
                     .inc();
                 log_rejected(
-                    &access_logger, &ip_str, &method_str, &path,
-                    403, start_time, user_agent.as_deref().unwrap_or(""),
-                    &referer, &req_trace_id, 0,
+                    &access_logger,
+                    &ip_str,
+                    &method_str,
+                    &path,
+                    403,
+                    start_time,
+                    user_agent.as_deref().unwrap_or(""),
+                    &referer,
+                    &req_trace_id,
+                    0,
                 );
                 return Ok(empty_response(hyper::StatusCode::FORBIDDEN));
             }
@@ -1121,27 +1146,43 @@ async fn handle_http_request(
                 let return_to = build_return_to(&path, query.as_deref());
                 let challenge_html = manager.challenge_html_for(&ip_str, &return_to);
                 log_rejected(
-                    &access_logger, &ip_str, &method_str, &path,
-                    403, start_time, user_agent.as_deref().unwrap_or(""),
-                    &referer, &req_trace_id, challenge_html.len() as u64,
+                    &access_logger,
+                    &ip_str,
+                    &method_str,
+                    &path,
+                    403,
+                    start_time,
+                    user_agent.as_deref().unwrap_or(""),
+                    &referer,
+                    &req_trace_id,
+                    challenge_html.len() as u64,
                 );
-                return Ok(html_response(
-                    hyper::StatusCode::FORBIDDEN,
-                    challenge_html,
-                ));
+                return Ok(html_response(hyper::StatusCode::FORBIDDEN, challenge_html));
             }
         }
     }
     if waf_enabled {
         let req_headers_map = headers_to_hashmap(req.headers());
-        if let crate::waf::WafAction::Block(reason) = waf.inspect(&ip_str, &path, query.as_deref(), &req_headers_map, user_agent.as_deref())
-        {
+        if let crate::waf::WafAction::Block(reason) = waf.inspect(
+            &ip_str,
+            &path,
+            query.as_deref(),
+            &req_headers_map,
+            user_agent.as_deref(),
+        ) {
             warn!("WAF blocked request from {}: {}", ip_str, reason);
             metrics.waf_blocks_total.with_label_values(&[&reason]).inc();
             log_rejected(
-                &access_logger, &ip_str, &method_str, &path,
-                403, start_time, user_agent.as_deref().unwrap_or(""),
-                &referer, &req_trace_id, 0,
+                &access_logger,
+                &ip_str,
+                &method_str,
+                &path,
+                403,
+                start_time,
+                user_agent.as_deref().unwrap_or(""),
+                &referer,
+                &req_trace_id,
+                0,
             );
             return Ok(empty_response(hyper::StatusCode::FORBIDDEN));
         }
@@ -1152,11 +1193,21 @@ async fn handle_http_request(
     if let Some(ref db) = *geo_db {
         if let Some(geo_result) = db.lookup(&real_ip) {
             if !geo_policy.is_allowed(&geo_result.country_code) {
-                warn!("GeoIP blocked request from {} (country: {})", ip_str, geo_result.country_code);
+                warn!(
+                    "GeoIP blocked request from {} (country: {})",
+                    ip_str, geo_result.country_code
+                );
                 log_rejected(
-                    &access_logger, &ip_str, &method_str, &path,
-                    403, start_time, user_agent.as_deref().unwrap_or(""),
-                    &referer, &req_trace_id, 0,
+                    &access_logger,
+                    &ip_str,
+                    &method_str,
+                    &path,
+                    403,
+                    start_time,
+                    user_agent.as_deref().unwrap_or(""),
+                    &referer,
+                    &req_trace_id,
+                    0,
                 );
                 return Ok(empty_response(hyper::StatusCode::FORBIDDEN));
             }
@@ -1218,7 +1269,9 @@ async fn handle_http_request(
                         *resp.status_mut() = status;
                         resp.headers_mut().insert(
                             hyper::header::LOCATION,
-                            location.parse().unwrap_or_else(|_| hyper::header::HeaderValue::from_static("/")),
+                            location
+                                .parse()
+                                .unwrap_or_else(|_| hyper::header::HeaderValue::from_static("/")),
                         );
                         return Ok(resp);
                     }
@@ -1233,9 +1286,7 @@ async fn handle_http_request(
                                  possible mutually-referencing rules. Last URI: {}",
                                 MAX_REWRITE_ITERATIONS, new_uri
                             );
-                            return Ok(empty_response(
-                                hyper::StatusCode::INTERNAL_SERVER_ERROR,
-                            ));
+                            return Ok(empty_response(hyper::StatusCode::INTERNAL_SERVER_ERROR));
                         }
                         debug!("Rewrite (last): {} -> {}", path, new_uri);
                         path = new_uri;
@@ -1357,10 +1408,12 @@ async fn handle_http_request(
                     resp.headers_mut().insert("access-control-allow-origin", hv);
                 }
                 if let Ok(hv) = methods_str.parse() {
-                    resp.headers_mut().insert("access-control-allow-methods", hv);
+                    resp.headers_mut()
+                        .insert("access-control-allow-methods", hv);
                 }
                 if let Ok(hv) = headers_str.parse() {
-                    resp.headers_mut().insert("access-control-allow-headers", hv);
+                    resp.headers_mut()
+                        .insert("access-control-allow-headers", hv);
                 }
                 if let Ok(hv) = max_age_str.parse() {
                     resp.headers_mut().insert("access-control-max-age", hv);
@@ -1389,9 +1442,16 @@ async fn handle_http_request(
                 AuthResult::Denied(status, msg) => {
                     debug!("Basic auth denied from {}: {}", ip_str, msg);
                     log_rejected(
-                        &access_logger, &ip_str, &method_str, &path,
-                        status.as_u16(), start_time, user_agent.as_deref().unwrap_or(""),
-                        &referer, &req_trace_id, msg.len() as u64,
+                        &access_logger,
+                        &ip_str,
+                        &method_str,
+                        &path,
+                        status.as_u16(),
+                        start_time,
+                        user_agent.as_deref().unwrap_or(""),
+                        &referer,
+                        &req_trace_id,
+                        msg.len() as u64,
                     );
                     let mut resp = error_response(status, &msg, &req_trace_id, req_accepts_json);
                     resp.headers_mut().insert(
@@ -1423,9 +1483,16 @@ async fn handle_http_request(
                 AuthResult::Denied(status, msg) => {
                     debug!("JWT auth denied from {}: {}", ip_str, msg);
                     log_rejected(
-                        &access_logger, &ip_str, &method_str, &path,
-                        status.as_u16(), start_time, user_agent.as_deref().unwrap_or(""),
-                        &referer, &req_trace_id, msg.len() as u64,
+                        &access_logger,
+                        &ip_str,
+                        &method_str,
+                        &path,
+                        status.as_u16(),
+                        start_time,
+                        user_agent.as_deref().unwrap_or(""),
+                        &referer,
+                        &req_trace_id,
+                        msg.len() as u64,
                     );
                     let mut resp = error_response(status, &msg, &req_trace_id, req_accepts_json);
                     resp.headers_mut().insert(
@@ -1464,9 +1531,16 @@ async fn handle_http_request(
                 AuthResult::Denied(status, msg) => {
                     debug!("OAuth auth denied from {}: {}", ip_str, msg);
                     log_rejected(
-                        &access_logger, &ip_str, &method_str, &path,
-                        status.as_u16(), start_time, user_agent.as_deref().unwrap_or(""),
-                        &referer, &req_trace_id, msg.len() as u64,
+                        &access_logger,
+                        &ip_str,
+                        &method_str,
+                        &path,
+                        status.as_u16(),
+                        start_time,
+                        user_agent.as_deref().unwrap_or(""),
+                        &referer,
+                        &req_trace_id,
+                        msg.len() as u64,
                     );
                     let mut resp = error_response(status, &msg, &req_trace_id, req_accepts_json);
                     resp.headers_mut().insert(
@@ -1496,30 +1570,45 @@ async fn handle_http_request(
                 };
                 let auth_result = if let Some(kid_str) = kid {
                     match mgr.find_key(jwks_uri, &kid_str).await {
-                        Some(jwk) => match crate::auth::jwks::JwksManager::decoding_key_from_jwk(&jwk) {
-                            Ok((decoding_key, algo)) => {
-                                use jsonwebtoken::{Validation, decode};
-                                use crate::auth::jwt::Claims;
-                                let mut validation = Validation::new(algo);
-                                validation.validate_aud = false;
-                                match decode::<Claims>(token, &decoding_key, &validation) {
-                                    Ok(data) => {
-                                        for (k, v) in crate::auth::jwt::claims_to_headers(&data.claims) {
-                                            if let (Ok(name), Ok(val)) = (
-                                                hyper::header::HeaderName::from_bytes(k.as_bytes()),
-                                                v.parse::<hyper::header::HeaderValue>(),
-                                            ) {
-                                                req.headers_mut().insert(name, val);
+                        Some(jwk) => {
+                            match crate::auth::jwks::JwksManager::decoding_key_from_jwk(&jwk) {
+                                Ok((decoding_key, algo)) => {
+                                    use crate::auth::jwt::Claims;
+                                    use jsonwebtoken::{Validation, decode};
+                                    let mut validation = Validation::new(algo);
+                                    validation.validate_aud = false;
+                                    match decode::<Claims>(token, &decoding_key, &validation) {
+                                        Ok(data) => {
+                                            for (k, v) in
+                                                crate::auth::jwt::claims_to_headers(&data.claims)
+                                            {
+                                                if let (Ok(name), Ok(val)) = (
+                                                    hyper::header::HeaderName::from_bytes(
+                                                        k.as_bytes(),
+                                                    ),
+                                                    v.parse::<hyper::header::HeaderValue>(),
+                                                ) {
+                                                    req.headers_mut().insert(name, val);
+                                                }
                                             }
+                                            AuthResult::Allowed
                                         }
-                                        AuthResult::Allowed
+                                        Err(_) => AuthResult::Denied(
+                                            hyper::StatusCode::UNAUTHORIZED,
+                                            "JWKS JWT validation failed",
+                                        ),
                                     }
-                                    Err(_) => AuthResult::Denied(hyper::StatusCode::UNAUTHORIZED, "JWKS JWT validation failed"),
                                 }
+                                Err(_) => AuthResult::Denied(
+                                    hyper::StatusCode::UNAUTHORIZED,
+                                    "JWKS key build error",
+                                ),
                             }
-                            Err(_) => AuthResult::Denied(hyper::StatusCode::UNAUTHORIZED, "JWKS key build error"),
-                        },
-                        None => AuthResult::Denied(hyper::StatusCode::UNAUTHORIZED, "JWKS key not found"),
+                        }
+                        None => AuthResult::Denied(
+                            hyper::StatusCode::UNAUTHORIZED,
+                            "JWKS key not found",
+                        ),
                     }
                 } else {
                     AuthResult::Denied(hyper::StatusCode::UNAUTHORIZED, "Missing kid in JWT header")
@@ -1549,31 +1638,32 @@ async fn handle_http_request(
         }
         // 5. OIDC session check
         else if let Some(ref cookie_name) = r_config.auth_oidc_cookie_name {
-            let (result, session) = crate::auth::oidc::check_session(req.headers(), cookie_name, &oidc_sessions);
+            let (result, session) =
+                crate::auth::oidc::check_session(req.headers(), cookie_name, &oidc_sessions);
             match result {
                 AuthResult::Allowed => {
                     if let Some(s) = session {
                         if let Some(ref issuer) = r_config.auth_oidc_issuer {
                             if !crate::auth::oidc::session_matches_issuer(&s, issuer) {
                                 let mut resp = Response::new(
-                                    http_body_util::Full::new(Bytes::from(
-                                        "OIDC issuer mismatch",
-                                    ))
-                                    .map_err(|_| unreachable!())
-                                    .boxed(),
+                                    http_body_util::Full::new(Bytes::from("OIDC issuer mismatch"))
+                                        .map_err(|_| unreachable!())
+                                        .boxed(),
                                 );
                                 *resp.status_mut() = hyper::StatusCode::UNAUTHORIZED;
                                 return Ok(resp);
                             }
                         }
                         if let Ok(val) = s.sub.parse::<hyper::header::HeaderValue>() {
-                            req.headers_mut().insert(
-                                hyper::header::HeaderName::from_static("x-auth-sub"), val);
+                            req.headers_mut()
+                                .insert(hyper::header::HeaderName::from_static("x-auth-sub"), val);
                         }
                         if let Some(email) = s.email {
                             if let Ok(val) = email.parse::<hyper::header::HeaderValue>() {
                                 req.headers_mut().insert(
-                                    hyper::header::HeaderName::from_static("x-auth-email"), val);
+                                    hyper::header::HeaderName::from_static("x-auth-email"),
+                                    val,
+                                );
                             }
                         }
                     }
@@ -1658,13 +1748,20 @@ async fn handle_http_request(
     // Enforce client_max_body_size before buffering/forwarding the request body.
     let max_body = {
         let route_limit = route.map(|(_, r)| r.client_max_body_size).unwrap_or(0);
-        if route_limit > 0 { route_limit } else { app_config.client_max_body_size }
+        if route_limit > 0 {
+            route_limit
+        } else {
+            app_config.client_max_body_size
+        }
     };
     if max_body > 0 {
         if let Some(cl) = req.headers().get(hyper::header::CONTENT_LENGTH) {
             if let Ok(len) = cl.to_str().unwrap_or("0").parse::<usize>() {
                 if len > max_body {
-                    warn!("Request body too large from {}: {} > {} bytes", ip_str, len, max_body);
+                    warn!(
+                        "Request body too large from {}: {} > {} bytes",
+                        ip_str, len, max_body
+                    );
                     return Ok(empty_response(hyper::StatusCode::PAYLOAD_TOO_LARGE));
                 }
             }
@@ -1672,9 +1769,7 @@ async fn handle_http_request(
     }
 
     // Route-level/body-dependent features should buffer only when needed.
-    let route_has_mirror = route
-        .and_then(|(_, r)| r.mirror_pool.as_ref())
-        .is_some()
+    let route_has_mirror = route.and_then(|(_, r)| r.mirror_pool.as_ref()).is_some()
         || app_config.mirror_pool.is_some();
     let should_buffer_request_body = waf_enabled
         || is_grpc_web_req
@@ -1709,14 +1804,19 @@ async fn handle_http_request(
         };
         if waf_enabled && !body_bytes.is_empty() {
             let body_text = String::from_utf8_lossy(&body_bytes);
-            if let crate::waf::WafAction::Block(reason) = waf.inspect_body(&ip_str, &body_text, &path, query.as_deref()) {
+            if let crate::waf::WafAction::Block(reason) =
+                waf.inspect_body(&ip_str, &body_text, &path, query.as_deref())
+            {
                 warn!("WAF blocked request body from {}: {}", ip_str, reason);
                 metrics.waf_blocks_total.with_label_values(&[&reason]).inc();
                 return Ok(empty_response(hyper::StatusCode::FORBIDDEN));
             }
         }
         ml_body_len = body_bytes.len();
-        ml_body_snippet = String::from_utf8_lossy(&body_bytes).chars().take(200).collect();
+        ml_body_snippet = String::from_utf8_lossy(&body_bytes)
+            .chars()
+            .take(200)
+            .collect();
         mirror_req_body = body_bytes.clone();
 
         if is_grpc_web_req {
@@ -1852,17 +1952,18 @@ async fn handle_http_request(
     bandwidth.pool(&pool_name).inc_requests();
 
     // ── Resolve gzip + brotli + cache + mirror flags from matched route config ──
-    let (route_gzip, route_gzip_min, route_cache, route_cache_ttl, route_brotli, route_mirror) = match route {
-        Some((_, r)) => (
-            r.gzip,
-            r.gzip_min_length,
-            r.proxy_cache,
-            r.proxy_cache_valid_secs,
-            r.brotli,
-            r.mirror_pool.clone(),
-        ),
-        None => (false, 1024, false, 60, false, None),
-    };
+    let (route_gzip, route_gzip_min, route_cache, route_cache_ttl, route_brotli, route_mirror) =
+        match route {
+            Some((_, r)) => (
+                r.gzip,
+                r.gzip_min_length,
+                r.proxy_cache,
+                r.proxy_cache_valid_secs,
+                r.brotli,
+                r.mirror_pool.clone(),
+            ),
+            None => (false, 1024, false, 60, false, None),
+        };
     let accepts_gzip = client_accepts_gzip && route_gzip;
     // Brotli is preferred over gzip when both client and route/global config agree
     let accepts_brotli = client_accepts_brotli && (route_brotli || app_config.brotli_enabled);
@@ -1977,10 +2078,7 @@ async fn handle_http_request(
                     p.backends
                         .load()
                         .iter()
-                        .find(|b| {
-                            b.config.address == addr
-                                && b.is_healthy.load(Ordering::Acquire)
-                        })
+                        .find(|b| b.config.address == addr && b.is_healthy.load(Ordering::Acquire))
                         .cloned()
                 })
         } else {
@@ -1990,12 +2088,14 @@ async fn handle_http_request(
             .or_else(|| p.get_next_backend(Some(&_peer.ip()), Some(Arc::clone(&ai_engine))))
         {
             Some(b) => b,
-            None => return Ok(error_response(
-                hyper::StatusCode::BAD_GATEWAY,
-                "No healthy backends available",
-                &req_trace_id,
-                req_accepts_json,
-            )),
+            None => {
+                return Ok(error_response(
+                    hyper::StatusCode::BAD_GATEWAY,
+                    "No healthy backends available",
+                    &req_trace_id,
+                    req_accepts_json,
+                ));
+            }
         }
     };
 
@@ -2010,29 +2110,61 @@ async fn handle_http_request(
             }
         }
     }
-    crate::telemetry::otel::inject_trace_context(req.headers_mut(), &req_trace_id, &req_span_id, true);
+    crate::telemetry::otel::inject_trace_context(
+        req.headers_mut(),
+        &req_trace_id,
+        &req_span_id,
+        true,
+    );
 
     // ── Resolve timeout + retry settings: route -> global -> hardcoded defaults ──
     let connect_timeout = std::time::Duration::from_secs({
-        let rt = route.map(|(_, r)| r.proxy_connect_timeout_secs).unwrap_or(0);
-        if rt > 0 { rt } else if app_config.proxy_connect_timeout_secs > 0 { app_config.proxy_connect_timeout_secs } else { 10 }
+        let rt = route
+            .map(|(_, r)| r.proxy_connect_timeout_secs)
+            .unwrap_or(0);
+        if rt > 0 {
+            rt
+        } else if app_config.proxy_connect_timeout_secs > 0 {
+            app_config.proxy_connect_timeout_secs
+        } else {
+            10
+        }
     });
     let read_timeout = std::time::Duration::from_secs({
         let rt = route.map(|(_, r)| r.proxy_read_timeout_secs).unwrap_or(0);
-        if rt > 0 { rt } else if app_config.proxy_read_timeout_secs > 0 { app_config.proxy_read_timeout_secs } else { 60 }
+        if rt > 0 {
+            rt
+        } else if app_config.proxy_read_timeout_secs > 0 {
+            app_config.proxy_read_timeout_secs
+        } else {
+            60
+        }
     });
     let max_retries = {
         let rt = route.map(|(_, r)| r.proxy_next_upstream_tries).unwrap_or(0);
-        if rt > 0 { rt } else { app_config.proxy_next_upstream_tries }
+        if rt > 0 {
+            rt
+        } else {
+            app_config.proxy_next_upstream_tries
+        }
     };
     let retry_timeout_secs = {
-        let rt = route.map(|(_, r)| r.proxy_next_upstream_timeout_secs).unwrap_or(0);
-        if rt > 0 { rt } else { app_config.proxy_next_upstream_timeout_secs }
+        let rt = route
+            .map(|(_, r)| r.proxy_next_upstream_timeout_secs)
+            .unwrap_or(0);
+        if rt > 0 {
+            rt
+        } else {
+            app_config.proxy_next_upstream_timeout_secs
+        }
     };
     let is_idempotent_method = matches!(
         req.method(),
-        &hyper::Method::GET | &hyper::Method::HEAD | &hyper::Method::OPTIONS
-            | &hyper::Method::PUT | &hyper::Method::DELETE
+        &hyper::Method::GET
+            | &hyper::Method::HEAD
+            | &hyper::Method::OPTIONS
+            | &hyper::Method::PUT
+            | &hyper::Method::DELETE
     );
     let can_retry_connect = is_idempotent_method && max_retries > 0;
     let retry_deadline = if retry_timeout_secs > 0 {
@@ -2044,11 +2176,15 @@ async fn handle_http_request(
     // 4. Forward the request to physical backend IP (with connect + read timeouts)
     let mut current_backend = backend;
     let mut retries_left = if can_retry_connect { max_retries } else { 0u32 };
-    current_backend.active_connections.fetch_add(1, Ordering::Relaxed);
+    current_backend
+        .active_connections
+        .fetch_add(1, Ordering::Relaxed);
     metrics.active_connections.inc();
     let Some(pool_ref) = pool.as_ref() else {
         error!("Upstream pool unexpectedly missing after backend selection");
-        current_backend.active_connections.fetch_sub(1, Ordering::Relaxed);
+        current_backend
+            .active_connections
+            .fetch_sub(1, Ordering::Relaxed);
         metrics.active_connections.dec();
         return Ok(error_response(
             hyper::StatusCode::BAD_GATEWAY,
@@ -2067,22 +2203,33 @@ async fn handle_http_request(
     let stream = loop {
         let connect_result = tokio::time::timeout(
             connect_timeout,
-            pool_ref.connection_pool.acquire_pooled(&current_backend.config.address),
-        ).await;
+            pool_ref
+                .connection_pool
+                .acquire_pooled(&current_backend.config.address),
+        )
+        .await;
         match connect_result {
             Ok(Ok(s)) => break s,
             Ok(Err(e)) => {
-                error!("Failed to connect to backend {}: {}", current_backend.config.address, e);
+                error!(
+                    "Failed to connect to backend {}: {}",
+                    current_backend.config.address, e
+                );
                 let phase = "connect".to_string();
-                metrics.backend_errors_total
+                metrics
+                    .backend_errors_total
                     .with_label_values(&[&current_backend.config.address, &pool_name, &phase])
                     .inc();
                 current_backend.record_failure();
             }
             Err(_elapsed) => {
-                warn!("Connect timeout to backend {} after {:?}", current_backend.config.address, connect_timeout);
+                warn!(
+                    "Connect timeout to backend {} after {:?}",
+                    current_backend.config.address, connect_timeout
+                );
                 let phase = "timeout".to_string();
-                metrics.backend_errors_total
+                metrics
+                    .backend_errors_total
                     .with_label_values(&[&current_backend.config.address, &pool_name, &phase])
                     .inc();
                 current_backend.record_failure();
@@ -2091,27 +2238,53 @@ async fn handle_http_request(
         // Retry with next backend if allowed
         if retries_left > 0 {
             retries_left -= 1;
-            current_backend.active_connections.fetch_sub(1, Ordering::Relaxed);
+            current_backend
+                .active_connections
+                .fetch_sub(1, Ordering::Relaxed);
             metrics.active_connections.dec();
             if let Some(dl) = retry_deadline {
                 if std::time::Instant::now() >= dl {
-                    return Ok(error_response(hyper::StatusCode::GATEWAY_TIMEOUT, "Upstream retry timeout exceeded", &req_trace_id, req_accepts_json));
+                    return Ok(error_response(
+                        hyper::StatusCode::GATEWAY_TIMEOUT,
+                        "Upstream retry timeout exceeded",
+                        &req_trace_id,
+                        req_accepts_json,
+                    ));
                 }
             }
             if let Some(p) = pool.as_ref() {
-                if let Some(next) = p.get_next_backend(Some(&_peer.ip()), Some(Arc::clone(&ai_engine))) {
-                    warn!("Retrying connect to next upstream {} (retries left: {})", next.config.address, retries_left);
+                if let Some(next) =
+                    p.get_next_backend(Some(&_peer.ip()), Some(Arc::clone(&ai_engine)))
+                {
+                    warn!(
+                        "Retrying connect to next upstream {} (retries left: {})",
+                        next.config.address, retries_left
+                    );
                     current_backend = next;
-                    current_backend.active_connections.fetch_add(1, Ordering::Relaxed);
+                    current_backend
+                        .active_connections
+                        .fetch_add(1, Ordering::Relaxed);
                     metrics.active_connections.inc();
                     continue;
                 }
             }
-            return Ok(error_response(hyper::StatusCode::GATEWAY_TIMEOUT, "All upstream connect attempts failed", &req_trace_id, req_accepts_json));
+            return Ok(error_response(
+                hyper::StatusCode::GATEWAY_TIMEOUT,
+                "All upstream connect attempts failed",
+                &req_trace_id,
+                req_accepts_json,
+            ));
         }
-        current_backend.active_connections.fetch_sub(1, Ordering::Relaxed);
+        current_backend
+            .active_connections
+            .fetch_sub(1, Ordering::Relaxed);
         metrics.active_connections.dec();
-        return Ok(error_response(hyper::StatusCode::GATEWAY_TIMEOUT, "Backend connect failed", &req_trace_id, req_accepts_json));
+        return Ok(error_response(
+            hyper::StatusCode::GATEWAY_TIMEOUT,
+            "Backend connect failed",
+            &req_trace_id,
+            req_accepts_json,
+        ));
     };
 
     let io = TokioIo::new(stream);
@@ -2129,14 +2302,25 @@ async fn handle_http_request(
             match hyper::client::conn::http2::handshake(executor::TokioExecutor, io).await {
                 Ok(handshake) => handshake,
                 Err(e) => {
-                    error!("HTTP/2 handshake failed with backend {}: {}", current_backend.config.address, e);
+                    error!(
+                        "HTTP/2 handshake failed with backend {}: {}",
+                        current_backend.config.address, e
+                    );
                     let phase = "connect".to_string();
-                    metrics.backend_errors_total
+                    metrics
+                        .backend_errors_total
                         .with_label_values(&[&current_backend.config.address, &pool_name, &phase])
                         .inc();
-                    current_backend.active_connections.fetch_sub(1, Ordering::Relaxed);
+                    current_backend
+                        .active_connections
+                        .fetch_sub(1, Ordering::Relaxed);
                     metrics.active_connections.dec();
-                    return Ok(error_response(hyper::StatusCode::SERVICE_UNAVAILABLE, "Backend HTTP/2 handshake failed", &req_trace_id, req_accepts_json));
+                    return Ok(error_response(
+                        hyper::StatusCode::SERVICE_UNAVAILABLE,
+                        "Backend HTTP/2 handshake failed",
+                        &req_trace_id,
+                        req_accepts_json,
+                    ));
                 }
             };
         tokio::spawn(async move {
@@ -2147,14 +2331,26 @@ async fn handle_http_request(
         let res = match tokio::time::timeout(read_timeout, sender.send_request(req)).await {
             Ok(r) => r,
             Err(_) => {
-                warn!("Read timeout from backend {} after {:?}", current_backend.config.address, read_timeout);
+                warn!(
+                    "Read timeout from backend {} after {:?}",
+                    current_backend.config.address, read_timeout
+                );
                 current_backend.record_failure();
-                current_backend.active_connections.fetch_sub(1, Ordering::Relaxed);
+                current_backend
+                    .active_connections
+                    .fetch_sub(1, Ordering::Relaxed);
                 metrics.active_connections.dec();
-                return Ok(error_response(hyper::StatusCode::GATEWAY_TIMEOUT, "Backend read timeout", &req_trace_id, req_accepts_json));
+                return Ok(error_response(
+                    hyper::StatusCode::GATEWAY_TIMEOUT,
+                    "Backend read timeout",
+                    &req_trace_id,
+                    req_accepts_json,
+                ));
             }
         };
-        current_backend.active_connections.fetch_sub(1, Ordering::Relaxed);
+        current_backend
+            .active_connections
+            .fetch_sub(1, Ordering::Relaxed);
         metrics.active_connections.dec();
         let backend_addr = current_backend.config.address.clone();
         match res {
@@ -2165,7 +2361,12 @@ async fn handle_http_request(
             Err(e) => {
                 error!("HTTP/2 request to backend {} failed: {}", backend_addr, e);
                 current_backend.record_failure();
-                return Ok(error_response(hyper::StatusCode::BAD_GATEWAY, "Backend request failed", &req_trace_id, req_accepts_json));
+                return Ok(error_response(
+                    hyper::StatusCode::BAD_GATEWAY,
+                    "Backend request failed",
+                    &req_trace_id,
+                    req_accepts_json,
+                ));
             }
         }
     }
@@ -2183,7 +2384,9 @@ async fn handle_http_request(
                 .backend_errors_total
                 .with_label_values(&[&current_backend.config.address, &pool_name, &phase])
                 .inc();
-            current_backend.active_connections.fetch_sub(1, Ordering::Relaxed);
+            current_backend
+                .active_connections
+                .fetch_sub(1, Ordering::Relaxed);
             return Ok(error_response(
                 hyper::StatusCode::SERVICE_UNAVAILABLE,
                 "Backend handshake failed",
@@ -2197,14 +2400,26 @@ async fn handle_http_request(
     let res = match tokio::time::timeout(read_timeout, sender.send_request(req)).await {
         Ok(r) => r,
         Err(_) => {
-            warn!("Read timeout from backend {} after {:?}", current_backend.config.address, read_timeout);
+            warn!(
+                "Read timeout from backend {} after {:?}",
+                current_backend.config.address, read_timeout
+            );
             current_backend.record_failure();
-            current_backend.active_connections.fetch_sub(1, Ordering::Relaxed);
+            current_backend
+                .active_connections
+                .fetch_sub(1, Ordering::Relaxed);
             metrics.active_connections.dec();
-            return Ok(error_response(hyper::StatusCode::GATEWAY_TIMEOUT, "Backend read timeout", &req_trace_id, req_accepts_json));
+            return Ok(error_response(
+                hyper::StatusCode::GATEWAY_TIMEOUT,
+                "Backend read timeout",
+                &req_trace_id,
+                req_accepts_json,
+            ));
         }
     };
-    current_backend.active_connections.fetch_sub(1, Ordering::Relaxed);
+    current_backend
+        .active_connections
+        .fetch_sub(1, Ordering::Relaxed);
     metrics.active_connections.dec();
 
     let backend_addr = current_backend.config.address.clone();
@@ -2303,7 +2518,9 @@ async fn handle_http_request(
                     status: Some(response.status().as_u16()),
                     response_headers: resp_headers,
                 };
-                for result in hook_engine.execute(crate::scripting::HookPhase::PostUpstream, &hook_ctx) {
+                for result in
+                    hook_engine.execute(crate::scripting::HookPhase::PostUpstream, &hook_ctx)
+                {
                     match result {
                         crate::scripting::HookResult::Respond { status, body, .. } => {
                             let sc = hyper::StatusCode::from_u16(status)
@@ -2358,13 +2575,12 @@ async fn handle_http_request(
 
             // HSTS header injection
             if let Some(max_age) = app_config.hsts_max_age {
-                if let Ok(hv) = hyper::header::HeaderValue::from_str(
-                    &format!("max-age={}", max_age),
-                ) {
-                    response.headers_mut().insert(
-                        hyper::header::STRICT_TRANSPORT_SECURITY,
-                        hv,
-                    );
+                if let Ok(hv) =
+                    hyper::header::HeaderValue::from_str(&format!("max-age={}", max_age))
+                {
+                    response
+                        .headers_mut()
+                        .insert(hyper::header::STRICT_TRANSPORT_SECURITY, hv);
                 }
             }
 
@@ -2467,7 +2683,8 @@ async fn handle_http_request(
 
             // ── Compression: prefer Brotli > Gzip ──
             let (final_body, content_encoding) = if should_brotli {
-                match crate::middleware::brotli::brotli_compress_async(body_bytes.clone(), 6).await {
+                match crate::middleware::brotli::brotli_compress_async(body_bytes.clone(), 6).await
+                {
                     Some(compressed) => (compressed, "br"),
                     None => (body_bytes, ""),
                 }
@@ -2521,7 +2738,9 @@ async fn handle_http_request(
                     crate::proxy::sticky::StickyMode::Cookie { .. } => {
                         if let Some(cookie_val) = mgr.set_cookie_header(&backend_addr) {
                             if let Ok(hv) = hyper::header::HeaderValue::from_str(&cookie_val) {
-                                final_resp.headers_mut().insert(hyper::header::SET_COOKIE, hv);
+                                final_resp
+                                    .headers_mut()
+                                    .insert(hyper::header::SET_COOKIE, hv);
                             }
                         }
                     }
@@ -2577,7 +2796,9 @@ async fn handle_http_request(
                     headers: final_resp
                         .headers()
                         .iter()
-                        .filter_map(|(k, v)| v.to_str().ok().map(|v| (k.to_string(), v.to_string())))
+                        .filter_map(|(k, v)| {
+                            v.to_str().ok().map(|v| (k.to_string(), v.to_string()))
+                        })
                         .collect(),
                     body: None,
                 };
@@ -2627,7 +2848,9 @@ async fn handle_http_request(
                     headers: final_resp
                         .headers()
                         .iter()
-                        .filter_map(|(k, v)| v.to_str().ok().map(|v| (k.to_string(), v.to_string())))
+                        .filter_map(|(k, v)| {
+                            v.to_str().ok().map(|v| (k.to_string(), v.to_string()))
+                        })
                         .collect(),
                     body: None,
                 };
@@ -2654,7 +2877,8 @@ async fn handle_http_request(
             error!("Failed to proxy request to backend {}: {}", backend_addr, e);
             // Passive health check: record this failure against the backend
             current_backend.record_failure();
-            metrics.backend_errors_total
+            metrics
+                .backend_errors_total
                 .with_label_values(&[&backend_addr, &pool_name, &"connect".to_string()])
                 .inc();
 
@@ -2766,7 +2990,10 @@ async fn handle_http2_request(
         if !zone_limiter.acquire_connection(&ip_str) {
             return Ok(empty_response(hyper::StatusCode::SERVICE_UNAVAILABLE));
         }
-        crate::middleware::connlimit::ConnectionGuard::new(Arc::clone(&zone_limiter), ip_str.clone())
+        crate::middleware::connlimit::ConnectionGuard::new(
+            Arc::clone(&zone_limiter),
+            ip_str.clone(),
+        )
     };
 
     let query_str = req.uri().query().map(str::to_string);
@@ -2788,7 +3015,8 @@ async fn handle_http2_request(
         .and_then(|v| v.to_str().ok())
         .map(str::to_string);
     let client_accepts_gzip = compression::accepts_gzip(accept_encoding_str.as_deref());
-    let client_accepts_brotli = crate::middleware::brotli::accepts_brotli(accept_encoding_str.as_deref());
+    let client_accepts_brotli =
+        crate::middleware::brotli::accepts_brotli(accept_encoding_str.as_deref());
 
     // ── Step 2: Wasm OnRequestHeaders ──
     if wasm_plugins.plugin_count() > 0 {
@@ -2803,7 +3031,11 @@ async fn handle_http2_request(
                 .collect(),
             body: None,
             client_ip: ip_str.clone(),
-            protocol: if is_grpc { "grpc".to_string() } else { "h2".to_string() },
+            protocol: if is_grpc {
+                "grpc".to_string()
+            } else {
+                "h2".to_string()
+            },
         };
         let result = wasm_plugins.execute_request_headers(&wasm_req_ctx);
         if let Some(direct) = result.direct_response {
@@ -2811,7 +3043,11 @@ async fn handle_http2_request(
                 .unwrap_or(hyper::StatusCode::INTERNAL_SERVER_ERROR);
             return Ok(Response::builder()
                 .status(sc)
-                .body(Full::new(Bytes::from(direct.body)).map_err(|never| match never {}).boxed())
+                .body(
+                    Full::new(Bytes::from(direct.body))
+                        .map_err(|never| match never {})
+                        .boxed(),
+                )
                 .expect("Response::builder is infallible for Full<Bytes> body"));
         }
         if let Some(hdrs) = result.headers {
@@ -2850,7 +3086,11 @@ async fn handle_http2_request(
                         .unwrap_or(hyper::StatusCode::INTERNAL_SERVER_ERROR);
                     return Ok(Response::builder()
                         .status(sc)
-                        .body(Full::new(Bytes::from(body)).map_err(|never| match never {}).boxed())
+                        .body(
+                            Full::new(Bytes::from(body))
+                                .map_err(|never| match never {})
+                                .boxed(),
+                        )
                         .expect("Response::builder is infallible for Full<Bytes> body"));
                 }
                 crate::scripting::HookResult::RewritePath(new_path) => {
@@ -2894,8 +3134,13 @@ async fn handle_http2_request(
     }
     if waf_enabled {
         let req_headers_map = headers_to_hashmap(req.headers());
-        if let crate::waf::WafAction::Block(reason) = waf.inspect(&ip_str, &path, query_str.as_deref(), &req_headers_map, user_agent_str.as_deref())
-        {
+        if let crate::waf::WafAction::Block(reason) = waf.inspect(
+            &ip_str,
+            &path,
+            query_str.as_deref(),
+            &req_headers_map,
+            user_agent_str.as_deref(),
+        ) {
             warn!("WAF blocked HTTP/2 request from {}: {}", ip_str, reason);
             metrics.waf_blocks_total.with_label_values(&[&reason]).inc();
             return Ok(empty_response(hyper::StatusCode::FORBIDDEN));
@@ -2906,7 +3151,10 @@ async fn handle_http2_request(
     if let Some(ref db) = *geo_db {
         if let Some(geo_result) = db.lookup(&real_ip) {
             if !geo_policy.is_allowed(&geo_result.country_code) {
-                warn!("GeoIP blocked HTTP/2 request from {} (country: {})", ip_str, geo_result.country_code);
+                warn!(
+                    "GeoIP blocked HTTP/2 request from {} (country: {})",
+                    ip_str, geo_result.country_code
+                );
                 return Ok(empty_response(hyper::StatusCode::FORBIDDEN));
             }
             crate::geo::inject_geo_headers(req.headers_mut(), &geo_result);
@@ -2944,7 +3192,9 @@ async fn handle_http2_request(
                         *resp.status_mut() = status;
                         resp.headers_mut().insert(
                             hyper::header::LOCATION,
-                            location.parse().unwrap_or_else(|_| hyper::header::HeaderValue::from_static("/")),
+                            location
+                                .parse()
+                                .unwrap_or_else(|_| hyper::header::HeaderValue::from_static("/")),
                         );
                         return Ok(resp);
                     }
@@ -2958,9 +3208,7 @@ async fn handle_http2_request(
                                 "Rewrite loop detected in H2 after {} iterations. Last URI: {}",
                                 MAX_REWRITE_ITERATIONS_H2, new_uri
                             );
-                            return Ok(empty_response(
-                                hyper::StatusCode::INTERNAL_SERVER_ERROR,
-                            ));
+                            return Ok(empty_response(hyper::StatusCode::INTERNAL_SERVER_ERROR));
                         }
                         path = new_uri;
                         continue 'rewrite;
@@ -3072,10 +3320,12 @@ async fn handle_http2_request(
                     resp.headers_mut().insert("access-control-allow-origin", hv);
                 }
                 if let Ok(hv) = methods_str.parse() {
-                    resp.headers_mut().insert("access-control-allow-methods", hv);
+                    resp.headers_mut()
+                        .insert("access-control-allow-methods", hv);
                 }
                 if let Ok(hv) = headers_str.parse() {
-                    resp.headers_mut().insert("access-control-allow-headers", hv);
+                    resp.headers_mut()
+                        .insert("access-control-allow-headers", hv);
                 }
                 if let Ok(hv) = max_age_str.parse() {
                     resp.headers_mut().insert("access-control-max-age", hv);
@@ -3201,30 +3451,45 @@ async fn handle_http2_request(
                 };
                 let auth_result = if let Some(kid_str) = kid {
                     match mgr.find_key(jwks_uri, &kid_str).await {
-                        Some(jwk) => match crate::auth::jwks::JwksManager::decoding_key_from_jwk(&jwk) {
-                            Ok((decoding_key, algo)) => {
-                                use jsonwebtoken::{Validation, decode};
-                                use crate::auth::jwt::Claims;
-                                let mut validation = Validation::new(algo);
-                                validation.validate_aud = false;
-                                match decode::<Claims>(token, &decoding_key, &validation) {
-                                    Ok(data) => {
-                                        for (k, v) in crate::auth::jwt::claims_to_headers(&data.claims) {
-                                            if let (Ok(name), Ok(val)) = (
-                                                hyper::header::HeaderName::from_bytes(k.as_bytes()),
-                                                v.parse::<hyper::header::HeaderValue>(),
-                                            ) {
-                                                req.headers_mut().insert(name, val);
+                        Some(jwk) => {
+                            match crate::auth::jwks::JwksManager::decoding_key_from_jwk(&jwk) {
+                                Ok((decoding_key, algo)) => {
+                                    use crate::auth::jwt::Claims;
+                                    use jsonwebtoken::{Validation, decode};
+                                    let mut validation = Validation::new(algo);
+                                    validation.validate_aud = false;
+                                    match decode::<Claims>(token, &decoding_key, &validation) {
+                                        Ok(data) => {
+                                            for (k, v) in
+                                                crate::auth::jwt::claims_to_headers(&data.claims)
+                                            {
+                                                if let (Ok(name), Ok(val)) = (
+                                                    hyper::header::HeaderName::from_bytes(
+                                                        k.as_bytes(),
+                                                    ),
+                                                    v.parse::<hyper::header::HeaderValue>(),
+                                                ) {
+                                                    req.headers_mut().insert(name, val);
+                                                }
                                             }
+                                            AuthResult::Allowed
                                         }
-                                        AuthResult::Allowed
+                                        Err(_) => AuthResult::Denied(
+                                            hyper::StatusCode::UNAUTHORIZED,
+                                            "JWKS JWT validation failed",
+                                        ),
                                     }
-                                    Err(_) => AuthResult::Denied(hyper::StatusCode::UNAUTHORIZED, "JWKS JWT validation failed"),
                                 }
+                                Err(_) => AuthResult::Denied(
+                                    hyper::StatusCode::UNAUTHORIZED,
+                                    "JWKS key build error",
+                                ),
                             }
-                            Err(_) => AuthResult::Denied(hyper::StatusCode::UNAUTHORIZED, "JWKS key build error"),
-                        },
-                        None => AuthResult::Denied(hyper::StatusCode::UNAUTHORIZED, "JWKS key not found"),
+                        }
+                        None => AuthResult::Denied(
+                            hyper::StatusCode::UNAUTHORIZED,
+                            "JWKS key not found",
+                        ),
                     }
                 } else {
                     AuthResult::Denied(hyper::StatusCode::UNAUTHORIZED, "Missing kid in JWT header")
@@ -3254,31 +3519,32 @@ async fn handle_http2_request(
         }
         // 5. OIDC session check
         else if let Some(ref cookie_name) = r_config.auth_oidc_cookie_name {
-            let (result, session) = crate::auth::oidc::check_session(req.headers(), cookie_name, &oidc_sessions);
+            let (result, session) =
+                crate::auth::oidc::check_session(req.headers(), cookie_name, &oidc_sessions);
             match result {
                 AuthResult::Allowed => {
                     if let Some(s) = session {
                         if let Some(ref issuer) = r_config.auth_oidc_issuer {
                             if !crate::auth::oidc::session_matches_issuer(&s, issuer) {
                                 let mut resp = Response::new(
-                                    http_body_util::Full::new(Bytes::from(
-                                        "OIDC issuer mismatch",
-                                    ))
-                                    .map_err(|_| unreachable!())
-                                    .boxed(),
+                                    http_body_util::Full::new(Bytes::from("OIDC issuer mismatch"))
+                                        .map_err(|_| unreachable!())
+                                        .boxed(),
                                 );
                                 *resp.status_mut() = hyper::StatusCode::UNAUTHORIZED;
                                 return Ok(resp);
                             }
                         }
                         if let Ok(val) = s.sub.parse::<hyper::header::HeaderValue>() {
-                            req.headers_mut().insert(
-                                hyper::header::HeaderName::from_static("x-auth-sub"), val);
+                            req.headers_mut()
+                                .insert(hyper::header::HeaderName::from_static("x-auth-sub"), val);
                         }
                         if let Some(email) = s.email {
                             if let Ok(val) = email.parse::<hyper::header::HeaderValue>() {
                                 req.headers_mut().insert(
-                                    hyper::header::HeaderName::from_static("x-auth-email"), val);
+                                    hyper::header::HeaderName::from_static("x-auth-email"),
+                                    val,
+                                );
                             }
                         }
                     }
@@ -3362,26 +3628,30 @@ async fn handle_http2_request(
     // ── Body Size Limit Check (HTTP/2) ────────────────────────────────────────
     let h2_max_body = {
         let route_limit = route.map(|(_, r)| r.client_max_body_size).unwrap_or(0);
-        if route_limit > 0 { route_limit } else { app_config.client_max_body_size }
+        if route_limit > 0 {
+            route_limit
+        } else {
+            app_config.client_max_body_size
+        }
     };
     if h2_max_body > 0 {
         if let Some(cl) = req.headers().get(hyper::header::CONTENT_LENGTH) {
             if let Ok(len) = cl.to_str().unwrap_or("0").parse::<usize>() {
                 if len > h2_max_body {
-                    warn!("HTTP/2 request body too large from {}: {} > {} bytes", ip_str, len, h2_max_body);
+                    warn!(
+                        "HTTP/2 request body too large from {}: {} > {} bytes",
+                        ip_str, len, h2_max_body
+                    );
                     return Ok(empty_response(hyper::StatusCode::PAYLOAD_TOO_LARGE));
                 }
             }
         }
     }
 
-    let route_has_mirror = route
-        .and_then(|(_, r)| r.mirror_pool.as_ref())
-        .is_some()
+    let route_has_mirror = route.and_then(|(_, r)| r.mirror_pool.as_ref()).is_some()
         || app_config.mirror_pool.is_some();
-    let should_buffer_request_body = waf_enabled
-        || route_has_mirror
-        || app_config.ml_fraud_model_path.is_some();
+    let should_buffer_request_body =
+        waf_enabled || route_has_mirror || app_config.ml_fraud_model_path.is_some();
     let (parts, body) = req.into_parts();
     let mirror_req_headers = parts.headers.clone();
     let mirror_req_uri = parts.uri.to_string();
@@ -3397,7 +3667,9 @@ async fn handle_http2_request(
         };
         if !body_bytes.is_empty() {
             let body_text = String::from_utf8_lossy(&body_bytes);
-            if let crate::waf::WafAction::Block(reason) = waf.inspect_body(&ip_str, &body_text, &path, query_str.as_deref()) {
+            if let crate::waf::WafAction::Block(reason) =
+                waf.inspect_body(&ip_str, &body_text, &path, query_str.as_deref())
+            {
                 warn!(
                     "WAF blocked HTTP/2 request body from {}: {}",
                     ip_str, reason
@@ -3426,17 +3698,18 @@ async fn handle_http2_request(
     let host_name = host.split(':').next().unwrap_or("default").to_string();
 
     // ── Resolve gzip + brotli + cache + mirror flags from matched route config ──
-    let (route_gzip, route_gzip_min, route_cache, route_cache_ttl, route_brotli, route_mirror) = match route {
-        Some((_, r)) => (
-            r.gzip,
-            r.gzip_min_length,
-            r.proxy_cache,
-            r.proxy_cache_valid_secs,
-            r.brotli,
-            r.mirror_pool.clone(),
-        ),
-        None => (false, 1024, false, 60, false, None),
-    };
+    let (route_gzip, route_gzip_min, route_cache, route_cache_ttl, route_brotli, route_mirror) =
+        match route {
+            Some((_, r)) => (
+                r.gzip,
+                r.gzip_min_length,
+                r.proxy_cache,
+                r.proxy_cache_valid_secs,
+                r.brotli,
+                r.mirror_pool.clone(),
+            ),
+            None => (false, 1024, false, 60, false, None),
+        };
     let accepts_gzip = client_accepts_gzip && route_gzip;
     let accepts_brotli = client_accepts_brotli && (route_brotli || app_config.brotli_enabled);
     // Mirror pool: route-level overrides global
@@ -3627,10 +3900,7 @@ async fn handle_http2_request(
                     p.backends
                         .load()
                         .iter()
-                        .find(|b| {
-                            b.config.address == addr
-                                && b.is_healthy.load(Ordering::Acquire)
-                        })
+                        .find(|b| b.config.address == addr && b.is_healthy.load(Ordering::Acquire))
                         .cloned()
                 })
         } else {
@@ -3640,12 +3910,14 @@ async fn handle_http2_request(
             .or_else(|| p.get_next_backend(Some(&_peer.ip()), Some(Arc::clone(&ai_engine))))
         {
             Some(b) => b,
-            None => return Ok(error_response(
-                hyper::StatusCode::BAD_GATEWAY,
-                "No healthy backends available",
-                &req_trace_id,
-                req_accepts_json,
-            )),
+            None => {
+                return Ok(error_response(
+                    hyper::StatusCode::BAD_GATEWAY,
+                    "No healthy backends available",
+                    &req_trace_id,
+                    req_accepts_json,
+                ));
+            }
         }
     };
 
@@ -3661,16 +3933,35 @@ async fn handle_http2_request(
             }
         }
     }
-    crate::telemetry::otel::inject_trace_context(req.headers_mut(), &req_trace_id, &req_span_id, true);
+    crate::telemetry::otel::inject_trace_context(
+        req.headers_mut(),
+        &req_trace_id,
+        &req_span_id,
+        true,
+    );
 
     // ── Resolve timeout settings: route -> global -> hardcoded defaults ──
     let h2_connect_timeout = std::time::Duration::from_secs({
-        let rt = route.map(|(_, r)| r.proxy_connect_timeout_secs).unwrap_or(0);
-        if rt > 0 { rt } else if app_config.proxy_connect_timeout_secs > 0 { app_config.proxy_connect_timeout_secs } else { 10 }
+        let rt = route
+            .map(|(_, r)| r.proxy_connect_timeout_secs)
+            .unwrap_or(0);
+        if rt > 0 {
+            rt
+        } else if app_config.proxy_connect_timeout_secs > 0 {
+            app_config.proxy_connect_timeout_secs
+        } else {
+            10
+        }
     });
     let h2_read_timeout = std::time::Duration::from_secs({
         let rt = route.map(|(_, r)| r.proxy_read_timeout_secs).unwrap_or(0);
-        if rt > 0 { rt } else if app_config.proxy_read_timeout_secs > 0 { app_config.proxy_read_timeout_secs } else { 60 }
+        if rt > 0 {
+            rt
+        } else if app_config.proxy_read_timeout_secs > 0 {
+            app_config.proxy_read_timeout_secs
+        } else {
+            60
+        }
     });
 
     // 4. Forward the request to physical backend IP (with connect + read timeouts)
@@ -3680,26 +3971,60 @@ async fn handle_http2_request(
         error!("Upstream pool unexpectedly missing after backend selection");
         backend.active_connections.fetch_sub(1, Ordering::Relaxed);
         metrics.active_connections.dec();
-        return Ok(error_response(hyper::StatusCode::BAD_GATEWAY, "Upstream pool configuration error", &req_trace_id, req_accepts_json));
+        return Ok(error_response(
+            hyper::StatusCode::BAD_GATEWAY,
+            "Upstream pool configuration error",
+            &req_trace_id,
+            req_accepts_json,
+        ));
     };
     let pool_ref = Arc::clone(pool_ref);
 
-    let stream = match tokio::time::timeout(h2_connect_timeout, pool_ref.connection_pool.acquire_pooled(&backend.config.address)).await {
+    let stream = match tokio::time::timeout(
+        h2_connect_timeout,
+        pool_ref
+            .connection_pool
+            .acquire_pooled(&backend.config.address),
+    )
+    .await
+    {
         Ok(Ok(s)) => s,
         Ok(Err(e)) => {
-            error!("Failed to connect to backend {}: {}", backend.config.address, e);
-            metrics.backend_errors_total.with_label_values(&[&backend.config.address, &pool_name, &"connect".to_string()]).inc();
+            error!(
+                "Failed to connect to backend {}: {}",
+                backend.config.address, e
+            );
+            metrics
+                .backend_errors_total
+                .with_label_values(&[&backend.config.address, &pool_name, &"connect".to_string()])
+                .inc();
             backend.active_connections.fetch_sub(1, Ordering::Relaxed);
             metrics.active_connections.dec();
-            return Ok(error_response(hyper::StatusCode::SERVICE_UNAVAILABLE, "Failed to connect to backend", &req_trace_id, req_accepts_json));
+            return Ok(error_response(
+                hyper::StatusCode::SERVICE_UNAVAILABLE,
+                "Failed to connect to backend",
+                &req_trace_id,
+                req_accepts_json,
+            ));
         }
         Err(_) => {
-            warn!("Connect timeout to backend {} after {:?}", backend.config.address, h2_connect_timeout);
-            metrics.backend_errors_total.with_label_values(&[&backend.config.address, &pool_name, &"timeout".to_string()]).inc();
+            warn!(
+                "Connect timeout to backend {} after {:?}",
+                backend.config.address, h2_connect_timeout
+            );
+            metrics
+                .backend_errors_total
+                .with_label_values(&[&backend.config.address, &pool_name, &"timeout".to_string()])
+                .inc();
             backend.active_connections.fetch_sub(1, Ordering::Relaxed);
             metrics.active_connections.dec();
             backend.record_failure();
-            return Ok(error_response(hyper::StatusCode::GATEWAY_TIMEOUT, "Backend connect timeout", &req_trace_id, req_accepts_json));
+            return Ok(error_response(
+                hyper::StatusCode::GATEWAY_TIMEOUT,
+                "Backend connect timeout",
+                &req_trace_id,
+                req_accepts_json,
+            ));
         }
     };
 
@@ -3709,11 +4034,26 @@ async fn handle_http2_request(
         match hyper::client::conn::http2::handshake(executor::TokioExecutor, io).await {
             Ok(handshake) => handshake,
             Err(e) => {
-                error!("HTTP/2 Handshake failed with backend {}: {}", backend.config.address, e);
-                metrics.backend_errors_total.with_label_values(&[&backend.config.address, &pool_name, &"handshake".to_string()]).inc();
+                error!(
+                    "HTTP/2 Handshake failed with backend {}: {}",
+                    backend.config.address, e
+                );
+                metrics
+                    .backend_errors_total
+                    .with_label_values(&[
+                        &backend.config.address,
+                        &pool_name,
+                        &"handshake".to_string(),
+                    ])
+                    .inc();
                 backend.active_connections.fetch_sub(1, Ordering::Relaxed);
                 metrics.active_connections.dec();
-                return Ok(error_response(hyper::StatusCode::SERVICE_UNAVAILABLE, "HTTP/2 handshake failed with backend", &req_trace_id, req_accepts_json));
+                return Ok(error_response(
+                    hyper::StatusCode::SERVICE_UNAVAILABLE,
+                    "HTTP/2 handshake failed with backend",
+                    &req_trace_id,
+                    req_accepts_json,
+                ));
             }
         };
 
@@ -3726,11 +4066,19 @@ async fn handle_http2_request(
     let res = match tokio::time::timeout(h2_read_timeout, sender.send_request(req)).await {
         Ok(r) => r,
         Err(_) => {
-            warn!("Read timeout from backend {} after {:?}", backend.config.address, h2_read_timeout);
+            warn!(
+                "Read timeout from backend {} after {:?}",
+                backend.config.address, h2_read_timeout
+            );
             backend.record_failure();
             backend.active_connections.fetch_sub(1, Ordering::Relaxed);
             metrics.active_connections.dec();
-            return Ok(error_response(hyper::StatusCode::GATEWAY_TIMEOUT, "Backend read timeout", &req_trace_id, req_accepts_json));
+            return Ok(error_response(
+                hyper::StatusCode::GATEWAY_TIMEOUT,
+                "Backend read timeout",
+                &req_trace_id,
+                req_accepts_json,
+            ));
         }
     };
     backend.active_connections.fetch_sub(1, Ordering::Relaxed);
@@ -3760,7 +4108,9 @@ async fn handle_http2_request(
                     status: Some(response.status().as_u16()),
                     response_headers: resp_headers,
                 };
-                for result in hook_engine.execute(crate::scripting::HookPhase::PostUpstream, &hook_ctx) {
+                for result in
+                    hook_engine.execute(crate::scripting::HookPhase::PostUpstream, &hook_ctx)
+                {
                     match result {
                         crate::scripting::HookResult::Respond { status, body, .. } => {
                             let sc = hyper::StatusCode::from_u16(status)
@@ -3831,13 +4181,12 @@ async fn handle_http2_request(
 
             // HSTS header injection
             if let Some(max_age) = app_config.hsts_max_age {
-                if let Ok(hv) = hyper::header::HeaderValue::from_str(
-                    &format!("max-age={}", max_age),
-                ) {
-                    response.headers_mut().insert(
-                        hyper::header::STRICT_TRANSPORT_SECURITY,
-                        hv,
-                    );
+                if let Ok(hv) =
+                    hyper::header::HeaderValue::from_str(&format!("max-age={}", max_age))
+                {
+                    response
+                        .headers_mut()
+                        .insert(hyper::header::STRICT_TRANSPORT_SECURITY, hv);
                 }
             }
 
@@ -3895,7 +4244,8 @@ async fn handle_http2_request(
 
             let body_len = body_bytes.len();
             let should_compress = should_compress
-                && body_len >= route_gzip_min.max(crate::middleware::compression::MIN_COMPRESS_SIZE);
+                && body_len
+                    >= route_gzip_min.max(crate::middleware::compression::MIN_COMPRESS_SIZE);
 
             // ── Cache Store ──
             if should_cache {
@@ -3936,7 +4286,8 @@ async fn handle_http2_request(
                 && body_len >= crate::middleware::brotli::MIN_BROTLI_SIZE;
 
             let (final_body, content_encoding) = if should_brotli {
-                match crate::middleware::brotli::brotli_compress_async(body_bytes.clone(), 6).await {
+                match crate::middleware::brotli::brotli_compress_async(body_bytes.clone(), 6).await
+                {
                     Some(compressed) => (compressed, "br"),
                     None => (body_bytes, ""),
                 }
@@ -3983,7 +4334,9 @@ async fn handle_http2_request(
                     crate::proxy::sticky::StickyMode::Cookie { .. } => {
                         if let Some(cookie_val) = mgr.set_cookie_header(&backend_addr) {
                             if let Ok(hv) = hyper::header::HeaderValue::from_str(&cookie_val) {
-                                final_resp.headers_mut().insert(hyper::header::SET_COOKIE, hv);
+                                final_resp
+                                    .headers_mut()
+                                    .insert(hyper::header::SET_COOKIE, hv);
                             }
                         }
                     }
@@ -4014,7 +4367,9 @@ async fn handle_http2_request(
                     headers: final_resp
                         .headers()
                         .iter()
-                        .filter_map(|(k, v)| v.to_str().ok().map(|v| (k.to_string(), v.to_string())))
+                        .filter_map(|(k, v)| {
+                            v.to_str().ok().map(|v| (k.to_string(), v.to_string()))
+                        })
                         .collect(),
                     body: None,
                 };
@@ -4066,7 +4421,9 @@ async fn handle_http2_request(
                     headers: final_resp
                         .headers()
                         .iter()
-                        .filter_map(|(k, v)| v.to_str().ok().map(|v| (k.to_string(), v.to_string())))
+                        .filter_map(|(k, v)| {
+                            v.to_str().ok().map(|v| (k.to_string(), v.to_string()))
+                        })
                         .collect(),
                     body: None,
                 };
@@ -4092,7 +4449,8 @@ async fn handle_http2_request(
         Err(e) => {
             error!("Failed to proxy request to backend {}: {}", backend_addr, e);
             backend.record_failure();
-            metrics.backend_errors_total
+            metrics
+                .backend_errors_total
                 .with_label_values(&[&backend_addr, &pool_name, &"proxy".to_string()])
                 .inc();
 
@@ -4172,18 +4530,22 @@ async fn sanitize_path(base: &std::path::Path, requested: &str) -> Option<std::p
     let full_path = base.join(req_path);
     let base_path = base.to_path_buf();
 
-    tokio::task::spawn_blocking(move || {
-        match full_path.canonicalize() {
-            Ok(canon) => {
-                if canon.starts_with(base_path.canonicalize().unwrap_or_else(|_| base_path.clone())) {
-                    Some(canon)
-                } else {
-                    None
-                }
+    tokio::task::spawn_blocking(move || match full_path.canonicalize() {
+        Ok(canon) => {
+            if canon.starts_with(
+                base_path
+                    .canonicalize()
+                    .unwrap_or_else(|_| base_path.clone()),
+            ) {
+                Some(canon)
+            } else {
+                None
             }
-            Err(_) => None,
         }
-    }).await.unwrap_or(None)
+        Err(_) => None,
+    })
+    .await
+    .unwrap_or(None)
 }
 
 // ── Static File Server ──────────────────────────────────────────────────────
@@ -4316,8 +4678,9 @@ async fn serve_static_file<T>(
         let mut resp = empty_response(hyper::StatusCode::OK);
         resp.headers_mut().insert(
             hyper::header::CONTENT_TYPE,
-            hyper::header::HeaderValue::from_str(&mime_type)
-                .unwrap_or_else(|_| hyper::header::HeaderValue::from_static("application/octet-stream")),
+            hyper::header::HeaderValue::from_str(&mime_type).unwrap_or_else(|_| {
+                hyper::header::HeaderValue::from_static("application/octet-stream")
+            }),
         );
         resp.headers_mut().insert(
             hyper::header::CONTENT_LENGTH,
@@ -4342,9 +4705,8 @@ async fn serve_static_file<T>(
             }
         }
     };
-    let boxed_body = BodyExt::boxed(
-        http_body_util::StreamBody::new(stream).map_err(|never| match never {}),
-    );
+    let boxed_body =
+        BodyExt::boxed(http_body_util::StreamBody::new(stream).map_err(|never| match never {}));
 
     let mut response = Response::builder()
         .status(hyper::StatusCode::OK)
@@ -4353,8 +4715,9 @@ async fn serve_static_file<T>(
 
     response.headers_mut().insert(
         hyper::header::CONTENT_TYPE,
-        hyper::header::HeaderValue::from_str(&mime_type)
-            .unwrap_or_else(|_| hyper::header::HeaderValue::from_static("application/octet-stream")),
+        hyper::header::HeaderValue::from_str(&mime_type).unwrap_or_else(|_| {
+            hyper::header::HeaderValue::from_static("application/octet-stream")
+        }),
     );
     response.headers_mut().insert(
         hyper::header::CONTENT_LENGTH,

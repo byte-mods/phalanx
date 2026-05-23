@@ -330,10 +330,7 @@ fn default_cors_methods() -> Vec<String> {
 }
 
 fn default_cors_headers() -> Vec<String> {
-    vec![
-        "Content-Type".to_string(),
-        "Authorization".to_string(),
-    ]
+    vec!["Content-Type".to_string(), "Authorization".to_string()]
 }
 
 fn default_cors_max_age() -> u64 {
@@ -597,6 +594,11 @@ pub struct AppConfig {
     /// backends over STARTTLS. Default: false (for backwards compatibility).
     #[serde(default)]
     pub mail_verify_backend_tls: bool,
+    /// Whether to negotiate STARTTLS with the mail backend before proxying.
+    /// When true, Phalanx connects plain TCP, sends STARTTLS/STLS, then upgrades.
+    /// Default: false.
+    #[serde(default)]
+    pub mail_backend_starttls: bool,
 
     // ── Graceful Shutdown ───────────────────────────────────────────────────
     /// Timeout in seconds to wait for in-flight requests during shutdown. Default: 30.
@@ -751,6 +753,7 @@ impl Default for AppConfig {
             websocket_idle_timeout_secs: 3600,
             udp_session_timeout_secs: 60,
             mail_verify_backend_tls: false,
+            mail_backend_starttls: false,
             shutdown_timeout_secs: 30,
             admin_api_tokens: HashMap::new(),
             tls_min_version: None,
@@ -767,521 +770,585 @@ impl Default for AppConfig {
 /// Synchronously loads and parses the given config path from disk.
 /// In strict mode, parse failures return `Err`.
 /// In lenient mode, parse failures are logged and defaults are returned.
-pub fn try_load_config(
-    conf_path: &str,
-    policy: ConfigParsePolicy,
-) -> Result<AppConfig, String> {
+pub fn try_load_config(conf_path: &str, policy: ConfigParsePolicy) -> Result<AppConfig, String> {
     match std::fs::read_to_string(conf_path) {
         Ok(content) => {
-        let phalanx_cfg = match parser::parse_phalanx_config(&content) {
-            Ok(cfg) => cfg,
-            Err(e) => {
-                let msg = format!("Configuration error in '{}': {}", conf_path, e);
-                if matches!(policy, ConfigParsePolicy::Strict) {
-                    return Err(msg);
+            let phalanx_cfg = match parser::parse_phalanx_config(&content) {
+                Ok(cfg) => cfg,
+                Err(e) => {
+                    let msg = format!("Configuration error in '{}': {}", conf_path, e);
+                    if matches!(policy, ConfigParsePolicy::Strict) {
+                        return Err(msg);
+                    }
+                    tracing::error!("{}. Falling back to defaults.", msg);
+                    return Ok(AppConfig::default());
                 }
-                tracing::error!("{}. Falling back to defaults.", msg);
-                return Ok(AppConfig::default());
+            };
+            // Start from defaults, then overlay values found in the parsed config.
+            // This ensures any field not explicitly set in the file keeps its default.
+            let mut app_cfg = AppConfig::default();
+
+            // Map top-level directives
+            if let Some(w) = phalanx_cfg.worker_threads {
+                app_cfg.workers = w;
             }
-        };
-        // Start from defaults, then overlay values found in the parsed config.
-        // This ensures any field not explicitly set in the file keeps its default.
-        let mut app_cfg = AppConfig::default();
 
-        // Map top-level directives
-        if let Some(w) = phalanx_cfg.worker_threads {
-            app_cfg.workers = w;
-        }
-
-        if let Some(t) = phalanx_cfg.tcp_listen {
-            if t.contains(':') {
-                app_cfg.tcp_bind = t;
-            } else {
-                app_cfg.tcp_bind = format!("0.0.0.0:{}", t);
+            if let Some(t) = phalanx_cfg.tcp_listen {
+                if t.contains(':') {
+                    app_cfg.tcp_bind = t;
+                } else {
+                    app_cfg.tcp_bind = format!("0.0.0.0:{}", t);
+                }
             }
-        }
 
-        if let Some(a) = phalanx_cfg.admin_listen {
-            if a.contains(':') {
-                app_cfg.admin_bind = a;
-            } else {
-                app_cfg.admin_bind = format!("127.0.0.1:{}", a);
+            if let Some(a) = phalanx_cfg.admin_listen {
+                if a.contains(':') {
+                    app_cfg.admin_bind = a;
+                } else {
+                    app_cfg.admin_bind = format!("127.0.0.1:{}", a);
+                }
             }
-        }
 
-        // Walk the http → server → route hierarchy and flatten it into AppConfig's
-        // flat HashMap-based structures. Multiple server blocks are merged sequentially.
-        if let Some(http) = phalanx_cfg.http {
-            for server in http.servers {
-                if let Some(listen) = server.listen {
-                    app_cfg.proxy_bind = format!("0.0.0.0:{}", listen);
-                }
+            // Walk the http → server → route hierarchy and flatten it into AppConfig's
+            // flat HashMap-based structures. Multiple server blocks are merged sequentially.
+            if let Some(http) = phalanx_cfg.http {
+                for server in http.servers {
+                    if let Some(listen) = server.listen {
+                        app_cfg.proxy_bind = format!("0.0.0.0:{}", listen);
+                    }
 
-                if server.ssl_certificate.is_some() {
-                    app_cfg.tls_cert_path = server.ssl_certificate;
-                }
-                if server.ssl_certificate_key.is_some() {
-                    app_cfg.tls_key_path = server.ssl_certificate_key;
-                }
-                if let Some(v) = server.directives.get("tls_ca_cert_path") {
-                    app_cfg.tls_ca_cert_path = Some(v.clone());
-                } else if let Some(v) = server.directives.get("ssl_client_certificate") {
-                    app_cfg.tls_ca_cert_path = Some(v.clone());
-                }
-                if let Some(v) = server.directives.get("otel_endpoint") {
-                    app_cfg.otel_endpoint = Some(v.clone());
-                }
-                if let Some(v) = server.directives.get("otel_service_name") {
-                    app_cfg.otel_service_name = Some(v.clone());
-                }
-                if let Some(v) = server.directives.get("listen_quic") {
-                    app_cfg.quic_bind = Some(if v.contains(':') {
-                        v.clone()
-                    } else {
-                        format!("0.0.0.0:{}", v)
-                    });
-                }
-                if let Some(v) = server.directives.get("listen_udp") {
-                    app_cfg.udp_bind = Some(if v.contains(':') {
-                        v.clone()
-                    } else {
-                        format!("0.0.0.0:{}", v)
-                    });
-                }
-                if let Some(v) = server.directives.get("trusted_proxy") {
-                    app_cfg.trusted_proxies.push(v.clone());
-                }
-                if let Some(v) = server.directives.get("geoip_db") {
-                    app_cfg.geoip_db_path = Some(v.clone());
-                }
-                if let Some(v) = server.directives.get("geo_allow") {
+                    if server.ssl_certificate.is_some() {
+                        app_cfg.tls_cert_path = server.ssl_certificate;
+                    }
+                    if server.ssl_certificate_key.is_some() {
+                        app_cfg.tls_key_path = server.ssl_certificate_key;
+                    }
+                    if let Some(v) = server.directives.get("tls_ca_cert_path") {
+                        app_cfg.tls_ca_cert_path = Some(v.clone());
+                    } else if let Some(v) = server.directives.get("ssl_client_certificate") {
+                        app_cfg.tls_ca_cert_path = Some(v.clone());
+                    }
+                    if let Some(v) = server.directives.get("otel_endpoint") {
+                        app_cfg.otel_endpoint = Some(v.clone());
+                    }
+                    if let Some(v) = server.directives.get("otel_service_name") {
+                        app_cfg.otel_service_name = Some(v.clone());
+                    }
+                    if let Some(v) = server.directives.get("listen_quic") {
+                        app_cfg.quic_bind = Some(if v.contains(':') {
+                            v.clone()
+                        } else {
+                            format!("0.0.0.0:{}", v)
+                        });
+                    }
+                    if let Some(v) = server.directives.get("listen_udp") {
+                        app_cfg.udp_bind = Some(if v.contains(':') {
+                            v.clone()
+                        } else {
+                            format!("0.0.0.0:{}", v)
+                        });
+                    }
+                    if let Some(v) = server.directives.get("trusted_proxy") {
+                        app_cfg.trusted_proxies.push(v.clone());
+                    }
+                    if let Some(v) = server.directives.get("geoip_db") {
+                        app_cfg.geoip_db_path = Some(v.clone());
+                    }
+                    if let Some(v) = server.directives.get("geo_allow") {
+                        app_cfg
+                            .geo_allow_countries
+                            .extend(v.split(',').map(|s| s.trim().to_string()));
+                    }
+                    if let Some(v) = server.directives.get("geo_deny") {
+                        app_cfg
+                            .geo_deny_countries
+                            .extend(v.split(',').map(|s| s.trim().to_string()));
+                    }
+                    if let Some(v) = server.directives.get("cache_disk_path") {
+                        app_cfg.cache_disk_path = Some(v.clone());
+                    }
+                    if let Some(v) = server.directives.get("brotli") {
+                        app_cfg.brotli_enabled = v == "on" || v == "true";
+                    }
+                    if let Some(v) = server.directives.get("webtransport") {
+                        app_cfg.webtransport_enabled = v == "on" || v == "true";
+                    }
+                    // ICE servers accumulate from parser (not from directives map).
                     app_cfg
-                        .geo_allow_countries
-                        .extend(v.split(',').map(|s| s.trim().to_string()));
-                }
-                if let Some(v) = server.directives.get("geo_deny") {
-                    app_cfg
-                        .geo_deny_countries
-                        .extend(v.split(',').map(|s| s.trim().to_string()));
-                }
-                if let Some(v) = server.directives.get("cache_disk_path") {
-                    app_cfg.cache_disk_path = Some(v.clone());
-                }
-                if let Some(v) = server.directives.get("brotli") {
-                    app_cfg.brotli_enabled = v == "on" || v == "true";
-                }
-                if let Some(v) = server.directives.get("webtransport") {
-                    app_cfg.webtransport_enabled = v == "on" || v == "true";
-                }
-                // ICE servers accumulate from parser (not from directives map).
-                app_cfg
-                    .ice_servers
-                    .extend(server.ice_servers.iter().cloned());
-                if let Some(v) = server.turn_username.as_ref() {
-                    app_cfg.turn_username = Some(v.clone());
-                }
-                if let Some(v) = server.turn_credential.as_ref() {
-                    app_cfg.turn_credential = Some(v.clone());
-                }
-                if let Some(v) = server.directives.get("auth_request") {
-                    app_cfg.auth_request_url = Some(v.clone());
-                }
-                if let Some(v) = server.directives.get("mirror") {
-                    app_cfg.mirror_pool = Some(v.clone());
+                        .ice_servers
+                        .extend(server.ice_servers.iter().cloned());
+                    if let Some(v) = server.turn_username.as_ref() {
+                        app_cfg.turn_username = Some(v.clone());
+                    }
+                    if let Some(v) = server.turn_credential.as_ref() {
+                        app_cfg.turn_credential = Some(v.clone());
+                    }
+                    if let Some(v) = server.directives.get("auth_request") {
+                        app_cfg.auth_request_url = Some(v.clone());
+                    }
+                    if let Some(v) = server.directives.get("mirror") {
+                        app_cfg.mirror_pool = Some(v.clone());
+                    }
+
+                    // Parse rate limiting directives
+                    if let Some(v) = route_or_directive_u32(&server.directives, "rate_limit_per_ip")
+                    {
+                        app_cfg.rate_limit_per_ip_sec = Some(v);
+                    }
+                    if let Some(v) = route_or_directive_u32(&server.directives, "rate_limit_burst")
+                    {
+                        app_cfg.rate_limit_burst = Some(v);
+                    }
+                    if let Some(v) = route_or_directive_u32(&server.directives, "global_rate_limit")
+                    {
+                        app_cfg.global_rate_limit_sec = Some(v);
+                    }
+
+                    // Parse WAF directives
+                    if let Some(v) = server.directives.get("waf_enabled") {
+                        app_cfg.waf_enabled = Some(v == "true");
+                    }
+                    if let Some(v) =
+                        route_or_directive_u32(&server.directives, "waf_auto_ban_threshold")
+                    {
+                        app_cfg.waf_auto_ban_threshold = Some(v);
+                    }
+                    if let Some(v) = server.directives.get("waf_auto_ban_duration") {
+                        if let Ok(val) = v.parse::<u64>() {
+                            app_cfg.waf_auto_ban_duration = Some(val);
+                        } else {
+                            tracing::warn!(
+                                "Invalid value '{}' for waf_auto_ban_duration: expected a number, ignoring",
+                                v
+                            );
+                        }
+                    }
+
+                    // Parse AI routing directives
+                    if let Some(v) = server.directives.get("ai_algorithm") {
+                        app_cfg.ai_algorithm = Some(v.clone());
+                    }
+                    if let Some(v) = server.directives.get("ai_epsilon") {
+                        if let Ok(val) = v.parse::<f64>() {
+                            app_cfg.ai_epsilon = Some(val);
+                        } else {
+                            tracing::warn!(
+                                "Invalid value '{}' for ai_epsilon: expected a number, ignoring",
+                                v
+                            );
+                        }
+                    }
+                    if let Some(v) = server.directives.get("ai_temperature") {
+                        if let Ok(val) = v.parse::<f64>() {
+                            app_cfg.ai_temperature = Some(val);
+                        } else {
+                            tracing::warn!(
+                                "Invalid value '{}' for ai_temperature: expected a number, ignoring",
+                                v
+                            );
+                        }
+                    }
+                    if let Some(v) = server.directives.get("ai_ucb_constant") {
+                        if let Ok(val) = v.parse::<f64>() {
+                            app_cfg.ai_ucb_constant = Some(val);
+                        } else {
+                            tracing::warn!(
+                                "Invalid value '{}' for ai_ucb_constant: expected a number, ignoring",
+                                v
+                            );
+                        }
+                    }
+                    if let Some(v) = server.directives.get("ai_thompson_threshold_ms") {
+                        if let Ok(val) = v.parse::<f64>() {
+                            app_cfg.ai_thompson_threshold_ms = Some(val);
+                        } else {
+                            tracing::warn!(
+                                "Invalid value '{}' for ai_thompson_threshold_ms: expected a number, ignoring",
+                                v
+                            );
+                        }
+                    }
+
+                    // Parse newer fields
+                    if let Some(v) = server.directives.get("proxy_proto_v2") {
+                        app_cfg.proxy_proto_v2 = v == "on" || v == "true";
+                    }
+                    if let Some(v) = server.directives.get("rhai_script") {
+                        app_cfg.rhai_script = Some(v.clone());
+                    }
+                    if let Some(v) = route_or_directive_u32(&server.directives, "keyval_ttl_secs") {
+                        app_cfg.keyval_ttl_secs = v as u64;
+                    }
+                    if let Some(v) = server.directives.get("auto_ssl_domain") {
+                        app_cfg.auto_ssl_domain = Some(v.clone());
+                    }
+                    if let Some(v) = server.directives.get("auto_ssl_email") {
+                        app_cfg.auto_ssl_email = Some(v.clone());
+                    }
+                    if let Some(v) = server.directives.get("auto_ssl_cache_dir") {
+                        app_cfg.auto_ssl_cache_dir = Some(v.clone());
+                    }
+                    if let Some(v) = server.directives.get("redis_url") {
+                        app_cfg.redis_url = Some(v.clone());
+                    }
+                    if let Some(v) = server.directives.get("ocsp_responder_url") {
+                        app_cfg.ocsp_responder_url = Some(v.clone());
+                    }
+                    if let Some(v) = server.directives.get("etcd_endpoints") {
+                        app_cfg.etcd_endpoints = Some(v.clone());
+                    }
+                    if let Some(v) = server.directives.get("node_id") {
+                        app_cfg.node_id = Some(v.clone());
+                    }
+                    if let Some(v) = server.directives.get("gossip_bind") {
+                        app_cfg.gossip_bind = Some(v.clone());
+                    }
+                    if let Some(v) = server.directives.get("gossip_seed_peers") {
+                        app_cfg.gossip_seed_peers = Some(v.clone());
+                    }
+                    if let Some(v) = server.directives.get("gossip_interval_ms") {
+                        if let Ok(val) = v.parse::<u64>() {
+                            app_cfg.gossip_interval_ms = Some(val);
+                        } else {
+                            tracing::warn!(
+                                "Invalid value '{}' for gossip_interval_ms: expected a number, ignoring",
+                                v
+                            );
+                        }
+                    }
+                    if let Some(v) = server.directives.get("ml_fraud_model_path") {
+                        app_cfg.ml_fraud_model_path = Some(v.clone());
+                    }
+                    if let Some(v) = server.directives.get("ml_fraud_mode") {
+                        app_cfg.ml_fraud_mode = Some(v.clone());
+                    }
+                    if let Some(v) = server.directives.get("smtp_bind") {
+                        app_cfg.smtp_bind = Some(v.clone());
+                    }
+                    if let Some(v) = server.directives.get("imap_bind") {
+                        app_cfg.imap_bind = Some(v.clone());
+                    }
+                    if let Some(v) = server.directives.get("pop3_bind") {
+                        app_cfg.pop3_bind = Some(v.clone());
+                    }
+                    if let Some(v) = server.directives.get("mail_upstream_pool") {
+                        app_cfg.mail_upstream_pool = Some(v.clone());
+                    }
+                    if let Some(v) = server.directives.get("waf_policy_path") {
+                        app_cfg.waf_policy_path = Some(v.clone());
+                    }
+                    if let Some(v) = server.directives.get("captcha_site_key") {
+                        app_cfg.captcha_site_key = Some(v.clone());
+                    }
+                    if let Some(v) = server.directives.get("captcha_secret_key") {
+                        app_cfg.captcha_secret_key = Some(v.clone());
+                    }
+                    if let Some(v) = server.directives.get("captcha_provider") {
+                        app_cfg.captcha_provider = Some(v.clone());
+                    }
+                    if let Some(v) = server.directives.get("captcha_challenge_threshold") {
+                        if let Ok(val) = v.parse::<f64>() {
+                            app_cfg.captcha_challenge_threshold = Some(val);
+                        } else {
+                            tracing::warn!(
+                                "Invalid value '{}' for captcha_challenge_threshold: expected a number, ignoring",
+                                v
+                            );
+                        }
+                    }
+                    if let Some(v) = server.directives.get("wasm_plugin_config") {
+                        app_cfg.wasm_plugin_config_path = Some(v.clone());
+                    }
+                    if let Some(v) = server.directives.get("k8s_ingress_enabled") {
+                        app_cfg.k8s_ingress_enabled = v == "true" || v == "on";
+                    }
+                    if let Some(v) = server.directives.get("k8s_ingress_class") {
+                        app_cfg.k8s_ingress_class = Some(v.clone());
+                    }
+                    if let Some(v) = server.directives.get("gslb_policy") {
+                        app_cfg.gslb_policy = Some(v.clone());
+                    }
+                    if let Some(v) = server.directives.get("gslb_max_latency_ms") {
+                        if let Ok(val) = v.parse::<f64>() {
+                            app_cfg.gslb_max_latency_ms = Some(val);
+                        } else {
+                            tracing::warn!(
+                                "Invalid value '{}' for gslb_max_latency_ms: expected a number, ignoring",
+                                v
+                            );
+                        }
+                    }
+
+                    // Proxy timeouts (global defaults)
+                    if let Some(v) = server.directives.get("proxy_connect_timeout") {
+                        if let Ok(val) = v.parse::<u64>() {
+                            app_cfg.proxy_connect_timeout_secs = val;
+                        } else {
+                            tracing::warn!(
+                                "Invalid value '{}' for proxy_connect_timeout: expected a number, ignoring",
+                                v
+                            );
+                        }
+                    }
+                    if let Some(v) = server.directives.get("proxy_read_timeout") {
+                        if let Ok(val) = v.parse::<u64>() {
+                            app_cfg.proxy_read_timeout_secs = val;
+                        } else {
+                            tracing::warn!(
+                                "Invalid value '{}' for proxy_read_timeout: expected a number, ignoring",
+                                v
+                            );
+                        }
+                    }
+
+                    // Retry policy (global defaults)
+                    if let Some(v) =
+                        route_or_directive_u32(&server.directives, "proxy_next_upstream_tries")
+                    {
+                        app_cfg.proxy_next_upstream_tries = v;
+                    }
+                    if let Some(v) = server.directives.get("proxy_next_upstream_timeout") {
+                        if let Ok(val) = v.parse::<u64>() {
+                            app_cfg.proxy_next_upstream_timeout_secs = val;
+                        } else {
+                            tracing::warn!(
+                                "Invalid value '{}' for proxy_next_upstream_timeout: expected a number, ignoring",
+                                v
+                            );
+                        }
+                    }
+
+                    // Request body size limit (global default)
+                    if let Some(v) = server.directives.get("client_max_body_size") {
+                        match parse_size_value(v) {
+                            Ok(sz) => app_cfg.client_max_body_size = sz,
+                            Err(e) => tracing::warn!("Bad client_max_body_size '{}': {}", v, e),
+                        }
+                    }
+
+                    // Graceful shutdown timeout
+                    if let Some(v) = server.directives.get("shutdown_timeout") {
+                        if let Ok(val) = v.parse::<u64>() {
+                            app_cfg.shutdown_timeout_secs = val;
+                        } else {
+                            tracing::warn!(
+                                "Invalid value '{}' for shutdown_timeout: expected a number, ignoring",
+                                v
+                            );
+                        }
+                    }
+
+                    // WebSocket idle timeout
+                    if let Some(v) = server.directives.get("websocket_idle_timeout") {
+                        if let Ok(val) = v.parse::<u64>() {
+                            app_cfg.websocket_idle_timeout_secs = val;
+                        } else {
+                            tracing::warn!(
+                                "Invalid value '{}' for websocket_idle_timeout: expected a number, ignoring",
+                                v
+                            );
+                        }
+                    }
+
+                    // UDP session timeout
+                    if let Some(v) = server.directives.get("udp_session_timeout") {
+                        if let Ok(val) = v.parse::<u64>() {
+                            app_cfg.udp_session_timeout_secs = val;
+                        } else {
+                            tracing::warn!(
+                                "Invalid value '{}' for udp_session_timeout: expected a number, ignoring",
+                                v
+                            );
+                        }
+                    }
+                    if let Some(v) = server.directives.get("room_idle_timeout") {
+                        if let Ok(val) = v.parse::<u64>() {
+                            app_cfg.room_idle_timeout_secs = val;
+                        } else {
+                            tracing::warn!(
+                                "Invalid value '{}' for room_idle_timeout: expected a number, ignoring",
+                                v
+                            );
+                        }
+                    }
+
+                    // Mail backend TLS verification
+                    if let Some(v) = server.directives.get("mail_verify_backend_tls") {
+                        app_cfg.mail_verify_backend_tls = v == "true" || v == "on";
+                    }
+                    if let Some(v) = server.directives.get("mail_backend_starttls") {
+                        app_cfg.mail_backend_starttls = v == "true" || v == "on";
+                    }
+
+                    // Admin API tokens: `api_token TOKEN ROLE;` in server block
+                    if let Some(v) = server.directives.get("api_token") {
+                        // Value format: "TOKEN ROLE" but generic directive only captures one value.
+                        // We handle multi-token api_token via dedicated parser entries instead.
+                        // Single-value fallback: token is the value, role defaults to "admin".
+                        app_cfg
+                            .admin_api_tokens
+                            .insert(v.clone(), "admin".to_string());
+                    }
+                    // Consume api_token entries parsed as multi-value directives
+                    for (key, value) in &server.directives {
+                        if let Some(token) = key.strip_prefix("api_token:") {
+                            app_cfg
+                                .admin_api_tokens
+                                .insert(token.to_string(), value.clone());
+                        }
+                    }
+
+                    // TLS hardening directives
+                    if let Some(v) = server.directives.get("ssl_min_version") {
+                        app_cfg.tls_min_version = Some(v.clone());
+                    } else if let Some(v) = server.directives.get("tls_min_version") {
+                        app_cfg.tls_min_version = Some(v.clone());
+                    }
+                    if let Some(v) = server.directives.get("ssl_ciphers") {
+                        app_cfg.tls_ciphers = v.split(':').map(|s| s.trim().to_string()).collect();
+                    } else if let Some(v) = server.directives.get("tls_ciphers") {
+                        app_cfg.tls_ciphers = v.split(':').map(|s| s.trim().to_string()).collect();
+                    }
+                    if let Some(v) = server.directives.get("hsts_max_age") {
+                        if let Ok(val) = v.parse::<u64>() {
+                            app_cfg.hsts_max_age = Some(val);
+                        } else {
+                            tracing::warn!(
+                                "Invalid value '{}' for hsts_max_age: expected a number, ignoring",
+                                v
+                            );
+                        }
+                    }
+
+                    // Rate limit response customization
+                    if let Some(v) = server.directives.get("rate_limit_retry_after") {
+                        if let Ok(val) = v.parse::<u64>() {
+                            app_cfg.rate_limit_retry_after = Some(val);
+                        } else {
+                            tracing::warn!(
+                                "Invalid value '{}' for rate_limit_retry_after: expected a number, ignoring",
+                                v
+                            );
+                        }
+                    }
+
+                    // Zone limiter directives
+                    if let Some(v) = route_or_directive_u32(&server.directives, "zone_rate_per_sec")
+                    {
+                        app_cfg.zone_rate_per_sec = v;
+                    }
+                    if let Some(v) = route_or_directive_u32(&server.directives, "zone_burst") {
+                        app_cfg.zone_burst = v;
+                    }
+                    if let Some(v) =
+                        route_or_directive_u32(&server.directives, "zone_max_connections")
+                    {
+                        app_cfg.zone_max_connections = v;
+                    }
+
+                    // Map phalanx-style route blocks into our RouteConfig hashmap
+                    for (path, route) in server.routes {
+                        app_cfg.routes.insert(
+                            path,
+                            RouteConfig {
+                                upstream: route.upstream,
+                                root: route.root,
+                                fastcgi_pass: route.fastcgi_pass,
+                                uwsgi_pass: route.uwsgi_pass,
+                                add_headers: route.add_headers,
+                                rewrite_rules: route.rewrite_rules,
+                                auth_basic_realm: route.auth_basic_realm,
+                                auth_basic_users: route.auth_basic_users,
+                                auth_jwt_secret: route.auth_jwt_secret,
+                                auth_jwt_algorithm: route.auth_jwt_algorithm,
+                                auth_oauth_introspect_url: route.auth_oauth_introspect_url,
+                                auth_oauth_client_id: route.auth_oauth_client_id,
+                                auth_oauth_client_secret: route.auth_oauth_client_secret,
+                                gzip: route.gzip,
+                                gzip_min_length: route.gzip_min_length,
+                                proxy_cache: route.proxy_cache,
+                                proxy_cache_valid_secs: route.proxy_cache_valid_secs,
+                                brotli: route.brotli,
+                                auth_request_url: route.auth_request_url,
+                                mirror_pool: route.mirror_pool,
+                                auth_jwks_uri: route.auth_jwks_uri,
+                                auth_oidc_issuer: route.auth_oidc_issuer,
+                                auth_oidc_cookie_name: route.auth_oidc_cookie_name,
+                                proxy_connect_timeout_secs: route.proxy_connect_timeout_secs,
+                                proxy_read_timeout_secs: route.proxy_read_timeout_secs,
+                                proxy_next_upstream_tries: route.proxy_next_upstream_tries,
+                                proxy_next_upstream_timeout_secs: route
+                                    .proxy_next_upstream_timeout_secs,
+                                client_max_body_size: route.client_max_body_size,
+                                cors_enabled: route.cors_enabled,
+                                cors_allowed_origins: route.cors_allowed_origins,
+                                cors_allowed_methods: route.cors_allowed_methods,
+                                cors_allowed_headers: route.cors_allowed_headers,
+                                cors_max_age_secs: route.cors_max_age_secs,
+                                cors_allow_credentials: route.cors_allow_credentials,
+                                proxy_http_version: route.proxy_http_version,
+                                split_pools: route.split_pools,
+                                split_weights: route.split_weights,
+                            },
+                        );
+                    }
                 }
 
-                // Parse rate limiting directives
-                if let Some(v) = route_or_directive_u32(&server.directives, "rate_limit_per_ip") {
-                    app_cfg.rate_limit_per_ip_sec = Some(v);
-                }
-                if let Some(v) = route_or_directive_u32(&server.directives, "rate_limit_burst") {
-                    app_cfg.rate_limit_burst = Some(v);
-                }
-                if let Some(v) = route_or_directive_u32(&server.directives, "global_rate_limit") {
-                    app_cfg.global_rate_limit_sec = Some(v);
-                }
-
-                // Parse WAF directives
-                if let Some(v) = server.directives.get("waf_enabled") {
-                    app_cfg.waf_enabled = Some(v == "true");
-                }
-                if let Some(v) =
-                    route_or_directive_u32(&server.directives, "waf_auto_ban_threshold")
-                {
-                    app_cfg.waf_auto_ban_threshold = Some(v);
-                }
-                if let Some(v) = server.directives.get("waf_auto_ban_duration") {
-                    if let Ok(val) = v.parse::<u64>() {
-                        app_cfg.waf_auto_ban_duration = Some(val);
-                    } else {
-                        tracing::warn!("Invalid value '{}' for waf_auto_ban_duration: expected a number, ignoring", v);
-                    }
-                }
-
-                // Parse AI routing directives
-                if let Some(v) = server.directives.get("ai_algorithm") {
-                    app_cfg.ai_algorithm = Some(v.clone());
-                }
-                if let Some(v) = server.directives.get("ai_epsilon") {
-                    if let Ok(val) = v.parse::<f64>() {
-                        app_cfg.ai_epsilon = Some(val);
-                    } else {
-                        tracing::warn!("Invalid value '{}' for ai_epsilon: expected a number, ignoring", v);
-                    }
-                }
-                if let Some(v) = server.directives.get("ai_temperature") {
-                    if let Ok(val) = v.parse::<f64>() {
-                        app_cfg.ai_temperature = Some(val);
-                    } else {
-                        tracing::warn!("Invalid value '{}' for ai_temperature: expected a number, ignoring", v);
-                    }
-                }
-                if let Some(v) = server.directives.get("ai_ucb_constant") {
-                    if let Ok(val) = v.parse::<f64>() {
-                        app_cfg.ai_ucb_constant = Some(val);
-                    } else {
-                        tracing::warn!("Invalid value '{}' for ai_ucb_constant: expected a number, ignoring", v);
-                    }
-                }
-                if let Some(v) = server.directives.get("ai_thompson_threshold_ms") {
-                    if let Ok(val) = v.parse::<f64>() {
-                        app_cfg.ai_thompson_threshold_ms = Some(val);
-                    } else {
-                        tracing::warn!("Invalid value '{}' for ai_thompson_threshold_ms: expected a number, ignoring", v);
-                    }
-                }
-
-                // Parse newer fields
-                if let Some(v) = server.directives.get("proxy_proto_v2") {
-                    app_cfg.proxy_proto_v2 = v == "on" || v == "true";
-                }
-                if let Some(v) = server.directives.get("rhai_script") {
-                    app_cfg.rhai_script = Some(v.clone());
-                }
-                if let Some(v) = route_or_directive_u32(&server.directives, "keyval_ttl_secs") {
-                    app_cfg.keyval_ttl_secs = v as u64;
-                }
-                if let Some(v) = server.directives.get("auto_ssl_domain") {
-                    app_cfg.auto_ssl_domain = Some(v.clone());
-                }
-                if let Some(v) = server.directives.get("auto_ssl_email") {
-                    app_cfg.auto_ssl_email = Some(v.clone());
-                }
-                if let Some(v) = server.directives.get("auto_ssl_cache_dir") {
-                    app_cfg.auto_ssl_cache_dir = Some(v.clone());
-                }
-                if let Some(v) = server.directives.get("redis_url") {
-                    app_cfg.redis_url = Some(v.clone());
-                }
-                if let Some(v) = server.directives.get("ocsp_responder_url") {
-                    app_cfg.ocsp_responder_url = Some(v.clone());
-                }
-                if let Some(v) = server.directives.get("etcd_endpoints") {
-                    app_cfg.etcd_endpoints = Some(v.clone());
-                }
-                if let Some(v) = server.directives.get("node_id") {
-                    app_cfg.node_id = Some(v.clone());
-                }
-                if let Some(v) = server.directives.get("gossip_bind") {
-                    app_cfg.gossip_bind = Some(v.clone());
-                }
-                if let Some(v) = server.directives.get("gossip_seed_peers") {
-                    app_cfg.gossip_seed_peers = Some(v.clone());
-                }
-                if let Some(v) = server.directives.get("gossip_interval_ms") {
-                    if let Ok(val) = v.parse::<u64>() {
-                        app_cfg.gossip_interval_ms = Some(val);
-                    } else {
-                        tracing::warn!("Invalid value '{}' for gossip_interval_ms: expected a number, ignoring", v);
-                    }
-                }
-                if let Some(v) = server.directives.get("ml_fraud_model_path") {
-                    app_cfg.ml_fraud_model_path = Some(v.clone());
-                }
-                if let Some(v) = server.directives.get("ml_fraud_mode") {
-                    app_cfg.ml_fraud_mode = Some(v.clone());
-                }
-                if let Some(v) = server.directives.get("smtp_bind") {
-                    app_cfg.smtp_bind = Some(v.clone());
-                }
-                if let Some(v) = server.directives.get("imap_bind") {
-                    app_cfg.imap_bind = Some(v.clone());
-                }
-                if let Some(v) = server.directives.get("pop3_bind") {
-                    app_cfg.pop3_bind = Some(v.clone());
-                }
-                if let Some(v) = server.directives.get("mail_upstream_pool") {
-                    app_cfg.mail_upstream_pool = Some(v.clone());
-                }
-                if let Some(v) = server.directives.get("waf_policy_path") {
-                    app_cfg.waf_policy_path = Some(v.clone());
-                }
-                if let Some(v) = server.directives.get("captcha_site_key") {
-                    app_cfg.captcha_site_key = Some(v.clone());
-                }
-                if let Some(v) = server.directives.get("captcha_secret_key") {
-                    app_cfg.captcha_secret_key = Some(v.clone());
-                }
-                if let Some(v) = server.directives.get("captcha_provider") {
-                    app_cfg.captcha_provider = Some(v.clone());
-                }
-                if let Some(v) = server.directives.get("captcha_challenge_threshold") {
-                    if let Ok(val) = v.parse::<f64>() {
-                        app_cfg.captcha_challenge_threshold = Some(val);
-                    } else {
-                        tracing::warn!("Invalid value '{}' for captcha_challenge_threshold: expected a number, ignoring", v);
-                    }
-                }
-                if let Some(v) = server.directives.get("wasm_plugin_config") {
-                    app_cfg.wasm_plugin_config_path = Some(v.clone());
-                }
-                if let Some(v) = server.directives.get("k8s_ingress_enabled") {
-                    app_cfg.k8s_ingress_enabled = v == "true" || v == "on";
-                }
-                if let Some(v) = server.directives.get("k8s_ingress_class") {
-                    app_cfg.k8s_ingress_class = Some(v.clone());
-                }
-                if let Some(v) = server.directives.get("gslb_policy") {
-                    app_cfg.gslb_policy = Some(v.clone());
-                }
-                if let Some(v) = server.directives.get("gslb_max_latency_ms") {
-                    if let Ok(val) = v.parse::<f64>() {
-                        app_cfg.gslb_max_latency_ms = Some(val);
-                    } else {
-                        tracing::warn!("Invalid value '{}' for gslb_max_latency_ms: expected a number, ignoring", v);
-                    }
-                }
-
-                // Proxy timeouts (global defaults)
-                if let Some(v) = server.directives.get("proxy_connect_timeout") {
-                    if let Ok(val) = v.parse::<u64>() {
-                        app_cfg.proxy_connect_timeout_secs = val;
-                    } else {
-                        tracing::warn!("Invalid value '{}' for proxy_connect_timeout: expected a number, ignoring", v);
-                    }
-                }
-                if let Some(v) = server.directives.get("proxy_read_timeout") {
-                    if let Ok(val) = v.parse::<u64>() {
-                        app_cfg.proxy_read_timeout_secs = val;
-                    } else {
-                        tracing::warn!("Invalid value '{}' for proxy_read_timeout: expected a number, ignoring", v);
-                    }
-                }
-
-                // Retry policy (global defaults)
-                if let Some(v) = route_or_directive_u32(&server.directives, "proxy_next_upstream_tries") {
-                    app_cfg.proxy_next_upstream_tries = v;
-                }
-                if let Some(v) = server.directives.get("proxy_next_upstream_timeout") {
-                    if let Ok(val) = v.parse::<u64>() {
-                        app_cfg.proxy_next_upstream_timeout_secs = val;
-                    } else {
-                        tracing::warn!("Invalid value '{}' for proxy_next_upstream_timeout: expected a number, ignoring", v);
-                    }
-                }
-
-                // Request body size limit (global default)
-                if let Some(v) = server.directives.get("client_max_body_size") {
-                    match parse_size_value(v) {
-                        Ok(sz) => app_cfg.client_max_body_size = sz,
-                        Err(e) => tracing::warn!("Bad client_max_body_size '{}': {}", v, e),
-                    }
-                }
-
-                // Graceful shutdown timeout
-                if let Some(v) = server.directives.get("shutdown_timeout") {
-                    if let Ok(val) = v.parse::<u64>() {
-                        app_cfg.shutdown_timeout_secs = val;
-                    } else {
-                        tracing::warn!("Invalid value '{}' for shutdown_timeout: expected a number, ignoring", v);
-                    }
-                }
-
-                // WebSocket idle timeout
-                if let Some(v) = server.directives.get("websocket_idle_timeout") {
-                    if let Ok(val) = v.parse::<u64>() {
-                        app_cfg.websocket_idle_timeout_secs = val;
-                    } else {
-                        tracing::warn!("Invalid value '{}' for websocket_idle_timeout: expected a number, ignoring", v);
-                    }
-                }
-
-                // UDP session timeout
-                if let Some(v) = server.directives.get("udp_session_timeout") {
-                    if let Ok(val) = v.parse::<u64>() {
-                        app_cfg.udp_session_timeout_secs = val;
-                    } else {
-                        tracing::warn!("Invalid value '{}' for udp_session_timeout: expected a number, ignoring", v);
-                    }
-                }
-                if let Some(v) = server.directives.get("room_idle_timeout") {
-                    if let Ok(val) = v.parse::<u64>() {
-                        app_cfg.room_idle_timeout_secs = val;
-                    } else {
-                        tracing::warn!("Invalid value '{}' for room_idle_timeout: expected a number, ignoring", v);
-                    }
-                }
-
-                // Mail backend TLS verification
-                if let Some(v) = server.directives.get("mail_verify_backend_tls") {
-                    app_cfg.mail_verify_backend_tls = v == "true" || v == "on";
-                }
-
-                // Admin API tokens: `api_token TOKEN ROLE;` in server block
-                if let Some(v) = server.directives.get("api_token") {
-                    // Value format: "TOKEN ROLE" but generic directive only captures one value.
-                    // We handle multi-token api_token via dedicated parser entries instead.
-                    // Single-value fallback: token is the value, role defaults to "admin".
-                    app_cfg.admin_api_tokens.insert(v.clone(), "admin".to_string());
-                }
-                // Consume api_token entries parsed as multi-value directives
-                for (key, value) in &server.directives {
-                    if let Some(token) = key.strip_prefix("api_token:") {
-                        app_cfg.admin_api_tokens.insert(token.to_string(), value.clone());
-                    }
-                }
-
-                // TLS hardening directives
-                if let Some(v) = server.directives.get("ssl_min_version") {
-                    app_cfg.tls_min_version = Some(v.clone());
-                } else if let Some(v) = server.directives.get("tls_min_version") {
-                    app_cfg.tls_min_version = Some(v.clone());
-                }
-                if let Some(v) = server.directives.get("ssl_ciphers") {
-                    app_cfg.tls_ciphers = v.split(':').map(|s| s.trim().to_string()).collect();
-                } else if let Some(v) = server.directives.get("tls_ciphers") {
-                    app_cfg.tls_ciphers = v.split(':').map(|s| s.trim().to_string()).collect();
-                }
-                if let Some(v) = server.directives.get("hsts_max_age") {
-                    if let Ok(val) = v.parse::<u64>() {
-                        app_cfg.hsts_max_age = Some(val);
-                    } else {
-                        tracing::warn!("Invalid value '{}' for hsts_max_age: expected a number, ignoring", v);
-                    }
-                }
-
-                // Rate limit response customization
-                if let Some(v) = server.directives.get("rate_limit_retry_after") {
-                    if let Ok(val) = v.parse::<u64>() {
-                        app_cfg.rate_limit_retry_after = Some(val);
-                    } else {
-                        tracing::warn!("Invalid value '{}' for rate_limit_retry_after: expected a number, ignoring", v);
-                    }
-                }
-
-                // Zone limiter directives
-                if let Some(v) = route_or_directive_u32(&server.directives, "zone_rate_per_sec") {
-                    app_cfg.zone_rate_per_sec = v;
-                }
-                if let Some(v) = route_or_directive_u32(&server.directives, "zone_burst") {
-                    app_cfg.zone_burst = v;
-                }
-                if let Some(v) = route_or_directive_u32(&server.directives, "zone_max_connections") {
-                    app_cfg.zone_max_connections = v;
-                }
-
-                // Map phalanx-style route blocks into our RouteConfig hashmap
-                for (path, route) in server.routes {
-                    app_cfg.routes.insert(
-                        path,
-                        RouteConfig {
-                            upstream: route.upstream,
-                            root: route.root,
-                            fastcgi_pass: route.fastcgi_pass,
-                            uwsgi_pass: route.uwsgi_pass,
-                            add_headers: route.add_headers,
-                            rewrite_rules: route.rewrite_rules,
-                            auth_basic_realm: route.auth_basic_realm,
-                            auth_basic_users: route.auth_basic_users,
-                            auth_jwt_secret: route.auth_jwt_secret,
-                            auth_jwt_algorithm: route.auth_jwt_algorithm,
-                            auth_oauth_introspect_url: route.auth_oauth_introspect_url,
-                            auth_oauth_client_id: route.auth_oauth_client_id,
-                            auth_oauth_client_secret: route.auth_oauth_client_secret,
-                            gzip: route.gzip,
-                            gzip_min_length: route.gzip_min_length,
-                            proxy_cache: route.proxy_cache,
-                            proxy_cache_valid_secs: route.proxy_cache_valid_secs,
-                            brotli: route.brotli,
-                            auth_request_url: route.auth_request_url,
-                            mirror_pool: route.mirror_pool,
-                            auth_jwks_uri: route.auth_jwks_uri,
-                            auth_oidc_issuer: route.auth_oidc_issuer,
-                            auth_oidc_cookie_name: route.auth_oidc_cookie_name,
-                            proxy_connect_timeout_secs: route.proxy_connect_timeout_secs,
-                            proxy_read_timeout_secs: route.proxy_read_timeout_secs,
-                            proxy_next_upstream_tries: route.proxy_next_upstream_tries,
-                            proxy_next_upstream_timeout_secs: route.proxy_next_upstream_timeout_secs,
-                            client_max_body_size: route.client_max_body_size,
-                            cors_enabled: route.cors_enabled,
-                            cors_allowed_origins: route.cors_allowed_origins,
-                            cors_allowed_methods: route.cors_allowed_methods,
-                            cors_allowed_headers: route.cors_allowed_headers,
-                            cors_max_age_secs: route.cors_max_age_secs,
-                            cors_allow_credentials: route.cors_allow_credentials,
-                            proxy_http_version: route.proxy_http_version,
-                            split_pools: route.split_pools,
-                            split_weights: route.split_weights,
+                // Convert parsed upstream blocks into typed UpstreamPoolConfig entries.
+                // The algorithm string is mapped to the LoadBalancingAlgorithm enum,
+                // and each server directive becomes a BackendConfig.
+                for upstream in http.upstreams {
+                    let algorithm = match upstream.algorithm.as_deref() {
+                        Some("roundrobin") | Some("round_robin") => {
+                            LoadBalancingAlgorithm::RoundRobin
+                        }
+                        Some("leastconnections") | Some("least_connections") => {
+                            LoadBalancingAlgorithm::LeastConnections
+                        }
+                        Some("iphash") | Some("ip_hash") => LoadBalancingAlgorithm::IpHash,
+                        Some("random") => LoadBalancingAlgorithm::Random,
+                        Some("weighted") | Some("weighted_roundrobin") => {
+                            LoadBalancingAlgorithm::WeightedRoundRobin
+                        }
+                        Some("ai") | Some("ai_predictive") => LoadBalancingAlgorithm::AIPredictive,
+                        Some("consistent_hash") | Some("consistenthash") => {
+                            LoadBalancingAlgorithm::ConsistentHash
+                        }
+                        Some("least_time") | Some("leasttime") => LoadBalancingAlgorithm::LeastTime,
+                        _ => LoadBalancingAlgorithm::RoundRobin,
+                    };
+                    let backends = upstream
+                        .servers
+                        .into_iter()
+                        .map(|(addr, weight)| BackendConfig {
+                            address: addr,
+                            weight,
+                            health_check_path: upstream.health_check_path.clone(),
+                            health_check_status: upstream.health_check_status,
+                            max_fails: upstream.max_fails,
+                            fail_timeout_secs: upstream.fail_timeout_secs,
+                            slow_start_secs: upstream.slow_start_secs,
+                            backup: false,
+                            max_conns: 0,
+                            queue_size: 0,
+                            ..Default::default()
+                        })
+                        .collect();
+                    app_cfg.upstreams.insert(
+                        upstream.name.clone(),
+                        UpstreamPoolConfig {
+                            algorithm,
+                            backends,
+                            keepalive: upstream.keepalive,
+                            srv_discover: upstream.srv_discover.clone(),
+                            health_check_interval_secs: upstream.health_check_interval_secs,
+                            health_check_timeout_secs: upstream.health_check_timeout_secs,
                         },
                     );
                 }
             }
-
-            // Convert parsed upstream blocks into typed UpstreamPoolConfig entries.
-            // The algorithm string is mapped to the LoadBalancingAlgorithm enum,
-            // and each server directive becomes a BackendConfig.
-            for upstream in http.upstreams {
-                let algorithm = match upstream.algorithm.as_deref() {
-                    Some("roundrobin") | Some("round_robin") => LoadBalancingAlgorithm::RoundRobin,
-                    Some("leastconnections") | Some("least_connections") => {
-                        LoadBalancingAlgorithm::LeastConnections
-                    }
-                    Some("iphash") | Some("ip_hash") => LoadBalancingAlgorithm::IpHash,
-                    Some("random") => LoadBalancingAlgorithm::Random,
-                    Some("weighted") | Some("weighted_roundrobin") => {
-                        LoadBalancingAlgorithm::WeightedRoundRobin
-                    }
-                    Some("ai") | Some("ai_predictive") => LoadBalancingAlgorithm::AIPredictive,
-                    Some("consistent_hash") | Some("consistenthash") => {
-                        LoadBalancingAlgorithm::ConsistentHash
-                    }
-                    Some("least_time") | Some("leasttime") => {
-                        LoadBalancingAlgorithm::LeastTime
-                    }
-                    _ => LoadBalancingAlgorithm::RoundRobin,
-                };
-                let backends = upstream
-                    .servers
-                    .into_iter()
-                    .map(|(addr, weight)| BackendConfig {
-                        address: addr,
-                        weight,
-                        health_check_path: upstream.health_check_path.clone(),
-                        health_check_status: upstream.health_check_status,
-                        max_fails: upstream.max_fails,
-                        fail_timeout_secs: upstream.fail_timeout_secs,
-                        slow_start_secs: upstream.slow_start_secs,
-                        backup: false,
-                        max_conns: 0,
-                        queue_size: 0,
-                        ..Default::default()
-                    })
-                    .collect();
-                app_cfg.upstreams.insert(
-                    upstream.name.clone(),
-                    UpstreamPoolConfig {
-                        algorithm,
-                        backends,
-                        keepalive: upstream.keepalive,
-                        srv_discover: upstream.srv_discover.clone(),
-                        health_check_interval_secs: upstream.health_check_interval_secs,
-                        health_check_timeout_secs: upstream.health_check_timeout_secs,
-                    },
-                );
-            }
-        }
-        tracing::info!("Loaded config from {}", conf_path);
-        Ok(app_cfg)
+            tracing::info!("Loaded config from {}", conf_path);
+            Ok(app_cfg)
         }
         Err(e) => {
             let msg = format!("Could not read config '{}': {}", conf_path, e);
@@ -1312,7 +1379,11 @@ fn route_or_directive_u32(directives: &HashMap<String, String>, key: &str) -> Op
     match v.parse::<u32>() {
         Ok(val) => Some(val),
         Err(_) => {
-            tracing::warn!("Invalid value '{}' for {}: expected an unsigned integer, ignoring", v, key);
+            tracing::warn!(
+                "Invalid value '{}' for {}: expected an unsigned integer, ignoring",
+                v,
+                key
+            );
             None
         }
     }
@@ -1325,7 +1396,8 @@ fn parse_size_value(s: &str) -> Result<usize, String> {
     if s.is_empty() {
         return Ok(0);
     }
-    let (num_str, multiplier) = if let Some(n) = s.strip_suffix('G').or_else(|| s.strip_suffix('g')) {
+    let (num_str, multiplier) = if let Some(n) = s.strip_suffix('G').or_else(|| s.strip_suffix('g'))
+    {
         (n, 1024 * 1024 * 1024)
     } else if let Some(n) = s.strip_suffix('M').or_else(|| s.strip_suffix('m')) {
         (n, 1024 * 1024)
@@ -1409,6 +1481,34 @@ mod tests {
         assert_eq!(cfg.websocket_idle_timeout_secs, 3600);
         assert_eq!(cfg.udp_session_timeout_secs, 60);
         assert!(!cfg.mail_verify_backend_tls);
+        assert!(!cfg.mail_backend_starttls);
+    }
+
+    #[test]
+    fn test_app_config_mail_backend_starttls_parsed() {
+        let cfg = r#"
+            worker_threads 1;
+            http {
+                upstream default { server 127.0.0.1:8080; }
+                server {
+                    listen 8080;
+                    smtp_bind 0.0.0.0:25;
+                    mail_backend_starttls on;
+                    route / { upstream default; }
+                }
+            }
+        "#;
+        let result = parser::parse_phalanx_config(cfg);
+        assert!(result.is_ok(), "parse failed: {:?}", result.err());
+        let parsed = result.unwrap();
+        let http = parsed.http.unwrap();
+        let server = &http.servers[0];
+        assert_eq!(
+            server.directives.get("mail_backend_starttls"),
+            Some(&"on".to_string()),
+            "directives: {:?}",
+            server.directives
+        );
     }
 
     #[test]
@@ -1443,10 +1543,8 @@ mod tests {
     #[test]
     fn test_try_load_config_lenient_invalid_returns_default() {
         let bad = "worker_threads 4\nhttp {";
-        let path = std::env::temp_dir().join(format!(
-            "phalanx_bad_lenient_{}.conf",
-            std::process::id()
-        ));
+        let path =
+            std::env::temp_dir().join(format!("phalanx_bad_lenient_{}.conf", std::process::id()));
         std::fs::write(&path, bad).expect("write temp config");
         let cfg = try_load_config(path.to_str().unwrap(), ConfigParsePolicy::Lenient)
             .expect("lenient parse should not fail hard");
@@ -1457,10 +1555,8 @@ mod tests {
     #[test]
     fn test_try_load_config_strict_invalid_returns_err() {
         let bad = "worker_threads 4\nhttp {";
-        let path = std::env::temp_dir().join(format!(
-            "phalanx_bad_strict_{}.conf",
-            std::process::id()
-        ));
+        let path =
+            std::env::temp_dir().join(format!("phalanx_bad_strict_{}.conf", std::process::id()));
         std::fs::write(&path, bad).expect("write temp config");
         let res = try_load_config(path.to_str().unwrap(), ConfigParsePolicy::Strict);
         assert!(res.is_err());
@@ -1626,10 +1722,8 @@ mod tests {
                 }
             }
         "#;
-        let path = std::env::temp_dir().join(format!(
-            "phalanx_timeout_test_{}.conf",
-            std::process::id()
-        ));
+        let path =
+            std::env::temp_dir().join(format!("phalanx_timeout_test_{}.conf", std::process::id()));
         std::fs::write(&path, cfg_str).expect("write temp config");
         let cfg = try_load_config(path.to_str().unwrap(), ConfigParsePolicy::Lenient)
             .expect("parse should succeed");
@@ -1673,10 +1767,8 @@ mod tests {
                 }
             }
         "#;
-        let path = std::env::temp_dir().join(format!(
-            "phalanx_tls_test_{}.conf",
-            std::process::id()
-        ));
+        let path =
+            std::env::temp_dir().join(format!("phalanx_tls_test_{}.conf", std::process::id()));
         std::fs::write(&path, cfg_str).expect("write temp config");
         let cfg = try_load_config(path.to_str().unwrap(), ConfigParsePolicy::Lenient)
             .expect("parse should succeed");
@@ -1712,10 +1804,8 @@ mod tests {
                 }
             }
         "#;
-        let path = std::env::temp_dir().join(format!(
-            "phalanx_zone_test_{}.conf",
-            std::process::id()
-        ));
+        let path =
+            std::env::temp_dir().join(format!("phalanx_zone_test_{}.conf", std::process::id()));
         std::fs::write(&path, cfg_str).expect("write temp config");
         let cfg = try_load_config(path.to_str().unwrap(), ConfigParsePolicy::Lenient)
             .expect("parse should succeed");

@@ -68,6 +68,7 @@ pub fn spawn_reload_handler(
     gslb_router: Arc<Option<crate::gslb::GslbRouter>>,
     cancel: tokio_util::sync::CancellationToken,
     reload_status: Arc<RwLock<Option<ReloadStatus>>>,
+    dynamic_certs: Arc<dashmap::DashMap<String, crate::admin::api::SslCertEntry>>,
 ) {
     tokio::spawn(async move {
         #[cfg(unix)]
@@ -111,14 +112,22 @@ pub fn spawn_reload_handler(
                 );
 
                 // ── Core: TLS + Upstreams ──
-                let new_tls = crate::proxy::tls::reload_tls_acceptor(new_config.as_ref()).await;
+                let new_tls = crate::proxy::tls::reload_tls_acceptor(
+                    new_config.as_ref(),
+                    Some(Arc::clone(&dynamic_certs)),
+                )
+                .await;
                 // Only swap the TLS acceptor if the new one loaded successfully.
                 // reload_tls_acceptor returns None when certs are malformed or missing —
                 // keeping the previous acceptor in place avoids dropping all TLS traffic.
                 if new_tls.is_some() {
                     tls_acceptor.store(Arc::new(new_tls));
                 }
-                upstreams.reload_from_config(new_config.as_ref(), Arc::clone(&discovery), cancel.clone());
+                upstreams.reload_from_config(
+                    new_config.as_ref(),
+                    Arc::clone(&discovery),
+                    cancel.clone(),
+                );
 
                 // ── Rate limiter ──
                 rate_limiter.reload(
@@ -190,9 +199,7 @@ pub fn spawn_reload_handler(
                     success: true,
                     errors: Vec::new(),
                 });
-                info!(
-                    "Configuration swap complete — all reloadable subsystems updated."
-                );
+                info!("Configuration swap complete — all reloadable subsystems updated.");
             }
         }
 

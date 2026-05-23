@@ -15,11 +15,11 @@ use crate::discovery::{DiscoveredBackend, ServiceDiscovery};
 use crate::keyval::{KeyvalGetResponse, KeyvalListEntry, KeyvalSetRequest, KeyvalStore};
 use crate::routing::UpstreamManager;
 use actix_web::{App, HttpResponse, HttpServer, Responder, delete, get, post, web};
+use parking_lot::RwLock;
 use prometheus::{
     Encoder, HistogramOpts, HistogramVec, IntCounter, IntCounterVec, IntGauge, Opts, Registry,
     TextEncoder,
 };
-use parking_lot::RwLock;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use tracing::info;
@@ -164,10 +164,7 @@ impl ProxyMetrics {
         .unwrap();
 
         let backend_errors_total = IntCounterVec::new(
-            Opts::new(
-                "phalanx_backend_errors_total",
-                "Per-backend error counter",
-            ),
+            Opts::new("phalanx_backend_errors_total", "Per-backend error counter"),
             &["backend", "pool", "error_type"],
         )
         .unwrap();
@@ -208,10 +205,7 @@ impl ProxyMetrics {
             .unwrap();
 
         let wt_sessions_total = IntCounterVec::new(
-            Opts::new(
-                "phalanx_wt_sessions_total",
-                "Total WebTransport sessions",
-            ),
+            Opts::new("phalanx_wt_sessions_total", "Total WebTransport sessions"),
             &["outcome"],
         )
         .unwrap();
@@ -407,12 +401,14 @@ async fn remove_backend(
 pub async fn start_admin_server(
     bind_addr: String,
     state: AdminState,
+    admin_api_tokens: std::collections::HashMap<String, String>,
     shutdown: tokio_util::sync::CancellationToken,
 ) {
     info!("Admin API listening on http://{}", bind_addr);
 
     let rate_limiter = Arc::clone(&state.rate_limiter);
-    let admin_state = web::Data::new(state);
+    let admin_state = web::Data::new(state.clone());
+    let extended_state = web::Data::new(api::ExtendedAdminState::new(state, &admin_api_tokens));
 
     // Dashboard state shares the same inner data via Arc clones
     let dash_state: web::Data<dashboard_api::DashboardState> = {
@@ -450,6 +446,7 @@ pub async fn start_admin_server(
         App::new()
             .app_data(admin_state.clone())
             .app_data(dash_state.clone())
+            .app_data(extended_state.clone())
             .service(health)
             .service(metrics_endpoint)
             .service(api_stats)
@@ -468,6 +465,13 @@ pub async fn start_admin_server(
             .service(api::ml_upload)
             .service(api::ml_logs)
             .service(api::ml_mode)
+            .service(api::create_route)
+            .service(api::list_routes)
+            .service(api::delete_route)
+            .service(api::add_ssl_cert)
+            .service(api::list_ssl_certs)
+            .service(api::delete_ssl_cert)
+            .service(api::list_upstreams)
             .service(cache_purge)
             // Dashboard API endpoints
             .service(dashboard_api::list_bans)
@@ -524,10 +528,7 @@ struct PurgeBody {
 /// POST /api/cache/purge -- invalidates cached responses by key, prefix,
 /// or all entries if neither is specified.
 #[post("/api/cache/purge")]
-async fn cache_purge(
-    state: web::Data<AdminState>,
-    body: web::Json<PurgeBody>,
-) -> impl Responder {
+async fn cache_purge(state: web::Data<AdminState>, body: web::Json<PurgeBody>) -> impl Responder {
     let purged = if let Some(ref key) = body.key {
         let removed = state.cache.purge(key).await;
         serde_json::json!({ "status": "ok", "key": key, "removed": removed })
@@ -545,10 +546,7 @@ async fn cache_purge(
 
 /// GET /api/keyval/{key} -- retrieves a single key-value entry.
 #[get("/api/keyval/{key}")]
-async fn keyval_get(
-    state: web::Data<AdminState>,
-    path: web::Path<String>,
-) -> impl Responder {
+async fn keyval_get(state: web::Data<AdminState>, path: web::Path<String>) -> impl Responder {
     let key = path.into_inner();
     match state.keyval.get(&key) {
         Some(value) => HttpResponse::Ok().json(KeyvalGetResponse { key, value }),
@@ -571,10 +569,7 @@ async fn keyval_set(
 
 /// DELETE /api/keyval/{key} -- removes a key-value entry.
 #[delete("/api/keyval/{key}")]
-async fn keyval_delete(
-    state: web::Data<AdminState>,
-    path: web::Path<String>,
-) -> impl Responder {
+async fn keyval_delete(state: web::Data<AdminState>, path: web::Path<String>) -> impl Responder {
     let key = path.into_inner();
     let deleted = state.keyval.delete(&key);
     if deleted {
@@ -713,13 +708,16 @@ async fn config_reload(state: web::Data<AdminState>) -> impl Responder {
             fn kill(pid: u32, sig: c_int) -> c_int;
         }
         let sighup: c_int = 1;
-        unsafe { kill(getpid(), sighup); }
+        unsafe {
+            kill(getpid(), sighup);
+        }
         return HttpResponse::Ok().json(serde_json::json!({
             "status": "reload signaled"
         }));
     }
     #[cfg(not(unix))]
-    HttpResponse::Ok().json(serde_json::json!({ "status": "reload not supported on this platform" }))
+    HttpResponse::Ok()
+        .json(serde_json::json!({ "status": "reload not supported on this platform" }))
 }
 
 /// GET /api/reload/status -- returns the result of the most recent SIGHUP reload.
@@ -889,10 +887,7 @@ mod tests {
     #[actix_web::test]
     async fn test_proxy_metrics_cache_hits() {
         let metrics = ProxyMetrics::new();
-        metrics
-            .cache_hits_total
-            .with_label_values(&["hit"])
-            .inc();
+        metrics.cache_hits_total.with_label_values(&["hit"]).inc();
         metrics
             .cache_hits_total
             .with_label_values(&["miss"])
@@ -1028,9 +1023,7 @@ mod tests {
             rand::random::<u64>()
         );
         let _ = std::fs::create_dir_all(&db_path);
-        let discovery = Arc::new(
-            crate::discovery::ServiceDiscovery::new(&db_path).unwrap(),
-        );
+        let discovery = Arc::new(crate::discovery::ServiceDiscovery::new(&db_path).unwrap());
         let config = crate::config::AppConfig::default();
         let manager = Arc::new(crate::routing::UpstreamManager::new(
             &config,
@@ -1131,12 +1124,8 @@ mod tests {
     #[actix_web::test]
     async fn test_publish_webrtc_missing_fields() {
         let (state, _sfu) = make_webrtc_admin_state();
-        let app = test::init_service(
-            App::new()
-                .app_data(state.clone())
-                .service(publish_webrtc),
-        )
-        .await;
+        let app =
+            test::init_service(App::new().app_data(state.clone()).service(publish_webrtc)).await;
         let req = test::TestRequest::post()
             .uri("/api/webrtc/publish")
             .set_json(&serde_json::json!({"room_id": "r1"}))
@@ -1148,12 +1137,8 @@ mod tests {
     #[actix_web::test]
     async fn test_subscribe_webrtc_returns_answer() {
         let (state, _sfu) = make_webrtc_admin_state();
-        let app = test::init_service(
-            App::new()
-                .app_data(state.clone())
-                .service(subscribe_webrtc),
-        )
-        .await;
+        let app =
+            test::init_service(App::new().app_data(state.clone()).service(subscribe_webrtc)).await;
         // A subscribe without a prior publish creates the room but
         // will fail in the WebRTC stack (no real browser). The handler
         // returns 400 on the WebRTC error, but the room exists.
@@ -1181,7 +1166,10 @@ mod tests {
         .await;
         let req = test::TestRequest::post()
             .uri("/api/webrtc/ice/nonexistent/peer1")
-            .set_payload(r#"{"candidate":"candidate:1 1 UDP 2122252543 192.168.1.1 54321 typ host"}"#.to_string())
+            .set_payload(
+                r#"{"candidate":"candidate:1 1 UDP 2122252543 192.168.1.1 54321 typ host"}"#
+                    .to_string(),
+            )
             .to_request();
         let resp = test::call_service(&app, req).await;
         assert_eq!(resp.status(), 400);
@@ -1309,9 +1297,7 @@ mod tests {
             rand::random::<u64>()
         );
         let _ = std::fs::create_dir_all(&db_path);
-        let discovery = Arc::new(
-            crate::discovery::ServiceDiscovery::new(&db_path).unwrap(),
-        );
+        let discovery = Arc::new(crate::discovery::ServiceDiscovery::new(&db_path).unwrap());
         let config = crate::config::AppConfig::default();
         let manager = Arc::new(crate::routing::UpstreamManager::new(
             &config,
@@ -1355,12 +1341,8 @@ mod tests {
             last_reload_status: Arc::new(RwLock::new(None)),
         });
 
-        let app = test::init_service(
-            App::new()
-                .app_data(state.clone())
-                .service(publish_webrtc),
-        )
-        .await;
+        let app =
+            test::init_service(App::new().app_data(state.clone()).service(publish_webrtc)).await;
         let req = test::TestRequest::post()
             .uri("/api/webrtc/publish")
             .set_json(&serde_json::json!({
@@ -1383,13 +1365,11 @@ mod tests {
     #[actix_web::test]
     async fn test_reload_status_returns_none_before_reload() {
         let (state, _sfu) = make_webrtc_admin_state();
-        let app = test::init_service(
-            App::new()
-                .app_data(state.clone())
-                .service(reload_status),
-        )
-        .await;
-        let req = test::TestRequest::get().uri("/api/reload/status").to_request();
+        let app =
+            test::init_service(App::new().app_data(state.clone()).service(reload_status)).await;
+        let req = test::TestRequest::get()
+            .uri("/api/reload/status")
+            .to_request();
         let resp = test::call_service(&app, req).await;
         assert_eq!(resp.status(), 200);
         let body: serde_json::Value = test::read_body_json(resp).await;
@@ -1407,13 +1387,11 @@ mod tests {
                 errors: vec![],
             });
         }
-        let app = test::init_service(
-            App::new()
-                .app_data(state.clone())
-                .service(reload_status),
-        )
-        .await;
-        let req = test::TestRequest::get().uri("/api/reload/status").to_request();
+        let app =
+            test::init_service(App::new().app_data(state.clone()).service(reload_status)).await;
+        let req = test::TestRequest::get()
+            .uri("/api/reload/status")
+            .to_request();
         let resp = test::call_service(&app, req).await;
         assert_eq!(resp.status(), 200);
         let body: serde_json::Value = test::read_body_json(resp).await;
@@ -1433,13 +1411,11 @@ mod tests {
                 errors: vec!["WAF policy reload failed".to_string()],
             });
         }
-        let app = test::init_service(
-            App::new()
-                .app_data(state.clone())
-                .service(reload_status),
-        )
-        .await;
-        let req = test::TestRequest::get().uri("/api/reload/status").to_request();
+        let app =
+            test::init_service(App::new().app_data(state.clone()).service(reload_status)).await;
+        let req = test::TestRequest::get()
+            .uri("/api/reload/status")
+            .to_request();
         let resp = test::call_service(&app, req).await;
         assert_eq!(resp.status(), 200);
         let body: serde_json::Value = test::read_body_json(resp).await;
@@ -1451,8 +1427,14 @@ mod tests {
     async fn test_api_stats_includes_histograms() {
         let metrics = Arc::new(ProxyMetrics::new());
         // Record a request to populate the histogram
-        metrics.http_request_duration.with_label_values(&["GET", "default"]).observe(0.042);
-        metrics.http_requests_total.with_label_values(&["GET", "200", "default"]).inc();
+        metrics
+            .http_request_duration
+            .with_label_values(&["GET", "default"])
+            .observe(0.042);
+        metrics
+            .http_requests_total
+            .with_label_values(&["GET", "200", "default"])
+            .inc();
 
         let discovery = Arc::new(crate::discovery::ServiceDiscovery::new("/tmp/dummy_db").unwrap());
         let manager = Arc::new(crate::routing::UpstreamManager::new(
@@ -1468,9 +1450,14 @@ mod tests {
             discovery,
             manager,
             keyval: crate::keyval::KeyvalStore::new(0, None),
-            waf: Arc::new(crate::waf::WafEngine::new(false, crate::waf::reputation::IpReputationManager::new(5, 3600, None))),
+            waf: Arc::new(crate::waf::WafEngine::new(
+                false,
+                crate::waf::reputation::IpReputationManager::new(5, 3600, None),
+            )),
             cache: Arc::new(crate::middleware::cache::AdvancedCache::new(1000, 60, None)),
-            rate_limiter: Arc::new(crate::middleware::ratelimit::PhalanxRateLimiter::new(100, 200, None, None)),
+            rate_limiter: Arc::new(crate::middleware::ratelimit::PhalanxRateLimiter::new(
+                100, 200, None, None,
+            )),
             bandwidth,
             alert_engine,
             dynamic_routes: Arc::new(dashmap::DashMap::new()),
@@ -1488,28 +1475,225 @@ mod tests {
             last_reload_status: Arc::new(RwLock::new(None)),
         });
 
-        let app = test::init_service(
-            App::new()
-                .app_data(state.clone())
-                .service(api_stats),
-        )
-        .await;
+        let app = test::init_service(App::new().app_data(state.clone()).service(api_stats)).await;
         let req = test::TestRequest::get().uri("/api/stats").to_request();
         let resp = test::call_service(&app, req).await;
         assert_eq!(resp.status(), 200);
         let body: serde_json::Value = test::read_body_json(resp).await;
 
         // Histogram family must be present
-        let hist = body.get("phalanx_http_request_duration_seconds").expect("histogram family missing");
+        let hist = body
+            .get("phalanx_http_request_duration_seconds")
+            .expect("histogram family missing");
         let hist_arr = hist.as_array().expect("histogram must be array");
         assert!(!hist_arr.is_empty(), "histogram array must not be empty");
         assert_eq!(hist_arr[0]["type"], "histogram");
         assert!(hist_arr[0]["value"].as_f64().unwrap() > 0.0);
 
         // Counter family must still be present
-        let counter = body.get("phalanx_http_requests_total").expect("counter family missing");
+        let counter = body
+            .get("phalanx_http_requests_total")
+            .expect("counter family missing");
         let counter_arr = counter.as_array().expect("counter must be array");
         assert!(!counter_arr.is_empty());
         assert_eq!(counter_arr[0]["type"], "counter");
+    }
+
+    // ─── Extended Admin API (RBAC + dynamic routes/certs/upstreams) tests ───
+
+    fn make_extended_admin_state() -> (web::Data<AdminState>, web::Data<api::ExtendedAdminState>) {
+        let (state, _sfu) = make_webrtc_admin_state();
+        let mut tokens = std::collections::HashMap::new();
+        tokens.insert("admin-token".to_string(), "admin".to_string());
+        tokens.insert("operator-token".to_string(), "operator".to_string());
+        tokens.insert("readonly-token".to_string(), "readonly".to_string());
+        let extended = web::Data::new(api::ExtendedAdminState::new(
+            state.as_ref().clone(),
+            &tokens,
+        ));
+        (state, extended)
+    }
+
+    #[actix_web::test]
+    async fn test_create_list_delete_route_with_rbac() {
+        let (base, ext) = make_extended_admin_state();
+        let app = test::init_service(
+            App::new()
+                .app_data(base.clone())
+                .app_data(ext.clone())
+                .service(api::create_route)
+                .service(api::list_routes)
+                .service(api::delete_route),
+        )
+        .await;
+
+        // Create route as operator
+        let req = test::TestRequest::post()
+            .uri("/api/routes")
+            .insert_header(("Authorization", "Bearer operator-token"))
+            .set_json(&serde_json::json!({"path": "/api/v2", "upstream": "api_pool"}))
+            .to_request();
+        let resp = test::call_service(&app, req).await;
+        assert_eq!(resp.status(), 201);
+
+        // List routes as readonly
+        let req = test::TestRequest::get()
+            .uri("/api/routes")
+            .insert_header(("Authorization", "Bearer readonly-token"))
+            .to_request();
+        let resp = test::call_service(&app, req).await;
+        assert_eq!(resp.status(), 200);
+        let body: serde_json::Value = test::read_body_json(resp).await;
+        let routes = body["routes"].as_array().unwrap();
+        assert_eq!(routes.len(), 1);
+        assert_eq!(routes[0]["path"], "/api/v2");
+
+        // Delete route as operator
+        let req = test::TestRequest::delete()
+            .uri("/api/routes/api/v2")
+            .insert_header(("Authorization", "Bearer operator-token"))
+            .to_request();
+        let resp = test::call_service(&app, req).await;
+        assert_eq!(resp.status(), 200);
+
+        // Verify deletion
+        let req = test::TestRequest::get()
+            .uri("/api/routes")
+            .insert_header(("Authorization", "Bearer readonly-token"))
+            .to_request();
+        let resp = test::call_service(&app, req).await;
+        let body: serde_json::Value = test::read_body_json(resp).await;
+        assert_eq!(body["routes"].as_array().unwrap().len(), 0);
+    }
+
+    #[actix_web::test]
+    async fn test_create_route_forbidden_for_readonly() {
+        let (base, ext) = make_extended_admin_state();
+        let app = test::init_service(
+            App::new()
+                .app_data(base.clone())
+                .app_data(ext.clone())
+                .service(api::create_route),
+        )
+        .await;
+
+        let req = test::TestRequest::post()
+            .uri("/api/routes")
+            .insert_header(("Authorization", "Bearer readonly-token"))
+            .set_json(&serde_json::json!({"path": "/api/v2", "upstream": "api_pool"}))
+            .to_request();
+        let resp = test::call_service(&app, req).await;
+        assert_eq!(resp.status(), 403);
+    }
+
+    #[actix_web::test]
+    async fn test_ssl_cert_crud_with_rbac() {
+        let (base, ext) = make_extended_admin_state();
+        let app = test::init_service(
+            App::new()
+                .app_data(base.clone())
+                .app_data(ext.clone())
+                .service(api::add_ssl_cert)
+                .service(api::list_ssl_certs)
+                .service(api::delete_ssl_cert),
+        )
+        .await;
+
+        // Add cert as admin
+        let req = test::TestRequest::post()
+            .uri("/api/ssl")
+            .insert_header(("Authorization", "Bearer admin-token"))
+            .set_json(&serde_json::json!({
+                "server_name": "example.com",
+                "cert_path": "/certs/example.pem",
+                "key_path": "/certs/example.key",
+                "added_at": 0
+            }))
+            .to_request();
+        let resp = test::call_service(&app, req).await;
+        assert_eq!(resp.status(), 201);
+
+        // List certs as readonly
+        let req = test::TestRequest::get()
+            .uri("/api/ssl")
+            .insert_header(("Authorization", "Bearer readonly-token"))
+            .to_request();
+        let resp = test::call_service(&app, req).await;
+        assert_eq!(resp.status(), 200);
+        let body: serde_json::Value = test::read_body_json(resp).await;
+        let certs = body["certificates"].as_array().unwrap();
+        assert_eq!(certs.len(), 1);
+        assert_eq!(certs[0]["server_name"], "example.com");
+
+        // Delete cert as admin
+        let req = test::TestRequest::delete()
+            .uri("/api/ssl/example.com")
+            .insert_header(("Authorization", "Bearer admin-token"))
+            .to_request();
+        let resp = test::call_service(&app, req).await;
+        assert_eq!(resp.status(), 200);
+    }
+
+    #[actix_web::test]
+    async fn test_add_ssl_cert_forbidden_for_operator() {
+        let (base, ext) = make_extended_admin_state();
+        let app = test::init_service(
+            App::new()
+                .app_data(base.clone())
+                .app_data(ext.clone())
+                .service(api::add_ssl_cert),
+        )
+        .await;
+
+        let req = test::TestRequest::post()
+            .uri("/api/ssl")
+            .insert_header(("Authorization", "Bearer operator-token"))
+            .set_json(&serde_json::json!({
+                "server_name": "example.com",
+                "cert_path": "/certs/example.pem",
+                "key_path": "/certs/example.key",
+                "added_at": 0
+            }))
+            .to_request();
+        let resp = test::call_service(&app, req).await;
+        assert_eq!(resp.status(), 403);
+    }
+
+    #[actix_web::test]
+    async fn test_list_upstreams_returns_empty_when_no_backends() {
+        let (base, ext) = make_extended_admin_state();
+        let app = test::init_service(
+            App::new()
+                .app_data(base.clone())
+                .app_data(ext.clone())
+                .service(api::list_upstreams),
+        )
+        .await;
+
+        let req = test::TestRequest::get()
+            .uri("/api/upstreams")
+            .insert_header(("Authorization", "Bearer readonly-token"))
+            .to_request();
+        let resp = test::call_service(&app, req).await;
+        assert_eq!(resp.status(), 200);
+        let body: serde_json::Value = test::read_body_json(resp).await;
+        let upstreams = body["upstreams"].as_array().unwrap();
+        assert_eq!(upstreams.len(), 0);
+    }
+
+    #[actix_web::test]
+    async fn test_unauthorized_without_token_when_tokens_configured() {
+        let (base, ext) = make_extended_admin_state();
+        let app = test::init_service(
+            App::new()
+                .app_data(base.clone())
+                .app_data(ext.clone())
+                .service(api::list_routes),
+        )
+        .await;
+
+        let req = test::TestRequest::get().uri("/api/routes").to_request();
+        let resp = test::call_service(&app, req).await;
+        assert_eq!(resp.status(), 401);
     }
 }

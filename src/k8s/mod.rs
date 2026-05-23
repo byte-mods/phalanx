@@ -8,10 +8,10 @@
 //! - Path-based and host-based routing
 //! - Annotation-driven configuration overrides
 
-use std::collections::HashMap;
-use std::sync::Arc;
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
+use std::sync::Arc;
 use tracing::{debug, info, warn};
 
 /// Represents a Kubernetes Ingress resource (simplified).
@@ -243,11 +243,7 @@ impl IngressController {
                     path.backend.service_port,
                 );
 
-                let tls_secret = rule
-                    .host
-                    .as_ref()
-                    .and_then(|h| tls_map.get(h))
-                    .cloned();
+                let tls_secret = rule.host.as_ref().and_then(|h| tls_map.get(h)).cloned();
 
                 // Check for rewrite-target annotation
                 let mut rewrite_rules = Vec::new();
@@ -267,10 +263,7 @@ impl IngressController {
                     .map(|v| v == "true")
                     .unwrap_or(false)
                 {
-                    add_headers.insert(
-                        "Access-Control-Allow-Origin".to_string(),
-                        "*".to_string(),
-                    );
+                    add_headers.insert("Access-Control-Allow-Origin".to_string(), "*".to_string());
                     add_headers.insert(
                         "Access-Control-Allow-Methods".to_string(),
                         "GET, POST, PUT, DELETE, OPTIONS".to_string(),
@@ -298,14 +291,12 @@ impl IngressController {
         // ingresses with the same path/host do not clobber each other.
         let mut stored = self.routes.write();
         stored.retain(|r| {
-            !routes
-                .iter()
-                .any(|nr| {
-                    nr.path == r.path
-                        && nr.host == r.host
-                        && nr.owner_namespace == r.owner_namespace
-                        && nr.owner_ingress_name == r.owner_ingress_name
-                })
+            !routes.iter().any(|nr| {
+                nr.path == r.path
+                    && nr.host == r.host
+                    && nr.owner_namespace == r.owner_namespace
+                    && nr.owner_ingress_name == r.owner_ingress_name
+            })
         });
         stored.extend(routes.clone());
 
@@ -340,11 +331,8 @@ impl IngressController {
                     .backends
                     .iter()
                     .map(|b| {
-                        let addr = self.resolve_service(
-                            &route.namespace,
-                            &b.service_name,
-                            b.service_port,
-                        );
+                        let addr =
+                            self.resolve_service(&route.namespace, &b.service_name, b.service_port);
                         (addr, b.weight)
                     })
                     .collect();
@@ -422,14 +410,12 @@ impl IngressController {
         // matching on path + host + owner, before inserting fresh entries.
         // Prevents duplicates when reconcile is called repeatedly for the same resource.
         stored.retain(|r| {
-            !phalanx_routes
-                .iter()
-                .any(|nr| {
-                    nr.path == r.path
-                        && nr.host == r.host
-                        && nr.owner_namespace == r.owner_namespace
-                        && nr.owner_ingress_name == r.owner_ingress_name
-                })
+            !phalanx_routes.iter().any(|nr| {
+                nr.path == r.path
+                    && nr.host == r.host
+                    && nr.owner_namespace == r.owner_namespace
+                    && nr.owner_ingress_name == r.owner_ingress_name
+            })
         });
         stored.extend(phalanx_routes.clone());
 
@@ -448,12 +434,10 @@ impl IngressController {
     /// ingress is removed — not other ingresses in the same namespace, nor same-named
     /// ingresses in other namespaces.
     pub fn remove_ingress(&self, namespace: &str, name: &str) {
-        self.routes
-            .write()
-            .retain(|r| {
-                r.owner_namespace.as_deref() != Some(namespace)
-                    || r.owner_ingress_name.as_deref() != Some(name)
-            });
+        self.routes.write().retain(|r| {
+            r.owner_namespace.as_deref() != Some(namespace)
+                || r.owner_ingress_name.as_deref() != Some(name)
+        });
         info!("Removed routes for ingress {}/{}", namespace, name);
     }
 
@@ -489,10 +473,7 @@ impl IngressController {
     /// calls `reconcile_ingress()` on Added/Modified events.
     ///
     /// Accepts a `CancellationToken` for graceful shutdown.
-    pub fn spawn_ingress_watcher(
-        self: Arc<Self>,
-        cancel: tokio_util::sync::CancellationToken,
-    ) {
+    pub fn spawn_ingress_watcher(self: Arc<Self>, cancel: tokio_util::sync::CancellationToken) {
         tokio::spawn(async move {
             use futures_util::TryStreamExt;
 
@@ -507,11 +488,12 @@ impl IngressController {
             let ingresses: kube::Api<k8s_openapi::api::networking::v1::Ingress> =
                 kube::Api::all(client);
             let watcher_config = kube::runtime::watcher::Config::default();
-            let mut stream = std::pin::pin!(
-                kube::runtime::watcher(ingresses, watcher_config)
-            );
+            let mut stream = std::pin::pin!(kube::runtime::watcher(ingresses, watcher_config));
 
-            info!("K8s Ingress watcher started for class '{}'", self.ingress_class);
+            info!(
+                "K8s Ingress watcher started for class '{}'",
+                self.ingress_class
+            );
 
             let mut backoff_ms: u64 = 0;
             loop {
@@ -560,12 +542,10 @@ impl IngressController {
     /// Matches both `owner_namespace` and `owner_ingress_name` exactly, so only the named
     /// gateway route is removed — not other gateway routes in the same namespace.
     pub fn remove_gateway_route(&self, namespace: &str, name: &str) {
-        self.routes
-            .write()
-            .retain(|r| {
-                r.owner_namespace.as_deref() != Some(namespace)
-                    || r.owner_ingress_name.as_deref() != Some(name)
-            });
+        self.routes.write().retain(|r| {
+            r.owner_namespace.as_deref() != Some(namespace)
+                || r.owner_ingress_name.as_deref() != Some(name)
+        });
         info!("Removed routes for gateway route {}/{}", namespace, name);
     }
 
@@ -576,10 +556,7 @@ impl IngressController {
     /// Phalanx routes. On Delete, removes the associated routes.
     ///
     /// Accepts a `CancellationToken` for graceful shutdown.
-    pub fn spawn_gateway_watcher(
-        self: Arc<Self>,
-        cancel: tokio_util::sync::CancellationToken,
-    ) {
+    pub fn spawn_gateway_watcher(self: Arc<Self>, cancel: tokio_util::sync::CancellationToken) {
         tokio::spawn(async move {
             // Gateway API HTTPRoute is a CRD — we use dynamic API access
             let client = match kube::Client::try_default().await {
@@ -601,14 +578,11 @@ impl IngressController {
                 plural: "httproutes".to_string(),
             };
 
-            let api: kube::Api<kube::api::DynamicObject> =
-                kube::Api::all_with(client, &ar);
+            let api: kube::Api<kube::api::DynamicObject> = kube::Api::all_with(client, &ar);
             let watcher_config = kube::runtime::watcher::Config::default();
 
             use futures_util::TryStreamExt;
-            let mut stream = std::pin::pin!(
-                kube::runtime::watcher(api, watcher_config)
-            );
+            let mut stream = std::pin::pin!(kube::runtime::watcher(api, watcher_config));
 
             info!("K8s Gateway API watcher started");
 
@@ -709,10 +683,8 @@ fn dynamic_to_gateway_route(obj: &kube::api::DynamicObject) -> Option<GatewayHtt
                                             .unwrap_or("/")
                                             .to_string(),
                                     });
-                                    let method = m
-                                        .get("method")
-                                        .and_then(|v| v.as_str())
-                                        .map(String::from);
+                                    let method =
+                                        m.get("method").and_then(|v| v.as_str()).map(String::from);
                                     GatewayMatch {
                                         path,
                                         headers: vec![],
@@ -735,7 +707,8 @@ fn dynamic_to_gateway_route(obj: &kube::api::DynamicObject) -> Option<GatewayHtt
                                         weight: b
                                             .get("weight")
                                             .and_then(|w| w.as_u64())
-                                            .unwrap_or(1) as u32,
+                                            .unwrap_or(1)
+                                            as u32,
                                     })
                                 })
                                 .collect()
@@ -766,7 +739,10 @@ fn k8s_ingress_to_internal(
 ) -> Option<IngressResource> {
     let metadata = &ingress.metadata;
     let name = metadata.name.clone().unwrap_or_default();
-    let namespace = metadata.namespace.clone().unwrap_or_else(|| "default".to_string());
+    let namespace = metadata
+        .namespace
+        .clone()
+        .unwrap_or_else(|| "default".to_string());
     let annotations: HashMap<String, String> = metadata
         .annotations
         .clone()
@@ -808,7 +784,8 @@ fn k8s_ingress_to_internal(
                                                 .as_ref()
                                                 .and_then(|s| s.port.as_ref())
                                                 .and_then(|p| p.number)
-                                                .unwrap_or(80) as u16,
+                                                .unwrap_or(80)
+                                                as u16,
                                         },
                                     }
                                 })
@@ -862,7 +839,10 @@ mod tests {
             namespace: "default".to_string(),
             annotations: {
                 let mut a = HashMap::new();
-                a.insert("kubernetes.io/ingress.class".to_string(), "phalanx".to_string());
+                a.insert(
+                    "kubernetes.io/ingress.class".to_string(),
+                    "phalanx".to_string(),
+                );
                 a
             },
             rules: vec![IngressRule {
@@ -918,10 +898,9 @@ mod tests {
     fn test_reconcile_ingress_with_rewrite() {
         let ctrl = make_controller();
         let mut ingress = make_ingress();
-        ingress.annotations.insert(
-            annotations::REWRITE_TARGET.to_string(),
-            "/v2".to_string(),
-        );
+        ingress
+            .annotations
+            .insert(annotations::REWRITE_TARGET.to_string(), "/v2".to_string());
         let routes = ctrl.reconcile_ingress(&ingress);
         assert_eq!(routes[0].rewrite_rules.len(), 1);
         assert!(routes[0].rewrite_rules[0].1.contains("/v2"));
@@ -931,12 +910,15 @@ mod tests {
     fn test_reconcile_ingress_with_cors() {
         let ctrl = make_controller();
         let mut ingress = make_ingress();
-        ingress.annotations.insert(
-            annotations::CORS_ENABLED.to_string(),
-            "true".to_string(),
-        );
+        ingress
+            .annotations
+            .insert(annotations::CORS_ENABLED.to_string(), "true".to_string());
         let routes = ctrl.reconcile_ingress(&ingress);
-        assert!(routes[0].add_headers.contains_key("Access-Control-Allow-Origin"));
+        assert!(
+            routes[0]
+                .add_headers
+                .contains_key("Access-Control-Allow-Origin")
+        );
     }
 
     #[test]
@@ -947,7 +929,10 @@ mod tests {
             namespace: "default".to_string(),
             annotations: {
                 let mut a = HashMap::new();
-                a.insert("kubernetes.io/ingress.class".to_string(), "phalanx".to_string());
+                a.insert(
+                    "kubernetes.io/ingress.class".to_string(),
+                    "phalanx".to_string(),
+                );
                 a
             },
             rules: vec![IngressRule {
@@ -1014,7 +999,10 @@ mod tests {
             namespace: "default".to_string(),
             annotations: {
                 let mut a = HashMap::new();
-                a.insert("kubernetes.io/ingress.class".to_string(), "phalanx".to_string());
+                a.insert(
+                    "kubernetes.io/ingress.class".to_string(),
+                    "phalanx".to_string(),
+                );
                 a
             },
             rules: vec![IngressRule {
@@ -1022,7 +1010,10 @@ mod tests {
                 paths: vec![IngressPath {
                     path: "/a".to_string(),
                     path_type: PathType::Prefix,
-                    backend: IngressBackend { service_name: "svc-a".to_string(), service_port: 80 },
+                    backend: IngressBackend {
+                        service_name: "svc-a".to_string(),
+                        service_port: 80,
+                    },
                 }],
             }],
             tls: vec![],
@@ -1032,7 +1023,10 @@ mod tests {
             namespace: "default".to_string(),
             annotations: {
                 let mut a = HashMap::new();
-                a.insert("kubernetes.io/ingress.class".to_string(), "phalanx".to_string());
+                a.insert(
+                    "kubernetes.io/ingress.class".to_string(),
+                    "phalanx".to_string(),
+                );
                 a
             },
             rules: vec![IngressRule {
@@ -1040,7 +1034,10 @@ mod tests {
                 paths: vec![IngressPath {
                     path: "/b".to_string(),
                     path_type: PathType::Prefix,
-                    backend: IngressBackend { service_name: "svc-b".to_string(), service_port: 80 },
+                    backend: IngressBackend {
+                        service_name: "svc-b".to_string(),
+                        service_port: 80,
+                    },
                 }],
             }],
             tls: vec![],
@@ -1064,7 +1061,10 @@ mod tests {
             namespace: ns.to_string(),
             annotations: {
                 let mut a = HashMap::new();
-                a.insert("kubernetes.io/ingress.class".to_string(), "phalanx".to_string());
+                a.insert(
+                    "kubernetes.io/ingress.class".to_string(),
+                    "phalanx".to_string(),
+                );
                 a
             },
             rules: vec![IngressRule {
@@ -1072,7 +1072,10 @@ mod tests {
                 paths: vec![IngressPath {
                     path: "/api".to_string(),
                     path_type: PathType::Prefix,
-                    backend: IngressBackend { service_name: "api".to_string(), service_port: 80 },
+                    backend: IngressBackend {
+                        service_name: "api".to_string(),
+                        service_port: 80,
+                    },
                 }],
             }],
             tls: vec![],
@@ -1092,7 +1095,10 @@ mod tests {
         assert_eq!(PathType::from_str("exact"), PathType::Exact);
         assert_eq!(PathType::from_str("prefix"), PathType::Prefix);
         assert_eq!(PathType::from_str("Prefix"), PathType::Prefix);
-        assert_eq!(PathType::from_str("other"), PathType::ImplementationSpecific);
+        assert_eq!(
+            PathType::from_str("other"),
+            PathType::ImplementationSpecific
+        );
     }
 
     #[test]
@@ -1198,7 +1204,10 @@ mod tests {
             }],
         };
         let routes = ctrl.reconcile_gateway_route(&route);
-        assert_eq!(routes[0].add_headers.get("X-Env"), Some(&"prod".to_string()));
+        assert_eq!(
+            routes[0].add_headers.get("X-Env"),
+            Some(&"prod".to_string())
+        );
     }
 
     #[test]
@@ -1247,8 +1256,16 @@ mod tests {
                     method: None,
                 }],
                 backends: vec![
-                    GatewayBackendRef { service_name: "stable".to_string(), service_port: 80, weight: 90 },
-                    GatewayBackendRef { service_name: "canary".to_string(), service_port: 80, weight: 10 },
+                    GatewayBackendRef {
+                        service_name: "stable".to_string(),
+                        service_port: 80,
+                        weight: 90,
+                    },
+                    GatewayBackendRef {
+                        service_name: "canary".to_string(),
+                        service_port: 80,
+                        weight: 10,
+                    },
                 ],
                 filters: vec![],
             }],
@@ -1288,7 +1305,10 @@ mod tests {
                 namespace: Some("default".to_string()),
                 annotations: Some({
                     let mut a = std::collections::BTreeMap::new();
-                    a.insert("kubernetes.io/ingress.class".to_string(), "phalanx".to_string());
+                    a.insert(
+                        "kubernetes.io/ingress.class".to_string(),
+                        "phalanx".to_string(),
+                    );
                     a
                 }),
                 ..Default::default()

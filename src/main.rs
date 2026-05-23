@@ -26,9 +26,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .nth(1)
         .unwrap_or_else(|| "phalanx.conf".to_string());
     let config_policy = config::ConfigParsePolicy::from_env();
-    let initial_cfg = config::try_load_config(&config_path, config_policy).map_err(|e| {
-        std::io::Error::new(std::io::ErrorKind::InvalidData, e)
-    })?;
+    let initial_cfg = config::try_load_config(&config_path, config_policy)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
     let cfg = Arc::new(ArcSwap::from_pointee(initial_cfg));
 
     // Snapshot the current config for components that need a static Arc<AppConfig>
@@ -72,13 +71,23 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             shutdown_token_signal.cancel();
         });
 
+        // H32: shared dynamic route/cert DashMaps consulted by both admin API and proxy
+        let dynamic_routes: Arc<dashmap::DashMap<String, config::RouteConfig>> =
+            Arc::new(dashmap::DashMap::new());
+        let dynamic_certs: Arc<dashmap::DashMap<String, admin::api::SslCertEntry>> =
+            Arc::new(dashmap::DashMap::new());
+
         // Setup TLS (shared, hot-reloadable)
         let tls_acceptor = Arc::new(ArcSwap::from_pointee(proxy::tls::load_tls_acceptor(
             &cfg_snapshot,
+            Some(Arc::clone(&dynamic_certs)),
         )));
 
         // Service Discovery: RocksDB-backed persistent backend registry.
-        let discovery = Arc::new(discovery::ServiceDiscovery::new("data/discovery.db").expect("Failed to open RocksDB for service discovery"));
+        let discovery = Arc::new(
+            discovery::ServiceDiscovery::new("data/discovery.db")
+                .expect("Failed to open RocksDB for service discovery"),
+        );
 
         // State & Routing: Manages backend health and load balancing algorithms.
         let upstreams = Arc::new(routing::UpstreamManager::new(
@@ -96,7 +105,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // Keyval Store: In-memory DashMap-backed store with TTL (NGINX Plus keyval_zone equivalent).
         let keyval = keyval::KeyvalStore::new(
             0,
-            cfg_snapshot.redis_url.as_deref().and_then(|url| redis::Client::open(url).ok()),
+            cfg_snapshot
+                .redis_url
+                .as_deref()
+                .and_then(|url| redis::Client::open(url).ok()),
         );
         keyval.spawn_background_tasks();
 
@@ -132,7 +144,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let waf_reputation = waf::reputation::IpReputationManager::new(
             cfg_snapshot.waf_auto_ban_threshold.unwrap_or(15),
             cfg_snapshot.waf_auto_ban_duration.unwrap_or(3600),
-            cfg_snapshot.redis_url.as_deref().and_then(|url| redis::Client::open(url).ok()),
+            cfg_snapshot
+                .redis_url
+                .as_deref()
+                .and_then(|url| redis::Client::open(url).ok()),
         );
         let waf_base = waf::WafEngine::new(true, waf_reputation).with_keyval(keyval.clone());
         // Load declarative WAF policy if configured
@@ -166,10 +181,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     );
                     let threshold = cfg_snapshot.captcha_challenge_threshold.unwrap_or(5.0);
                     Some(waf::bot::CaptchaManager::new(
-                        site_key,
-                        secret_key,
-                        provider,
-                        threshold,
+                        site_key, secret_key, provider, threshold,
                     ))
                 }
                 _ => None,
@@ -181,7 +193,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             if let Some(srv_name) = &pool_config.srv_discover {
                 if let Some(pool) = upstreams.get_pool(pool_name) {
                     let template = pool_config.backends.first().cloned().unwrap_or_default();
-                    discovery::spawn_srv_watcher(pool_name.clone(), srv_name.to_string(), pool, template, shutdown_token.clone());
+                    discovery::spawn_srv_watcher(
+                        pool_name.clone(),
+                        srv_name.to_string(),
+                        pool,
+                        template,
+                        shutdown_token.clone(),
+                    );
                 }
             }
         }
@@ -207,21 +225,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // Start background alert polling every 30 seconds
         Arc::clone(&alert_engine).spawn_background_check(30, shutdown_token.clone());
 
-        // H32: shared dynamic route/cert DashMaps consulted by both admin API and proxy
-        let dynamic_routes: Arc<dashmap::DashMap<String, config::RouteConfig>> =
-            Arc::new(dashmap::DashMap::new());
-        let dynamic_certs: Arc<dashmap::DashMap<String, admin::api::SslCertEntry>> =
-            Arc::new(dashmap::DashMap::new());
-
         // ClusterState: shared KV across Phalanx nodes via Redis or etcd.
         // Created before AdminState so the dashboard can serve cluster node status.
-        let node_id = cfg_snapshot
-            .node_id
-            .clone()
-            .unwrap_or_else(|| {
-                std::env::var("HOSTNAME")
-                    .unwrap_or_else(|_| "phalanx-node-1".to_string())
-            });
+        let node_id = cfg_snapshot.node_id.clone().unwrap_or_else(|| {
+            std::env::var("HOSTNAME").unwrap_or_else(|_| "phalanx-node-1".to_string())
+        });
         let cluster_state: std::sync::Arc<cluster::ClusterState> = std::sync::Arc::new({
             use cluster::{ClusterBackend, ClusterState};
             let backend = if let Some(ref gossip_addr) = cfg_snapshot.gossip_bind {
@@ -239,9 +247,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     .split(',')
                     .map(|s| s.trim().to_string())
                     .collect();
-                ClusterBackend::Etcd { endpoints, client: Arc::new(tokio::sync::Mutex::new(None)) }
+                ClusterBackend::Etcd {
+                    endpoints,
+                    client: Arc::new(tokio::sync::Mutex::new(None)),
+                }
             } else if let Some(redis_url) = cfg_snapshot.redis_url.as_deref() {
-                ClusterBackend::Redis { url: redis_url.to_string(), client: Arc::new(tokio::sync::Mutex::new(None)) }
+                ClusterBackend::Redis {
+                    url: redis_url.to_string(),
+                    client: Arc::new(tokio::sync::Mutex::new(None)),
+                }
             } else {
                 ClusterBackend::Standalone
             };
@@ -304,19 +318,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         });
 
         // GSLB Router: geographic traffic steering across data centers
-        let gslb_router: Arc<Option<gslb::GslbRouter>> = Arc::new(
-            cfg_snapshot.gslb_policy.as_deref().map(|policy_str| {
+        let gslb_router: Arc<Option<gslb::GslbRouter>> =
+            Arc::new(cfg_snapshot.gslb_policy.as_deref().map(|policy_str| {
                 let policy = gslb::GslbPolicy::from_str(policy_str);
                 let max_latency = cfg_snapshot.gslb_max_latency_ms.unwrap_or(500.0);
                 let router = gslb::GslbRouter::new(policy, max_latency, 3);
                 tracing::info!("GSLB router initialized with {:?} policy", policy);
                 router
-            }),
-        );
+            }));
 
         // K8s Ingress Controller: watches K8s resources and generates routes
-        let k8s_controller: Arc<Option<k8s::IngressController>> = Arc::new(
-            if cfg_snapshot.k8s_ingress_enabled {
+        let k8s_controller: Arc<Option<k8s::IngressController>> =
+            Arc::new(if cfg_snapshot.k8s_ingress_enabled {
                 let ingress_class = cfg_snapshot
                     .k8s_ingress_class
                     .as_deref()
@@ -328,12 +341,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 );
                 // H33: start the watcher so K8s resources are actually discovered
                 let ctrl_arc = Arc::new(controller);
-                ctrl_arc.clone().spawn_ingress_watcher(shutdown_token.clone());
+                ctrl_arc
+                    .clone()
+                    .spawn_ingress_watcher(shutdown_token.clone());
                 Some((*ctrl_arc).clone())
             } else {
                 None
-            },
-        );
+            });
 
         // Hook engine (pre-populated from rhai_script if configured)
         let hook_engine = {
@@ -369,20 +383,26 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         // Create native plugin instances based on name convention
                         let plugin: Arc<dyn wasm::WasmPlugin> = match plugin_cfg.name.as_str() {
                             name if name.starts_with("header-injection") => {
-                                let headers: Vec<(String, String)> = serde_json::from_str(&plugin_cfg.config)
-                                    .unwrap_or_default();
+                                let headers: Vec<(String, String)> =
+                                    serde_json::from_str(&plugin_cfg.config).unwrap_or_default();
                                 Arc::new(wasm::HeaderInjectionPlugin::new(name, headers))
                             }
                             name if name.starts_with("path-blocker") => {
-                                let patterns: Vec<String> = serde_json::from_str(&plugin_cfg.config)
-                                    .unwrap_or_default();
+                                let patterns: Vec<String> =
+                                    serde_json::from_str(&plugin_cfg.config).unwrap_or_default();
                                 Arc::new(wasm::PathBlockerPlugin::new(name, patterns))
                             }
                             name if name.starts_with("header-rate-limit") => {
                                 #[derive(serde::Deserialize)]
-                                struct RlCfg { header: String, max: u64 }
-                                let rl: RlCfg = serde_json::from_str(&plugin_cfg.config)
-                                    .unwrap_or(RlCfg { header: "x-api-key".into(), max: 100 });
+                                struct RlCfg {
+                                    header: String,
+                                    max: u64,
+                                }
+                                let rl: RlCfg =
+                                    serde_json::from_str(&plugin_cfg.config).unwrap_or(RlCfg {
+                                        header: "x-api-key".into(),
+                                        max: 100,
+                                    });
                                 Arc::new(wasm::HeaderRateLimitPlugin::new(name, &rl.header, rl.max))
                             }
                             _ => {
@@ -399,7 +419,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     );
                 }
                 Err(e) => {
-                    tracing::warn!("Failed to load Wasm plugin config from {}: {}", wasm_config_path, e);
+                    tracing::warn!(
+                        "Failed to load Wasm plugin config from {}: {}",
+                        wasm_config_path,
+                        e
+                    );
                 }
             }
         }
@@ -460,15 +484,25 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         if let Some(ref model_path) = cfg_snapshot.ml_fraud_model_path {
             let mode_str = cfg_snapshot.ml_fraud_mode.as_deref().unwrap_or("shadow");
             if mode_str == "active" {
-                waf_engine.ml_engine.mode.store(std::sync::Arc::new(waf::ml_fraud::MlFraudMode::Active));
+                waf_engine
+                    .ml_engine
+                    .mode
+                    .store(std::sync::Arc::new(waf::ml_fraud::MlFraudMode::Active));
             }
             let ml_reputation = std::sync::Arc::clone(&waf_engine.reputation);
-            waf_engine.ml_engine.load_model(
-                model_path,
-                ml_reputation,
-                Some(metrics.ml_model_load_failures.clone()),
-            ).await;
-            tracing::info!("ML Fraud Engine started in {} mode from {}", mode_str, model_path);
+            waf_engine
+                .ml_engine
+                .load_model(
+                    model_path,
+                    ml_reputation,
+                    Some(metrics.ml_model_load_failures.clone()),
+                )
+                .await;
+            tracing::info!(
+                "ML Fraud Engine started in {} mode from {}",
+                mode_str,
+                model_path
+            );
         }
 
         // --- Hot Reload (SIGHUP) ---
@@ -490,6 +524,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             Arc::clone(&gslb_router),
             shutdown_token.clone(),
             Arc::clone(&reload_status),
+            Arc::clone(&dynamic_certs),
         );
 
         let mut supervisor_handles: Vec<JoinHandle<()>> = Vec::new();
@@ -522,6 +557,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         supervisor_handles.push(tokio::spawn(supervise_admin_listener(
             config_updates_rx.clone(),
             admin_state,
+            cfg_snapshot.admin_api_tokens.clone(),
             shutdown_token.clone(),
         )));
         supervisor_handles.push(tokio::spawn(supervise_tcp_listener(
@@ -576,20 +612,23 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             Arc::clone(&access_logger),
             Arc::clone(&bandwidth_tracker),
             Arc::clone(&oidc_sessions),
+            Arc::clone(&dynamic_routes),
             shutdown_token.clone(),
         )));
 
         shutdown_token.cancelled().await;
         let shutdown_timeout = cfg.load_full().shutdown_timeout_secs;
-        tracing::info!("Waiting up to {}s for in-flight requests to drain...", shutdown_timeout);
-        let drain_result = tokio::time::timeout(
-            std::time::Duration::from_secs(shutdown_timeout),
-            async {
+        tracing::info!(
+            "Waiting up to {}s for in-flight requests to drain...",
+            shutdown_timeout
+        );
+        let drain_result =
+            tokio::time::timeout(std::time::Duration::from_secs(shutdown_timeout), async {
                 for handle in supervisor_handles {
                     let _ = handle.await;
                 }
-            },
-        ).await;
+            })
+            .await;
         if drain_result.is_err() {
             tracing::warn!(
                 "Graceful shutdown timeout ({}s) exceeded — force-stopping remaining tasks",
@@ -790,14 +829,16 @@ async fn supervise_proxy_listener(
 async fn supervise_admin_listener(
     mut config_rx: watch::Receiver<Arc<config::AppConfig>>,
     state: admin::AdminState,
+    admin_api_tokens: std::collections::HashMap<String, String>,
     shutdown: CancellationToken,
 ) {
     let start = |bind_addr: String| {
         let listener_shutdown = shutdown.child_token();
         let task_shutdown = listener_shutdown.clone();
         let state = state.clone();
+        let tokens = admin_api_tokens.clone();
         let handle = tokio::spawn(async move {
-            admin::start_admin_server(bind_addr, state, task_shutdown).await;
+            admin::start_admin_server(bind_addr, state, tokens, task_shutdown).await;
         });
         RunningListener {
             shutdown: listener_shutdown,
@@ -978,7 +1019,9 @@ async fn supervise_udp_listener(
         let cfg = config_rx.borrow();
         (cfg.udp_bind.clone(), cfg.udp_session_timeout_secs)
     };
-    let mut running = current_bind.clone().map(|addr| start(addr, current_timeout));
+    let mut running = current_bind
+        .clone()
+        .map(|addr| start(addr, current_timeout));
     let mut restart_attempt: u32 = 0;
     let mut health_tick = time::interval(std::time::Duration::from_secs(1));
     health_tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
@@ -1073,6 +1116,7 @@ async fn supervise_mail_listener(
             upstream_pool,
             banner: None,
             starttls,
+            backend_starttls: cfg.mail_backend_starttls,
             tls_cert_path: cfg.tls_cert_path.clone(),
             tls_key_path: cfg.tls_key_path.clone(),
         })
@@ -1092,7 +1136,10 @@ async fn supervise_mail_listener(
 
     let (mut current_cfg, mut verify_tls) = {
         let init_cfg = config_rx.borrow();
-        (config_for(init_cfg.as_ref()), init_cfg.mail_verify_backend_tls)
+        (
+            config_for(init_cfg.as_ref()),
+            init_cfg.mail_verify_backend_tls,
+        )
     };
     let mut running = current_cfg.clone().map(|c| start(c, verify_tls));
     let mut restart_attempt: u32 = 0;
@@ -1188,6 +1235,7 @@ async fn supervise_http3_listener(
     access_logger: Arc<telemetry::access_log::AccessLogger>,
     bandwidth: Arc<telemetry::bandwidth::BandwidthTracker>,
     oidc_sessions: auth::oidc::OidcSessionStore,
+    dynamic_routes: Arc<dashmap::DashMap<String, config::RouteConfig>>,
     shutdown: CancellationToken,
 ) {
     let start = |bind_addr: String, cfg_snapshot: Arc<config::AppConfig>| {
@@ -1209,7 +1257,9 @@ async fn supervise_http3_listener(
         let access_logger = Arc::clone(&access_logger);
         let bandwidth = Arc::clone(&bandwidth);
         let oidc_sessions = Arc::clone(&oidc_sessions);
-        let trusted_proxies = proxy::realip::TrustedProxies::from_cidrs(&cfg_snapshot.trusted_proxies);
+        let trusted_proxies =
+            proxy::realip::TrustedProxies::from_cidrs(&cfg_snapshot.trusted_proxies);
+        let dynamic_routes_spawn = Arc::clone(&dynamic_routes);
         let handle = tokio::spawn(async move {
             proxy::http3::start_http3_proxy(
                 &bind_addr,
@@ -1231,6 +1281,7 @@ async fn supervise_http3_listener(
                 bandwidth,
                 oidc_sessions,
                 trusted_proxies,
+                dynamic_routes_spawn,
                 task_shutdown,
             )
             .await;
@@ -1359,8 +1410,8 @@ mod tests {
     /// `supervise_http3_listener`.
     #[tokio::test]
     async fn test_http3_no_restart_on_unchanged_config() {
-        use std::sync::Arc;
         use crate::config::AppConfig;
+        use std::sync::Arc;
         let default_cfg = Arc::new(AppConfig::default());
         let (tx, mut rx) = tokio::sync::watch::channel(Arc::clone(&default_cfg));
         let mut current_bind: Option<String> = rx.borrow().quic_bind.clone();
@@ -1373,7 +1424,10 @@ mod tests {
         rx.changed().await.unwrap();
         let next_bind = rx.borrow().quic_bind.clone();
         // Bind unchanged → must NOT restart
-        assert_eq!(next_bind, current_bind, "should NOT restart when bind unchanged");
+        assert_eq!(
+            next_bind, current_bind,
+            "should NOT restart when bind unchanged"
+        );
 
         // Simulate config reload — different quic_bind
         let mut cfg3 = AppConfig::default();
@@ -1391,6 +1445,9 @@ mod tests {
         tx.send(Arc::new(cfg4)).unwrap();
         rx.changed().await.unwrap();
         let next_bind = rx.borrow().quic_bind.clone();
-        assert_ne!(next_bind, current_bind, "should restart when bind changed to None");
+        assert_ne!(
+            next_bind, current_bind,
+            "should restart when bind changed to None"
+        );
     }
 }

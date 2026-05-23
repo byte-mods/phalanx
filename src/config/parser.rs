@@ -513,6 +513,7 @@ fn is_known_server_directive(token: &str) -> bool {
         "keyval_ttl_secs",
         "listen_quic",
         "listen_udp",
+        "mail_backend_starttls",
         "mail_upstream_pool",
         "mail_verify_backend_tls",
         "mirror",
@@ -743,7 +744,12 @@ fn parse_route_block(
             expect_directive_value_semicolon(tokens, i, "gzip_min_length")?;
             block.gzip_min_length = match tokens[i + 1].parse() {
                 Ok(v) => v,
-                Err(_) => return Err(format!("Invalid value '{}' for gzip_min_length", tokens[i + 1])),
+                Err(_) => {
+                    return Err(format!(
+                        "Invalid value '{}' for gzip_min_length",
+                        tokens[i + 1]
+                    ));
+                }
             };
             i += 3;
             continue;
@@ -762,7 +768,12 @@ fn parse_route_block(
             expect_directive_value_semicolon(tokens, i, "proxy_cache_valid")?;
             block.proxy_cache_valid_secs = match tokens[i + 1].parse() {
                 Ok(v) => v,
-                Err(_) => return Err(format!("Invalid value '{}' for proxy_cache_valid", tokens[i + 1])),
+                Err(_) => {
+                    return Err(format!(
+                        "Invalid value '{}' for proxy_cache_valid",
+                        tokens[i + 1]
+                    ));
+                }
             };
             i += 3;
             continue;
@@ -797,7 +808,12 @@ fn parse_route_block(
             expect_directive_value_semicolon(tokens, i, "proxy_connect_timeout")?;
             block.proxy_connect_timeout_secs = match tokens[i + 1].parse() {
                 Ok(v) => v,
-                Err(_) => return Err(format!("Invalid value '{}' for proxy_connect_timeout", tokens[i + 1])),
+                Err(_) => {
+                    return Err(format!(
+                        "Invalid value '{}' for proxy_connect_timeout",
+                        tokens[i + 1]
+                    ));
+                }
             };
             i += 3;
             continue;
@@ -808,7 +824,12 @@ fn parse_route_block(
             expect_directive_value_semicolon(tokens, i, "proxy_read_timeout")?;
             block.proxy_read_timeout_secs = match tokens[i + 1].parse() {
                 Ok(v) => v,
-                Err(_) => return Err(format!("Invalid value '{}' for proxy_read_timeout", tokens[i + 1])),
+                Err(_) => {
+                    return Err(format!(
+                        "Invalid value '{}' for proxy_read_timeout",
+                        tokens[i + 1]
+                    ));
+                }
             };
             i += 3;
             continue;
@@ -819,7 +840,12 @@ fn parse_route_block(
             expect_directive_value_semicolon(tokens, i, "proxy_next_upstream_tries")?;
             block.proxy_next_upstream_tries = match tokens[i + 1].parse() {
                 Ok(v) => v,
-                Err(_) => return Err(format!("Invalid value '{}' for proxy_next_upstream_tries", tokens[i + 1])),
+                Err(_) => {
+                    return Err(format!(
+                        "Invalid value '{}' for proxy_next_upstream_tries",
+                        tokens[i + 1]
+                    ));
+                }
             };
             i += 3;
             continue;
@@ -830,7 +856,12 @@ fn parse_route_block(
             expect_directive_value_semicolon(tokens, i, "proxy_next_upstream_timeout")?;
             block.proxy_next_upstream_timeout_secs = match tokens[i + 1].parse() {
                 Ok(v) => v,
-                Err(_) => return Err(format!("Invalid value '{}' for proxy_next_upstream_timeout", tokens[i + 1])),
+                Err(_) => {
+                    return Err(format!(
+                        "Invalid value '{}' for proxy_next_upstream_timeout",
+                        tokens[i + 1]
+                    ));
+                }
             };
             i += 3;
             continue;
@@ -903,7 +934,12 @@ fn parse_route_block(
             expect_directive_value_semicolon(tokens, i, "cors_max_age")?;
             block.cors_max_age_secs = match tokens[i + 1].parse() {
                 Ok(v) => v,
-                Err(_) => return Err(format!("Invalid value '{}' for cors_max_age", tokens[i + 1])),
+                Err(_) => {
+                    return Err(format!(
+                        "Invalid value '{}' for cors_max_age",
+                        tokens[i + 1]
+                    ));
+                }
             };
             i += 3;
             continue;
@@ -912,7 +948,8 @@ fn parse_route_block(
         // Parse: `cors_allow_credentials on;`
         if token == "cors_allow_credentials" {
             expect_directive_value_semicolon(tokens, i, "cors_allow_credentials")?;
-            block.cors_allow_credentials = tokens[i + 1].to_lowercase() == "on" || tokens[i + 1] == "true";
+            block.cors_allow_credentials =
+                tokens[i + 1].to_lowercase() == "on" || tokens[i + 1] == "true";
             i += 3;
             continue;
         }
@@ -1035,7 +1072,12 @@ fn parse_upstream_block(
             expect_directive_value_semicolon(tokens, i, "fail_timeout")?;
             block.fail_timeout_secs = match tokens[i + 1].parse() {
                 Ok(v) => v,
-                Err(_) => return Err(format!("Invalid value '{}' for fail_timeout", tokens[i + 1])),
+                Err(_) => {
+                    return Err(format!(
+                        "Invalid value '{}' for fail_timeout",
+                        tokens[i + 1]
+                    ));
+                }
             };
             i += 3;
             continue;
@@ -1125,7 +1167,12 @@ fn parse_upstream_block(
             expect_directive_value_semicolon(tokens, i, "health_check_status")?;
             block.health_check_status = match tokens[i + 1].parse() {
                 Ok(v) => v,
-                Err(_) => return Err(format!("Invalid value '{}' for health_check_status", tokens[i + 1])),
+                Err(_) => {
+                    return Err(format!(
+                        "Invalid value '{}' for health_check_status",
+                        tokens[i + 1]
+                    ));
+                }
             };
             i += 3;
             continue;
@@ -1136,7 +1183,12 @@ fn parse_upstream_block(
             expect_directive_value_semicolon(tokens, i, "health_check_interval")?;
             block.health_check_interval_secs = match tokens[i + 1].parse() {
                 Ok(v) => v,
-                Err(_) => return Err(format!("Invalid value '{}' for health_check_interval", tokens[i + 1])),
+                Err(_) => {
+                    return Err(format!(
+                        "Invalid value '{}' for health_check_interval",
+                        tokens[i + 1]
+                    ));
+                }
             };
             i += 3;
             continue;
@@ -1147,7 +1199,12 @@ fn parse_upstream_block(
             expect_directive_value_semicolon(tokens, i, "health_check_timeout")?;
             block.health_check_timeout_secs = match tokens[i + 1].parse() {
                 Ok(v) => v,
-                Err(_) => return Err(format!("Invalid value '{}' for health_check_timeout", tokens[i + 1])),
+                Err(_) => {
+                    return Err(format!(
+                        "Invalid value '{}' for health_check_timeout",
+                        tokens[i + 1]
+                    ));
+                }
             };
             i += 3;
             continue;
@@ -1526,10 +1583,7 @@ mod tests {
     fn test_unknown_directive_inside_server() {
         let cfg = r#"http { server { listen 8080; rate_limt_per_ip 10; } }"#;
         let result = parse_phalanx_config(cfg);
-        assert!(
-            result.is_err(),
-            "Expected Err for unknown server directive"
-        );
+        assert!(result.is_err(), "Expected Err for unknown server directive");
         let err = result.unwrap_err();
         assert!(
             err.contains("rate_limt_per_ip") || err.contains("Unknown"),
@@ -1667,9 +1721,16 @@ mod tests {
             }
         "#;
         let result = parse_phalanx_config(cfg);
-        assert!(result.is_err(), "Expected error for missing colon in split_traffic");
+        assert!(
+            result.is_err(),
+            "Expected error for missing colon in split_traffic"
+        );
         let err = result.unwrap_err();
-        assert!(err.contains("split_traffic entry 'pool_v2'"), "Error should name the bad entry: {}", err);
+        assert!(
+            err.contains("split_traffic entry 'pool_v2'"),
+            "Error should name the bad entry: {}",
+            err
+        );
     }
 
     #[test]
@@ -1686,9 +1747,16 @@ mod tests {
             }
         "#;
         let result = parse_phalanx_config(cfg);
-        assert!(result.is_err(), "Expected error for invalid weight in split_traffic");
+        assert!(
+            result.is_err(),
+            "Expected error for invalid weight in split_traffic"
+        );
         let err = result.unwrap_err();
-        assert!(err.contains("Invalid weight 'ten'"), "Error should name the bad weight: {}", err);
+        assert!(
+            err.contains("Invalid weight 'ten'"),
+            "Error should name the bad weight: {}",
+            err
+        );
     }
 
     // ── Health check interval/timeout ────────────────────────────────────────
@@ -1867,8 +1935,14 @@ mod tests {
         let servers = &result.unwrap().http.unwrap().servers;
         assert_eq!(servers[0].ice_servers.len(), 3);
         assert_eq!(servers[0].ice_servers[0], "stun:stun.l.google.com:19302");
-        assert_eq!(servers[0].ice_servers[1], "turn:turn.example.com:3478?transport=udp");
-        assert_eq!(servers[0].ice_servers[2], "turns:turns.example.com:5349?transport=tcp");
+        assert_eq!(
+            servers[0].ice_servers[1],
+            "turn:turn.example.com:3478?transport=udp"
+        );
+        assert_eq!(
+            servers[0].ice_servers[2],
+            "turns:turns.example.com:5349?transport=tcp"
+        );
     }
 
     #[test]

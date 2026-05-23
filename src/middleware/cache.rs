@@ -63,8 +63,7 @@ impl CacheEntry {
 
     /// Returns `true` if stale but within the `stale_while_revalidate` grace window.
     pub fn is_stale_revalidatable(&self) -> bool {
-        !self.is_fresh()
-            && self.created_at.elapsed() < self.max_age + self.stale_while_revalidate
+        !self.is_fresh() && self.created_at.elapsed() < self.max_age + self.stale_while_revalidate
     }
 
     /// Returns `true` if stale but within the `stale_if_error` grace window.
@@ -353,7 +352,10 @@ fn serialize_entry(entry: &CacheEntry) -> Option<Vec<u8>> {
     let remaining_max_age = entry.max_age.saturating_sub(elapsed).as_secs();
     // swr window starts after max_age expires
     let past_max_age = elapsed.saturating_sub(entry.max_age);
-    let remaining_swr = entry.stale_while_revalidate.saturating_sub(past_max_age).as_secs();
+    let remaining_swr = entry
+        .stale_while_revalidate
+        .saturating_sub(past_max_age)
+        .as_secs();
     let remaining_sie = entry.stale_if_error.saturating_sub(past_max_age).as_secs();
     let header_json = serde_json::to_vec(&entry.headers).ok()?;
 
@@ -396,7 +398,9 @@ fn deserialize_entry(data: Vec<u8>) -> Option<CacheEntry> {
 
     let ct_len = u32::from_le_bytes(data[pos..pos + 4].try_into().ok()?) as usize;
     pos += 4;
-    let content_type = std::str::from_utf8(data.get(pos..pos + ct_len)?).ok()?.to_string();
+    let content_type = std::str::from_utf8(data.get(pos..pos + ct_len)?)
+        .ok()?
+        .to_string();
     pos += ct_len;
 
     let hdr_len = u32::from_le_bytes(data[pos..pos + 4].try_into().ok()?) as usize;
@@ -498,9 +502,7 @@ mod tests {
 
     #[test]
     fn test_build_cache_key_with_vary() {
-        let vary = vec![
-            ("Accept-Encoding".to_string(), "gzip".to_string()),
-        ];
+        let vary = vec![("Accept-Encoding".to_string(), "gzip".to_string())];
         let key = build_cache_key("GET", "example.com", "/api", None, &vary);
         assert!(key.contains(":V:"));
         assert!(key.contains("Accept-Encoding=gzip;"));
@@ -551,7 +553,10 @@ mod tests {
 
         // Purge only /api/ prefix
         let count = cache.purge_prefix("/api/").await;
-        assert!(count >= 2, "expected at least 2 L1 entries purged, got {count}");
+        assert!(
+            count >= 2,
+            "expected at least 2 L1 entries purged, got {count}"
+        );
 
         // /api/ entries should be gone
         assert!(cache.get("GET:example.com:/api/users/1").await.is_none());
@@ -684,9 +689,11 @@ mod tests {
         assert!(cache.get("GET:example.com:/other/path").await.is_some());
 
         // /api/ entries should be gone
-        assert!(cache
-            .get("GET:example.com:/api/v1/resource/0")
-            .await
-            .is_none());
+        assert!(
+            cache
+                .get("GET:example.com:/api/v1/resource/0")
+                .await
+                .is_none()
+        );
     }
 }

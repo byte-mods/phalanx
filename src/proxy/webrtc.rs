@@ -23,6 +23,7 @@
 //!  Subscriber B ◄──(DTLS/SRTP)── PeerConnection(Sub B) WriteRTP
 //! ```
 
+use crate::telemetry::bandwidth::BandwidthTracker;
 use dashmap::DashMap;
 use std::sync::{
     Arc,
@@ -32,21 +33,17 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::broadcast;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
-use crate::telemetry::bandwidth::BandwidthTracker;
+use webrtc::util::marshal::Marshal;
 use webrtc::{
     api::{
         APIBuilder,
         interceptor_registry::register_default_interceptors,
-        media_engine::{MediaEngine, MIME_TYPE_H264, MIME_TYPE_OPUS, MIME_TYPE_VP8},
+        media_engine::{MIME_TYPE_H264, MIME_TYPE_OPUS, MIME_TYPE_VP8, MediaEngine},
     },
-    ice_transport::{
-        ice_connection_state::RTCIceConnectionState,
-        ice_server::RTCIceServer,
-    },
+    ice_transport::{ice_connection_state::RTCIceConnectionState, ice_server::RTCIceServer},
     interceptor::registry::Registry,
     peer_connection::{
-        RTCPeerConnection,
-        configuration::RTCConfiguration,
+        RTCPeerConnection, configuration::RTCConfiguration,
         peer_connection_state::RTCPeerConnectionState,
         sdp::session_description::RTCSessionDescription,
     },
@@ -56,14 +53,10 @@ use webrtc::{
         rtp_receiver::RTCRtpReceiver,
     },
     track::{
-        track_local::{
-            TrackLocalWriter,
-            track_local_static_rtp::TrackLocalStaticRTP,
-        },
+        track_local::{TrackLocalWriter, track_local_static_rtp::TrackLocalStaticRTP},
         track_remote::TrackRemote,
     },
 };
-use webrtc::util::marshal::Marshal;
 
 // ─── SFU State ───────────────────────────────────────────────────────────────
 
@@ -319,7 +312,9 @@ fn build_webrtc_api() -> webrtc::error::Result<webrtc::api::API> {
                 mime_type: MIME_TYPE_H264.to_owned(),
                 clock_rate: 90000,
                 channels: 0,
-                sdp_fmtp_line: "level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42001f".to_owned(),
+                sdp_fmtp_line:
+                    "level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42001f"
+                        .to_owned(),
                 rtcp_feedback: vec![],
             },
             payload_type: 102,
@@ -368,7 +363,10 @@ fn build_ice_servers(
     turn_username: Option<&str>,
     turn_credential: Option<&str>,
 ) -> Vec<RTCIceServer> {
-    let valid: Vec<&String> = configured_urls.iter().filter(|u| !u.trim().is_empty()).collect();
+    let valid: Vec<&String> = configured_urls
+        .iter()
+        .filter(|u| !u.trim().is_empty())
+        .collect();
     let servers = if !valid.is_empty() {
         valid
             .iter()
@@ -417,7 +415,9 @@ pub async fn handle_publish(
 ) -> Result<String, String> {
     let room = sfu.get_or_create_room(&room_id);
 
-    let api = acquire_api(&room).await.map_err(|e| format!("Failed to build WebRTC API: {}", e))?;
+    let api = acquire_api(&room)
+        .await
+        .map_err(|e| format!("Failed to build WebRTC API: {}", e))?;
 
     let config = RTCConfiguration {
         ice_servers: build_ice_servers(ice_servers, turn_username, turn_credential),
@@ -431,7 +431,8 @@ pub async fn handle_publish(
     );
 
     // Store the peer connection and mark as publisher
-    room.peers.insert(peer_id.clone(), Arc::clone(&peer_connection));
+    room.peers
+        .insert(peer_id.clone(), Arc::clone(&peer_connection));
     room.publishers.insert(peer_id.clone(), ());
     room.touch();
 
@@ -443,7 +444,9 @@ pub async fn handle_publish(
 
     // on_track: called when the publisher sends a media track
     peer_connection.on_track(Box::new(
-        move |track: Arc<TrackRemote>, _receiver: Arc<RTCRtpReceiver>, _transceiver: Arc<RTCRtpTransceiver>| {
+        move |track: Arc<TrackRemote>,
+              _receiver: Arc<RTCRtpReceiver>,
+              _transceiver: Arc<RTCRtpTransceiver>| {
             let room = Arc::clone(&room_for_track);
             let pid = peer_id_for_track.clone();
             let bw = bandwidth_for_track.clone();
@@ -488,7 +491,10 @@ pub async fn handle_publish(
                                 Ok(pkt_bytes) => {
                                     let pkt_len = pkt_bytes.len() as u64;
                                     if let Err(e) = local_track.write(&pkt_bytes).await {
-                                        debug!("RTP write to local track failed (ssrc={}): {}", ssrc, e);
+                                        debug!(
+                                            "RTP write to local track failed (ssrc={}): {}",
+                                            ssrc, e
+                                        );
                                     } else {
                                         room.bytes_forwarded.fetch_add(pkt_len, Ordering::Relaxed);
                                         room.packets_forwarded.fetch_add(1, Ordering::Relaxed);
@@ -515,32 +521,38 @@ pub async fn handle_publish(
 
     // on_peer_connection_state_change: cleanup on disconnect
     let room_for_state = Arc::clone(&room);
-    peer_connection.on_peer_connection_state_change(Box::new(move |state: RTCPeerConnectionState| {
-        let room = Arc::clone(&room_for_state);
-        let peer_id = peer_id_for_close.clone();
-        Box::pin(async move {
-            info!("Publisher peer {} state: {:?}", peer_id, state);
-            if state == RTCPeerConnectionState::Disconnected
-                || state == RTCPeerConnectionState::Failed
-                || state == RTCPeerConnectionState::Closed
-            {
-                // H27: remove all tracks belonging to this publisher
-                if let Some((_, ssrclist)) = room.publisher_tracks.remove(&peer_id) {
-                    for ssrc in &ssrclist {
-                        room.tracks.remove(ssrc);
+    peer_connection.on_peer_connection_state_change(Box::new(
+        move |state: RTCPeerConnectionState| {
+            let room = Arc::clone(&room_for_state);
+            let peer_id = peer_id_for_close.clone();
+            Box::pin(async move {
+                info!("Publisher peer {} state: {:?}", peer_id, state);
+                if state == RTCPeerConnectionState::Disconnected
+                    || state == RTCPeerConnectionState::Failed
+                    || state == RTCPeerConnectionState::Closed
+                {
+                    // H27: remove all tracks belonging to this publisher
+                    if let Some((_, ssrclist)) = room.publisher_tracks.remove(&peer_id) {
+                        for ssrc in &ssrclist {
+                            room.tracks.remove(ssrc);
+                        }
+                        info!(
+                            "Cleaned up {} tracks for publisher {}",
+                            ssrclist.len(),
+                            peer_id
+                        );
                     }
-                    info!("Cleaned up {} tracks for publisher {}", ssrclist.len(), peer_id);
+                    room.peers.remove(&peer_id);
+                    room.publishers.remove(&peer_id);
+                    info!("Publisher peer {} removed from room.", peer_id);
                 }
-                room.peers.remove(&peer_id);
-                room.publishers.remove(&peer_id);
-                info!("Publisher peer {} removed from room.", peer_id);
-            }
-        })
-    }));
+            })
+        },
+    ));
 
     // Set the remote description (publisher's offer)
-    let offer = RTCSessionDescription::offer(offer_sdp)
-        .map_err(|e| format!("Invalid SDP offer: {}", e))?;
+    let offer =
+        RTCSessionDescription::offer(offer_sdp).map_err(|e| format!("Invalid SDP offer: {}", e))?;
     peer_connection
         .set_remote_description(offer)
         .await
@@ -563,8 +575,14 @@ pub async fn handle_publish(
     // Block until all ICE candidates have been gathered, but cap wait so
     // a slow STUN/TURN probe cannot block the async runtime indefinitely.
     const ICE_GATHER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
-    if tokio::time::timeout(ICE_GATHER_TIMEOUT, gather_complete.recv()).await.is_err() {
-        warn!("ICE gathering timed out for publisher {}, proceeding with partial candidates", peer_id);
+    if tokio::time::timeout(ICE_GATHER_TIMEOUT, gather_complete.recv())
+        .await
+        .is_err()
+    {
+        warn!(
+            "ICE gathering timed out for publisher {}, proceeding with partial candidates",
+            peer_id
+        );
     }
 
     let local_desc = peer_connection
@@ -600,7 +618,9 @@ pub async fn handle_subscribe(
 ) -> Result<String, String> {
     let room = sfu.get_or_create_room(&room_id);
 
-    let api = acquire_api(&room).await.map_err(|e| format!("Failed to build WebRTC API: {}", e))?;
+    let api = acquire_api(&room)
+        .await
+        .map_err(|e| format!("Failed to build WebRTC API: {}", e))?;
 
     let config = RTCConfiguration {
         ice_servers: build_ice_servers(ice_servers, turn_username, turn_credential),
@@ -613,23 +633,29 @@ pub async fn handle_subscribe(
             .map_err(|e| format!("Failed to create subscriber peer connection: {}", e))?,
     );
 
-    room.peers.insert(peer_id.clone(), Arc::clone(&peer_connection));
+    room.peers
+        .insert(peer_id.clone(), Arc::clone(&peer_connection));
     room.touch();
 
     // Subscribe to all existing tracks immediately
     let existing_tracks: Vec<SfuTrack> = room.tracks.iter().map(|e| e.value().clone()).collect();
     for sfu_track in existing_tracks {
         if let Err(e) = peer_connection
-            .add_track(Arc::clone(&sfu_track.local_track) as Arc<dyn webrtc::track::track_local::TrackLocal + Send + Sync>)
+            .add_track(Arc::clone(&sfu_track.local_track)
+                as Arc<dyn webrtc::track::track_local::TrackLocal + Send + Sync>)
             .await
         {
-            warn!("Failed to add existing track {} to subscriber {}: {}", sfu_track.ssrc, peer_id, e);
+            warn!(
+                "Failed to add existing track {} to subscriber {}: {}",
+                sfu_track.ssrc, peer_id, e
+            );
         }
     }
 
     // H28: create cancellation token so the track-rx task exits on disconnect
     let sub_cancel = CancellationToken::new();
-    room.subscriber_tokens.insert(peer_id.clone(), sub_cancel.clone());
+    room.subscriber_tokens
+        .insert(peer_id.clone(), sub_cancel.clone());
 
     // Subscribe to future tracks (publishers joining after this subscriber)
     let mut track_rx = room.track_tx.subscribe();
@@ -672,25 +698,27 @@ pub async fn handle_subscribe(
     // on_ice_connection_state_change: cleanup on disconnect (H28: cancel subscriber token)
     let room_for_state = Arc::clone(&room);
     let peer_id_for_close = peer_id.clone();
-    peer_connection.on_ice_connection_state_change(Box::new(move |state: RTCIceConnectionState| {
-        let room = Arc::clone(&room_for_state);
-        let peer_id = peer_id_for_close.clone();
-        Box::pin(async move {
-            if state == RTCIceConnectionState::Disconnected
-                || state == RTCIceConnectionState::Failed
-                || state == RTCIceConnectionState::Closed
-            {
-                if let Some((_, token)) = room.subscriber_tokens.remove(&peer_id) {
-                    token.cancel();
+    peer_connection.on_ice_connection_state_change(Box::new(
+        move |state: RTCIceConnectionState| {
+            let room = Arc::clone(&room_for_state);
+            let peer_id = peer_id_for_close.clone();
+            Box::pin(async move {
+                if state == RTCIceConnectionState::Disconnected
+                    || state == RTCIceConnectionState::Failed
+                    || state == RTCIceConnectionState::Closed
+                {
+                    if let Some((_, token)) = room.subscriber_tokens.remove(&peer_id) {
+                        token.cancel();
+                    }
+                    if let Some((_, handle)) = room.subscriber_handles.remove(&peer_id) {
+                        handle.abort();
+                    }
+                    room.peers.remove(&peer_id);
+                    info!("Subscriber peer {} disconnected from room.", peer_id);
                 }
-                if let Some((_, handle)) = room.subscriber_handles.remove(&peer_id) {
-                    handle.abort();
-                }
-                room.peers.remove(&peer_id);
-                info!("Subscriber peer {} disconnected from room.", peer_id);
-            }
-        })
-    }));
+            })
+        },
+    ));
 
     // Set subscriber offer and generate answer
     let offer = RTCSessionDescription::offer(offer_sdp)
@@ -713,8 +741,14 @@ pub async fn handle_subscribe(
         .map_err(|e| format!("Subscriber set_local_description failed: {}", e))?;
 
     const ICE_GATHER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
-    if tokio::time::timeout(ICE_GATHER_TIMEOUT, gather_complete.recv()).await.is_err() {
-        warn!("ICE gathering timed out for subscriber {}, proceeding with partial candidates", peer_id);
+    if tokio::time::timeout(ICE_GATHER_TIMEOUT, gather_complete.recv())
+        .await
+        .is_err()
+    {
+        warn!(
+            "ICE gathering timed out for subscriber {}, proceeding with partial candidates",
+            peer_id
+        );
     }
 
     let local_desc = peer_connection
@@ -797,12 +831,13 @@ mod tests {
 
     #[test]
     fn test_build_ice_servers_configured_overrides_default() {
-        let configured = vec![
-            "turn:turn.example.com:3478?transport=udp".to_string(),
-        ];
+        let configured = vec!["turn:turn.example.com:3478?transport=udp".to_string()];
         let servers = build_ice_servers(&configured, None, None);
         assert_eq!(servers.len(), 1);
-        assert_eq!(servers[0].urls[0], "turn:turn.example.com:3478?transport=udp");
+        assert_eq!(
+            servers[0].urls[0],
+            "turn:turn.example.com:3478?transport=udp"
+        );
     }
 
     #[test]
@@ -814,7 +849,10 @@ mod tests {
         let servers = build_ice_servers(&configured, None, None);
         assert_eq!(servers.len(), 2);
         assert_eq!(servers[0].urls[0], "stun:stun.custom.com:3478");
-        assert_eq!(servers[1].urls[0], "turn:turn.custom.com:3478?transport=udp");
+        assert_eq!(
+            servers[1].urls[0],
+            "turn:turn.custom.com:3478?transport=udp"
+        );
     }
 
     #[test]
@@ -932,8 +970,7 @@ mod tests {
 
         // Simulate storing a handle (use an already-completed task for the test)
         let dummy_handle = tokio::spawn(async {});
-        room.subscriber_handles
-            .insert("peer1".into(), dummy_handle);
+        room.subscriber_handles.insert("peer1".into(), dummy_handle);
         assert_eq!(room.subscriber_handles.len(), 1);
 
         // Simulate disconnect cleanup
@@ -948,12 +985,11 @@ mod tests {
     async fn test_ice_gather_timeout_fires_when_channel_never_sends() {
         let (_tx, mut rx) = tokio::sync::mpsc::channel::<()>(1);
         let start = tokio::time::Instant::now();
-        let result = tokio::time::timeout(
-            std::time::Duration::from_millis(50),
-            rx.recv(),
-        )
-        .await;
-        assert!(result.is_err(), "timeout should fire when sender never sends");
+        let result = tokio::time::timeout(std::time::Duration::from_millis(50), rx.recv()).await;
+        assert!(
+            result.is_err(),
+            "timeout should fire when sender never sends"
+        );
         let elapsed = start.elapsed();
         assert!(
             elapsed >= std::time::Duration::from_millis(50),

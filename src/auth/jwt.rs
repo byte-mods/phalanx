@@ -63,7 +63,11 @@ pub fn check(headers: &HeaderMap, secret: &str, algorithm: &str) -> (AuthResult,
     let key = match decoding_key_from_secret(secret, algo) {
         Ok(k) => k,
         Err(e) => {
-            tracing::error!("JWT key material misconfigured for algorithm {:?}: {}", algo, e);
+            tracing::error!(
+                "JWT key material misconfigured for algorithm {:?}: {}",
+                algo,
+                e
+            );
             return (
                 AuthResult::Denied(StatusCode::UNAUTHORIZED, "JWT configuration error"),
                 None,
@@ -112,12 +116,8 @@ fn decoding_key_from_secret(
         Algorithm::RS256 | Algorithm::RS384 | Algorithm::RS512 => {
             DecodingKey::from_rsa_pem(secret.as_bytes())
         }
-        Algorithm::ES256 | Algorithm::ES384 => {
-            DecodingKey::from_ec_pem(secret.as_bytes())
-        }
-        Algorithm::EdDSA => {
-            DecodingKey::from_ed_pem(secret.as_bytes())
-        }
+        Algorithm::ES256 | Algorithm::ES384 => DecodingKey::from_ec_pem(secret.as_bytes()),
+        Algorithm::EdDSA => DecodingKey::from_ed_pem(secret.as_bytes()),
         _ => Err(jsonwebtoken::errors::Error::from(
             jsonwebtoken::errors::ErrorKind::InvalidAlgorithm,
         )),
@@ -138,7 +138,10 @@ fn parse_algorithm(algorithm: &str) -> Result<Algorithm, String> {
         "RS512" => Ok(Algorithm::RS512),
         "ES256" => Ok(Algorithm::ES256),
         "ES384" => Ok(Algorithm::ES384),
-        _ => Err(format!("Unknown or unsupported JWT algorithm: '{}'", algorithm)),
+        _ => Err(format!(
+            "Unknown or unsupported JWT algorithm: '{}'",
+            algorithm
+        )),
     }
 }
 
@@ -275,8 +278,14 @@ mod tests {
 
     #[test]
     fn test_all_valid_algorithms_parsed() {
-        for alg in &["HS256", "HS384", "HS512", "RS256", "RS384", "RS512", "ES256", "ES384"] {
-            assert!(parse_algorithm(alg).is_ok(), "algorithm {} should parse", alg);
+        for alg in &[
+            "HS256", "HS384", "HS512", "RS256", "RS384", "RS512", "ES256", "ES384",
+        ] {
+            assert!(
+                parse_algorithm(alg).is_ok(),
+                "algorithm {} should parse",
+                alg
+            );
         }
     }
 }

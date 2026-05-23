@@ -113,7 +113,9 @@ impl CidrRange {
 /// (255.255.255.255) addresses that a misconfigured or malicious proxy
 /// might inject into forwarding headers.
 fn is_bogus_ip(ip: &IpAddr) -> bool {
-    ip.is_loopback() || ip.is_multicast() || ip.is_unspecified()
+    ip.is_loopback()
+        || ip.is_multicast()
+        || ip.is_unspecified()
         || *ip == IpAddr::V4(std::net::Ipv4Addr::BROADCAST)
 }
 
@@ -173,11 +175,7 @@ pub fn resolve_client_ip(
 
 /// Injects standard proxy headers (`X-Forwarded-For`, `X-Forwarded-Proto`, `X-Real-IP`)
 /// into the outgoing request to the backend.
-pub fn inject_forwarding_headers(
-    headers: &mut hyper::HeaderMap,
-    client_ip: &IpAddr,
-    is_tls: bool,
-) {
+pub fn inject_forwarding_headers(headers: &mut hyper::HeaderMap, client_ip: &IpAddr, is_tls: bool) {
     let ip_str = client_ip.to_string();
 
     // X-Forwarded-For: append to existing or create new
@@ -200,10 +198,7 @@ pub fn inject_forwarding_headers(
 
     // X-Real-IP
     if let Ok(val) = ip_str.parse() {
-        headers.insert(
-            hyper::header::HeaderName::from_static("x-real-ip"),
-            val,
-        );
+        headers.insert(hyper::header::HeaderName::from_static("x-real-ip"), val);
     }
 
     // X-Forwarded-Proto

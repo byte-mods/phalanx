@@ -35,7 +35,11 @@ impl IpReputationManager {
     ///
     /// Returns an `Arc<Self>` because the manager is shared across request handlers
     /// and the optional background Pub/Sub task.
-    pub fn new(ban_threshold: u32, ban_duration_secs: u64, redis_client: Option<redis::Client>) -> Arc<Self> {
+    pub fn new(
+        ban_threshold: u32,
+        ban_duration_secs: u64,
+        redis_client: Option<redis::Client>,
+    ) -> Arc<Self> {
         let mgr = Arc::new(Self {
             strikes: Arc::new(DashMap::new()),
             ban_threshold,
@@ -83,7 +87,7 @@ impl IpReputationManager {
     /// Also broadcasts to Redis cluster if enabled.
     pub fn add_strike(&self, ip: &str, severity: u32) {
         self.add_strike_local(ip, severity);
-        
+
         // Broadcast to cluster
         if let Some(client) = &self.redis_client {
             let ip_str = ip.to_string();
@@ -92,7 +96,8 @@ impl IpReputationManager {
                 if let Ok(mut con) = client_clone.get_multiplexed_async_connection().await {
                     use redis::AsyncCommands;
                     let payload = format!("{}:{}", ip_str, severity);
-                    let _: redis::RedisResult<()> = con.publish("phalanx:waf:strikes", payload).await;
+                    let _: redis::RedisResult<()> =
+                        con.publish("phalanx:waf:strikes", payload).await;
                 }
             });
         }
@@ -160,14 +165,18 @@ impl IpReputationManager {
     pub fn manual_ban(&self, ip: &str) {
         self.strikes
             .entry(ip.to_string())
-            .and_modify(|e| { e.0 = self.ban_threshold; e.1 = std::time::Instant::now(); })
+            .and_modify(|e| {
+                e.0 = self.ban_threshold;
+                e.1 = std::time::Instant::now();
+            })
             .or_insert((self.ban_threshold, std::time::Instant::now()));
         tracing::info!("IP {} manually banned", ip);
     }
 
     /// Returns strike count for all tracked IPs (not just banned ones), sorted by count descending.
     pub fn list_all_strikes(&self) -> Vec<(String, u32)> {
-        let mut result: Vec<(String, u32)> = self.strikes
+        let mut result: Vec<(String, u32)> = self
+            .strikes
             .iter()
             .map(|e| (e.key().clone(), e.value().0))
             .collect();
@@ -236,7 +245,11 @@ mod tests {
         mgr.add_strike("temp", 1);
         std::thread::sleep(std::time::Duration::from_millis(10));
         assert!(!mgr.is_banned("temp"), "ban should have expired");
-        assert_eq!(mgr.get_strikes("temp"), 0, "strikes should be cleared on expiry");
+        assert_eq!(
+            mgr.get_strikes("temp"),
+            0,
+            "strikes should be cleared on expiry"
+        );
     }
 
     #[tokio::test]

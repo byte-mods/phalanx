@@ -62,9 +62,8 @@ impl WafRules {
         ];
 
         // Malicious Scanners & Bots
-        let bot_ua_patterns = vec![
-            r"(?i)(sqlmap|nikto|zmap|nmap|masscan|dirbuster|nuclei|acunetix|nessus)",
-        ];
+        let bot_ua_patterns =
+            vec![r"(?i)(sqlmap|nikto|zmap|nmap|masscan|dirbuster|nuclei|acunetix|nessus)"];
 
         Self {
             sqli_set: RegexSet::new(&sqli_patterns).unwrap(),

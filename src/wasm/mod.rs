@@ -8,10 +8,10 @@
 //! to intercept requests at multiple phases: OnRequestHeaders, OnRequestBody,
 //! OnResponseHeaders, OnResponseBody, and OnLog.
 
-use std::collections::HashMap;
-use std::sync::Arc;
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
+use std::sync::Arc;
 use tracing::info;
 
 /// Proxy-Wasm ABI action returned by plugin callbacks.
@@ -340,7 +340,9 @@ impl WasmtimePlugin {
     fn call_export(&self, func_name: &str) -> Option<i32> {
         let mut guard = self.state.lock();
         let (store, instance) = &mut *guard;
-        let func = instance.get_typed_func::<(), i32>(&mut *store, func_name).ok()?;
+        let func = instance
+            .get_typed_func::<(), i32>(&mut *store, func_name)
+            .ok()?;
         func.call(&mut *store, ()).ok()
     }
 }
@@ -411,7 +413,10 @@ impl WasmPluginManager {
     /// Registers a plugin with the given configuration.
     pub fn register(&self, plugin: Arc<dyn WasmPlugin>, config: WasmPluginConfig) {
         let mut plugins = self.plugins.write();
-        info!("Wasm plugin registered: {} (priority: {})", config.name, config.priority);
+        info!(
+            "Wasm plugin registered: {} (priority: {})",
+            config.name, config.priority
+        );
         plugins.push(PluginEntry { plugin, config });
         plugins.sort_by_key(|e| e.config.priority);
     }
@@ -435,7 +440,11 @@ impl WasmPluginManager {
 
     /// Lists all registered plugin names.
     pub fn plugin_names(&self) -> Vec<String> {
-        self.plugins.read().iter().map(|e| e.config.name.clone()).collect()
+        self.plugins
+            .read()
+            .iter()
+            .map(|e| e.config.name.clone())
+            .collect()
     }
 
     /// Executes all plugins for the OnRequestHeaders phase.
@@ -444,7 +453,8 @@ impl WasmPluginManager {
         let mut merged = WasmPluginResult::default();
 
         for entry in plugins.iter() {
-            if !entry.config.enabled || !entry.config.phases.contains(&WasmPhase::OnRequestHeaders) {
+            if !entry.config.enabled || !entry.config.phases.contains(&WasmPhase::OnRequestHeaders)
+            {
                 continue;
             }
             let result = entry.plugin.on_request_headers(ctx);
@@ -456,10 +466,7 @@ impl WasmPluginManager {
 
             // Merge headers
             if let Some(hdrs) = result.headers {
-                merged
-                    .headers
-                    .get_or_insert_with(Vec::new)
-                    .extend(hdrs);
+                merged.headers.get_or_insert_with(Vec::new).extend(hdrs);
             }
 
             // Merge metadata
@@ -556,8 +563,7 @@ impl WasmPluginManager {
 
     /// Loads a plugin configuration from a JSON file.
     pub fn load_config_from_file(path: &str) -> Result<Vec<WasmPluginConfig>, String> {
-        let content =
-            std::fs::read_to_string(path).map_err(|e| format!("read error: {}", e))?;
+        let content = std::fs::read_to_string(path).map_err(|e| format!("read error: {}", e))?;
         serde_json::from_str(&content).map_err(|e| format!("parse error: {}", e))
     }
 
@@ -598,14 +604,19 @@ impl WasmPluginManager {
             let existing_names: std::collections::HashSet<String> =
                 plugins.iter().map(|e| e.config.name.clone()).collect();
 
-            let compile: Vec<_> = configs.iter()
-                .filter(|c| c.enabled && !c.wasm_path.is_empty()
-                    && std::path::Path::new(&c.wasm_path).exists()
-                    && !existing_names.contains(&c.name))
+            let compile: Vec<_> = configs
+                .iter()
+                .filter(|c| {
+                    c.enabled
+                        && !c.wasm_path.is_empty()
+                        && std::path::Path::new(&c.wasm_path).exists()
+                        && !existing_names.contains(&c.name)
+                })
                 .cloned()
                 .collect();
 
-            let keep: Vec<_> = plugins.iter()
+            let keep: Vec<_> = plugins
+                .iter()
                 .filter(|e| new_names.contains(&e.config.name))
                 .map(|e| (e.plugin.clone(), e.config.clone()))
                 .collect();
@@ -636,10 +647,16 @@ impl WasmPluginManager {
             let mut plugins = self.plugins.write();
             plugins.clear();
             for (plugin, config) in &to_keep {
-                plugins.push(PluginEntry { plugin: plugin.clone(), config: config.clone() });
+                plugins.push(PluginEntry {
+                    plugin: plugin.clone(),
+                    config: config.clone(),
+                });
             }
             for (plugin, config) in &compiled {
-                plugins.push(PluginEntry { plugin: plugin.clone(), config: config.clone() });
+                plugins.push(PluginEntry {
+                    plugin: plugin.clone(),
+                    config: config.clone(),
+                });
             }
             plugins.sort_by_key(|e| e.config.priority);
             plugins.len()
@@ -799,7 +816,8 @@ mod tests {
     fn test_header_rate_limit_allows_under_limit() {
         let plugin = HeaderRateLimitPlugin::new("rl", "X-API-Key", 10);
         let mut ctx = make_request_ctx();
-        ctx.headers.push(("X-API-Key".to_string(), "key-1".to_string()));
+        ctx.headers
+            .push(("X-API-Key".to_string(), "key-1".to_string()));
         for _ in 0..10 {
             let result = plugin.on_request_headers(&ctx);
             assert!(result.direct_response.is_none());
@@ -810,7 +828,8 @@ mod tests {
     fn test_header_rate_limit_blocks_over_limit() {
         let plugin = HeaderRateLimitPlugin::new("rl", "X-API-Key", 5);
         let mut ctx = make_request_ctx();
-        ctx.headers.push(("X-API-Key".to_string(), "key-2".to_string()));
+        ctx.headers
+            .push(("X-API-Key".to_string(), "key-2".to_string()));
         for _ in 0..5 {
             plugin.on_request_headers(&ctx);
         }
@@ -834,9 +853,11 @@ mod tests {
     fn test_header_rate_limit_separate_keys() {
         let plugin = HeaderRateLimitPlugin::new("rl", "X-API-Key", 2);
         let mut ctx1 = make_request_ctx();
-        ctx1.headers.push(("X-API-Key".to_string(), "a".to_string()));
+        ctx1.headers
+            .push(("X-API-Key".to_string(), "a".to_string()));
         let mut ctx2 = make_request_ctx();
-        ctx2.headers.push(("X-API-Key".to_string(), "b".to_string()));
+        ctx2.headers
+            .push(("X-API-Key".to_string(), "b".to_string()));
 
         plugin.on_request_headers(&ctx1);
         plugin.on_request_headers(&ctx1);
@@ -871,7 +892,11 @@ mod tests {
     fn test_path_blocker_multiple_patterns() {
         let plugin = PathBlockerPlugin::new(
             "blocker",
-            vec!["/admin".to_string(), "/secret".to_string(), "/api".to_string()],
+            vec![
+                "/admin".to_string(),
+                "/secret".to_string(),
+                "/api".to_string(),
+            ],
         );
         let ctx = make_request_ctx();
         let result = plugin.on_request_headers(&ctx);
@@ -926,11 +951,19 @@ mod tests {
         let p2 = Arc::new(HeaderInjectionPlugin::new("high", vec![]));
         mgr.register(
             p1,
-            WasmPluginConfig { name: "low".into(), priority: 200, ..Default::default() },
+            WasmPluginConfig {
+                name: "low".into(),
+                priority: 200,
+                ..Default::default()
+            },
         );
         mgr.register(
             p2,
-            WasmPluginConfig { name: "high".into(), priority: 10, ..Default::default() },
+            WasmPluginConfig {
+                name: "high".into(),
+                priority: 10,
+                ..Default::default()
+            },
         );
         let names = mgr.plugin_names();
         assert_eq!(names, vec!["high", "low"]);

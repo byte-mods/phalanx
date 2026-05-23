@@ -111,8 +111,10 @@ async fn webtransport_settings_handshake_completes() {
             .enable_extended_connect(true)
             .enable_datagram(true)
             .max_webtransport_sessions(8);
-        let mut h3_conn: h3::server::Connection<h3_quinn::Connection, Bytes> =
-            h3_builder.build(h3_quinn::Connection::new(conn)).await.ok()?;
+        let mut h3_conn: h3::server::Connection<h3_quinn::Connection, Bytes> = h3_builder
+            .build(h3_quinn::Connection::new(conn))
+            .await
+            .ok()?;
         // Block on accept so the connection stays open long enough for the
         // client to complete its SETTINGS exchange. Result ignored — we
         // only care that the handshake itself didn't error.
@@ -218,19 +220,12 @@ async fn webtransport_extended_connect_does_not_return_200_when_gate_off() {
         .unwrap();
     req.extensions_mut().insert(Protocol::WEB_TRANSPORT);
 
-    let send_res = tokio::time::timeout(
-        Duration::from_secs(5),
-        send_request.send_request(req),
-    )
-    .await
-    .expect("send_request timed out");
+    let send_res = tokio::time::timeout(Duration::from_secs(5), send_request.send_request(req))
+        .await
+        .expect("send_request timed out");
 
     if let Ok(mut req_stream) = send_res {
-        let resp = tokio::time::timeout(
-            Duration::from_secs(2),
-            req_stream.recv_response(),
-        )
-        .await;
+        let resp = tokio::time::timeout(Duration::from_secs(2), req_stream.recv_response()).await;
         if let Ok(Ok(resp)) = resp {
             assert_ne!(
                 resp.status(),

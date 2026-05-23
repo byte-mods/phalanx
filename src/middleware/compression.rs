@@ -157,6 +157,9 @@ mod tests {
     fn test_gzip_compress_at_boundary() {
         let data = vec![b'A'; MIN_COMPRESS_SIZE];
         let result = gzip_compress(&data);
-        assert!(result.is_some(), "repeating data at boundary should compress");
+        assert!(
+            result.is_some(),
+            "repeating data at boundary should compress"
+        );
     }
 }

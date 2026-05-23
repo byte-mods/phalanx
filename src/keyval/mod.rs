@@ -114,10 +114,22 @@ impl KeyvalStore {
                                         if let Some((cmd, rest)) = payload.split_once(':') {
                                             match cmd {
                                                 "SET" => {
-                                                    if let Some((key, val_ttl)) = rest.split_once(':') {
-                                                        if let Some((ttl_str, value)) = val_ttl.split_once(':') {
-                                                            let ttl = if ttl_str.is_empty() { None } else { ttl_str.parse().ok() };
-                                                            store_clone.set_local(key.to_string(), value.to_string(), ttl);
+                                                    if let Some((key, val_ttl)) =
+                                                        rest.split_once(':')
+                                                    {
+                                                        if let Some((ttl_str, value)) =
+                                                            val_ttl.split_once(':')
+                                                        {
+                                                            let ttl = if ttl_str.is_empty() {
+                                                                None
+                                                            } else {
+                                                                ttl_str.parse().ok()
+                                                            };
+                                                            store_clone.set_local(
+                                                                key.to_string(),
+                                                                value.to_string(),
+                                                                ttl,
+                                                            );
                                                         }
                                                     }
                                                 }
@@ -161,7 +173,7 @@ impl KeyvalStore {
     /// If `ttl_secs` is `None`, the store's `default_ttl` is used.
     pub fn set(&self, key: String, value: String, ttl_secs: Option<u64>) {
         self.set_local(key.clone(), value.clone(), ttl_secs);
-        
+
         if let Some(client) = &self.redis_client {
             let client_clone = client.clone();
             let ttl_str = ttl_secs.map(|t| t.to_string()).unwrap_or_default();
@@ -169,7 +181,8 @@ impl KeyvalStore {
             tokio::spawn(async move {
                 if let Ok(mut con) = client_clone.get_multiplexed_async_connection().await {
                     use redis::AsyncCommands;
-                    let _: redis::RedisResult<()> = con.publish("phalanx:keyval:sync", payload).await;
+                    let _: redis::RedisResult<()> =
+                        con.publish("phalanx:keyval:sync", payload).await;
                 }
             });
         }
@@ -187,7 +200,7 @@ impl KeyvalStore {
     /// Delete a key. Returns `true` if the key existed.
     pub fn delete(&self, key: &str) -> bool {
         let existed = self.delete_local(key);
-        
+
         if existed {
             if let Some(client) = &self.redis_client {
                 let client_clone = client.clone();
@@ -195,12 +208,13 @@ impl KeyvalStore {
                 tokio::spawn(async move {
                     if let Ok(mut con) = client_clone.get_multiplexed_async_connection().await {
                         use redis::AsyncCommands;
-                        let _: redis::RedisResult<()> = con.publish("phalanx:keyval:sync", payload).await;
+                        let _: redis::RedisResult<()> =
+                            con.publish("phalanx:keyval:sync", payload).await;
                     }
                 });
             }
         }
-        
+
         existed
     }
 

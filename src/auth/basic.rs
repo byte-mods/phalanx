@@ -189,9 +189,17 @@ mod tests {
     fn test_basic_auth_constant_time_missing_user() {
         let users = make_users(&[("admin", "correct")]);
         // Wrong password for known user
-        let r1 = check(&make_headers(&basic_header("admin", "wrong")), "Test", &users);
+        let r1 = check(
+            &make_headers(&basic_header("admin", "wrong")),
+            "Test",
+            &users,
+        );
         // Unknown user
-        let r2 = check(&make_headers(&basic_header("nobody", "anything")), "Test", &users);
+        let r2 = check(
+            &make_headers(&basic_header("nobody", "anything")),
+            "Test",
+            &users,
+        );
         // Both must be 401 with identical message
         assert_eq!(
             format!("{:?}", r1),

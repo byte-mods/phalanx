@@ -13,14 +13,12 @@
 //!   # ...refactor...
 //!   cargo bench --bench hot_paths -- --baseline pre-change
 
-use ai_load_balancer::config::{
-    BackendConfig, LoadBalancingAlgorithm, UpstreamPoolConfig,
-};
+use ai_load_balancer::config::{BackendConfig, LoadBalancingAlgorithm, UpstreamPoolConfig};
 use ai_load_balancer::routing::UpstreamPool;
 use ai_load_balancer::scripting::{HookContext, HookEngine, HookPhase};
-use criterion::{criterion_group, criterion_main, Criterion};
-use std::hint::black_box;
+use criterion::{Criterion, criterion_group, criterion_main};
 use std::collections::HashMap;
+use std::hint::black_box;
 use std::sync::Arc;
 
 // ── P1: get_next_backend allocation ────────────────────────────────────────

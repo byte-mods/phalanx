@@ -7,7 +7,6 @@ use tracing::{debug, info};
 
 pub mod rhai_engine;
 
-
 /// A plugin/hook system for extensible request/response processing.
 ///
 /// Provides lifecycle hooks that custom scripts or compiled plugins can
@@ -217,9 +216,9 @@ impl HookEngine {
     /// On error, returns the error string and preserves existing hooks.
     pub fn reload_rhai_script(&self, script_path: &str) -> Result<(), String> {
         let sp = script_path.to_string();
-        let result = std::thread::spawn(move || {
-            rhai_engine::RhaiHookHandler::from_file(&sp)
-        }).join().unwrap_or(Err("Rhai reload thread panicked".to_string()));
+        let result = std::thread::spawn(move || rhai_engine::RhaiHookHandler::from_file(&sp))
+            .join()
+            .unwrap_or(Err("Rhai reload thread panicked".to_string()));
         match result {
             Ok(handler) => {
                 {
@@ -233,7 +232,12 @@ impl HookEngine {
                     }
                 }
                 let handler = std::sync::Arc::new(handler);
-                for phase in [HookPhase::PreRoute, HookPhase::PreUpstream, HookPhase::PostUpstream, HookPhase::Log] {
+                for phase in [
+                    HookPhase::PreRoute,
+                    HookPhase::PreUpstream,
+                    HookPhase::PostUpstream,
+                    HookPhase::Log,
+                ] {
                     self.register(Hook {
                         name: format!("rhai:{}", script_path),
                         phase,
@@ -463,7 +467,11 @@ mod tests {
         let mut ctx = hook_ctx();
         ctx.headers.insert("X-Flag".to_string(), "yes".to_string());
 
-        let hook = ConditionalRewriteHook::new("X-Flag".to_string(), "yes".to_string(), "/rewritten".to_string());
+        let hook = ConditionalRewriteHook::new(
+            "X-Flag".to_string(),
+            "yes".to_string(),
+            "/rewritten".to_string(),
+        );
         match hook.execute(&ctx) {
             HookResult::RewritePath(p) => assert_eq!(p, "/rewritten"),
             other => panic!("expected RewritePath, got {:?}", other),
@@ -475,7 +483,11 @@ mod tests {
         let mut ctx = hook_ctx();
         ctx.headers.insert("X-Flag".to_string(), "no".to_string());
 
-        let hook = ConditionalRewriteHook::new("X-Flag".to_string(), "yes".to_string(), "/rewritten".to_string());
+        let hook = ConditionalRewriteHook::new(
+            "X-Flag".to_string(),
+            "yes".to_string(),
+            "/rewritten".to_string(),
+        );
         match hook.execute(&ctx) {
             HookResult::Continue => {}
             other => panic!("expected Continue, got {:?}", other),

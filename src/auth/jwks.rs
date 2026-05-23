@@ -203,7 +203,11 @@ impl JwksManager {
                 tokio::time::sleep(JWKS_REFRESH_INTERVAL).await;
                 match self.get_keys(&jwks_uri).await {
                     Ok(keys) => {
-                        debug!("JWKS auto-refresh: {} keys loaded from {}", keys.keys.len(), jwks_uri);
+                        debug!(
+                            "JWKS auto-refresh: {} keys loaded from {}",
+                            keys.keys.len(),
+                            jwks_uri
+                        );
                     }
                     Err(e) => {
                         warn!("JWKS auto-refresh failed for {}: {}", jwks_uri, e);
@@ -349,11 +353,13 @@ mod tests {
         );
 
         // Fetch should fail (invalid URL) but return stale cached keys
-        let result = mgr
-            .get_keys("https://invalid.example.com/jwks")
-            .await;
+        let result = mgr.get_keys("https://invalid.example.com/jwks").await;
         // Stale-while-revalidate: should succeed with cached keys despite fetch failure
-        assert!(result.is_ok(), "expected stale cache fallback, got err: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "expected stale cache fallback, got err: {:?}",
+            result.err()
+        );
         let keys = result.unwrap();
         assert_eq!(keys.keys.len(), 1);
         assert_eq!(keys.keys[0].kid.as_deref(), Some("test-key"));
@@ -363,9 +369,7 @@ mod tests {
     async fn test_jwks_no_stale_cache_returns_error() {
         let mgr = JwksManager::new();
         // No cache seeded, unreachable URL → should return error
-        let result = mgr
-            .get_keys("https://invalid.example.com/jwks")
-            .await;
+        let result = mgr.get_keys("https://invalid.example.com/jwks").await;
         assert!(result.is_err());
     }
 }

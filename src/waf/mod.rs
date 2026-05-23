@@ -322,7 +322,13 @@ impl WafEngine {
 
         // Also run the declarative policy engine against the body
         let policy = self.policy_engine.load();
-        let policy_violations = policy.evaluate(None, path, query, &std::collections::HashMap::new(), Some(body));
+        let policy_violations = policy.evaluate(
+            None,
+            path,
+            query,
+            &std::collections::HashMap::new(),
+            Some(body),
+        );
         for v in &policy_violations {
             if matches!(v.action, policy::RuleAction::Block) {
                 warn!(
@@ -350,7 +356,13 @@ mod tests {
         waf.reload_rules();
         // Verify inspection still works after reload
         let empty_headers = std::collections::HashMap::new();
-        let result = waf.inspect("1.2.3.4", "/safe", None, &empty_headers, Some("Mozilla/5.0"));
+        let result = waf.inspect(
+            "1.2.3.4",
+            "/safe",
+            None,
+            &empty_headers,
+            Some("Mozilla/5.0"),
+        );
         assert_eq!(result, WafAction::Allow);
     }
 
@@ -362,7 +374,13 @@ mod tests {
         waf.reload_policy("/nonexistent/policy.json");
         // Engine should still work
         let empty_headers = std::collections::HashMap::new();
-        let result = waf.inspect("1.2.3.4", "/safe", None, &empty_headers, Some("Mozilla/5.0"));
+        let result = waf.inspect(
+            "1.2.3.4",
+            "/safe",
+            None,
+            &empty_headers,
+            Some("Mozilla/5.0"),
+        );
         assert_eq!(result, WafAction::Allow);
     }
 
@@ -382,7 +400,13 @@ mod tests {
         let waf = WafEngine::new(true, reputation);
         let empty_headers = std::collections::HashMap::new();
         // "burpsuite" is in classify_user_agent's BAD_BOTS but NOT in the regex bot_ua_set
-        let result = waf.inspect("1.2.3.4", "/safe", None, &empty_headers, Some("burpsuite/2024.1"));
+        let result = waf.inspect(
+            "1.2.3.4",
+            "/safe",
+            None,
+            &empty_headers,
+            Some("burpsuite/2024.1"),
+        );
         assert!(matches!(result, WafAction::Block(_)));
     }
 
@@ -392,7 +416,13 @@ mod tests {
         let waf = WafEngine::new(true, reputation);
         let empty_headers = std::collections::HashMap::new();
         // Googlebot is classified as GoodBot
-        let result = waf.inspect("1.2.3.4", "/safe", None, &empty_headers, Some("Googlebot/2.1"));
+        let result = waf.inspect(
+            "1.2.3.4",
+            "/safe",
+            None,
+            &empty_headers,
+            Some("Googlebot/2.1"),
+        );
         assert_eq!(result, WafAction::Allow);
     }
 

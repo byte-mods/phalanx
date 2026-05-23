@@ -77,52 +77,53 @@ where
 {
     let start_time = std::time::Instant::now();
 
-    let stream = match tokio::time::timeout(CONNECT_TIMEOUT, TcpStream::connect(&fastcgi_pass)).await {
-        Ok(Ok(s)) => s,
-        Ok(Err(e)) => {
-            error!(
-                "Failed to connect to FastCGI server {}: {}",
-                fastcgi_pass, e
-            );
-            access_logger.log(AccessLogEntry {
-                timestamp: chrono_timestamp(),
-                client_ip: ip_str.to_string(),
-                method: method_str.to_string(),
-                path: req_path.to_string(),
-                status: 502,
-                latency_ms: start_time.elapsed().as_millis() as u64,
-                backend: "fastcgi".to_string(),
-                pool: fastcgi_pass,
-                bytes_sent: 0,
-                referer: String::new(),
-                user_agent: String::new(),
-                trace_id: String::new(),
-            });
-            return Ok(empty_response(StatusCode::BAD_GATEWAY));
-        }
-        Err(_elapsed) => {
-            error!(
-                "Timeout connecting to FastCGI server {} ({}s)",
-                fastcgi_pass,
-                CONNECT_TIMEOUT.as_secs()
-            );
-            access_logger.log(AccessLogEntry {
-                timestamp: chrono_timestamp(),
-                client_ip: ip_str.to_string(),
-                method: method_str.to_string(),
-                path: req_path.to_string(),
-                status: 502,
-                latency_ms: start_time.elapsed().as_millis() as u64,
-                backend: "fastcgi".to_string(),
-                pool: fastcgi_pass,
-                bytes_sent: 0,
-                referer: String::new(),
-                user_agent: String::new(),
-                trace_id: String::new(),
-            });
-            return Ok(empty_response(StatusCode::BAD_GATEWAY));
-        }
-    };
+    let stream =
+        match tokio::time::timeout(CONNECT_TIMEOUT, TcpStream::connect(&fastcgi_pass)).await {
+            Ok(Ok(s)) => s,
+            Ok(Err(e)) => {
+                error!(
+                    "Failed to connect to FastCGI server {}: {}",
+                    fastcgi_pass, e
+                );
+                access_logger.log(AccessLogEntry {
+                    timestamp: chrono_timestamp(),
+                    client_ip: ip_str.to_string(),
+                    method: method_str.to_string(),
+                    path: req_path.to_string(),
+                    status: 502,
+                    latency_ms: start_time.elapsed().as_millis() as u64,
+                    backend: "fastcgi".to_string(),
+                    pool: fastcgi_pass,
+                    bytes_sent: 0,
+                    referer: String::new(),
+                    user_agent: String::new(),
+                    trace_id: String::new(),
+                });
+                return Ok(empty_response(StatusCode::BAD_GATEWAY));
+            }
+            Err(_elapsed) => {
+                error!(
+                    "Timeout connecting to FastCGI server {} ({}s)",
+                    fastcgi_pass,
+                    CONNECT_TIMEOUT.as_secs()
+                );
+                access_logger.log(AccessLogEntry {
+                    timestamp: chrono_timestamp(),
+                    client_ip: ip_str.to_string(),
+                    method: method_str.to_string(),
+                    path: req_path.to_string(),
+                    status: 502,
+                    latency_ms: start_time.elapsed().as_millis() as u64,
+                    backend: "fastcgi".to_string(),
+                    pool: fastcgi_pass,
+                    bytes_sent: 0,
+                    referer: String::new(),
+                    user_agent: String::new(),
+                    trace_id: String::new(),
+                });
+                return Ok(empty_response(StatusCode::BAD_GATEWAY));
+            }
+        };
 
     let (parts, body) = req.into_parts();
     let query_string = parts.uri.query().unwrap_or("");
@@ -157,17 +158,18 @@ where
     let fcgi_req = FcgiRequest::new(params, &mut body_reader);
     let client = Client::new(stream);
 
-    let mut fcgi_res_stream = match tokio::time::timeout(EXEC_TIMEOUT, client.execute_once_stream(fcgi_req)).await {
-        Ok(Ok(s)) => s,
-        Ok(Err(e)) => {
-            error!("FastCGI stream execute error: {}", e);
-            return Ok(empty_response(StatusCode::INTERNAL_SERVER_ERROR));
-        }
-        Err(_elapsed) => {
-            error!("FastCGI execute timeout ({}s)", EXEC_TIMEOUT.as_secs());
-            return Ok(empty_response(StatusCode::GATEWAY_TIMEOUT));
-        }
-    };
+    let mut fcgi_res_stream =
+        match tokio::time::timeout(EXEC_TIMEOUT, client.execute_once_stream(fcgi_req)).await {
+            Ok(Ok(s)) => s,
+            Ok(Err(e)) => {
+                error!("FastCGI stream execute error: {}", e);
+                return Ok(empty_response(StatusCode::INTERNAL_SERVER_ERROR));
+            }
+            Err(_elapsed) => {
+                error!("FastCGI execute timeout ({}s)", EXEC_TIMEOUT.as_secs());
+                return Ok(empty_response(StatusCode::GATEWAY_TIMEOUT));
+            }
+        };
 
     // Buffer output until we parse PHP-FPM / CGI headers (\r\n\r\n)
     let mut header_buf = Vec::new();
@@ -249,10 +251,11 @@ where
         }
     };
 
-    let stream_body = BodyExt::boxed(BodyExt::map_err(
-        StreamBody::new(fcgi_stream),
-        |never| match never {},
-    ));
+    let stream_body =
+        BodyExt::boxed(BodyExt::map_err(
+            StreamBody::new(fcgi_stream),
+            |never| match never {},
+        ));
     let response = builder.body(stream_body).unwrap();
 
     let latency = start_time.elapsed().as_millis() as u64;

@@ -9,13 +9,9 @@
 /// automatically releases on drop.
 use arc_swap::ArcSwap;
 use dashmap::DashMap;
-use std::sync::Arc;
-use governor::{
-    clock::DefaultClock,
-    state::keyed::DefaultKeyedStateStore,
-    Quota, RateLimiter,
-};
+use governor::{Quota, RateLimiter, clock::DefaultClock, state::keyed::DefaultKeyedStateStore};
 use std::num::NonZeroU32;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 use tracing::{info, warn};
 
@@ -62,7 +58,8 @@ impl ZoneLimiter {
         let quota = Quota::per_second(NonZeroU32::new(rate_per_sec.max(1)).unwrap())
             .allow_burst(NonZeroU32::new(burst.max(1)).unwrap());
         self.rate_limiter.store(Arc::new(RateLimiter::keyed(quota)));
-        self.max_connections.store(max_connections, Ordering::Relaxed);
+        self.max_connections
+            .store(max_connections, Ordering::Relaxed);
         info!(
             "Zone '{}' reloaded: rate={}/s burst={} max_conns={}",
             self.name, rate_per_sec, burst, max_connections
@@ -74,10 +71,7 @@ impl ZoneLimiter {
     pub fn check_rate(&self, key: &str) -> bool {
         let limiter = self.rate_limiter.load();
         if limiter.check_key(&key.to_string()).is_err() {
-            warn!(
-                "Zone '{}' rate limit exceeded for key '{}'",
-                self.name, key
-            );
+            warn!("Zone '{}' rate limit exceeded for key '{}'", self.name, key);
             return false;
         }
         true
@@ -167,22 +161,21 @@ impl ZoneKeySource {
                 .and_then(|v| v.to_str().ok())
                 .unwrap_or("_")
                 .to_string(),
-            ZoneKeySource::Cookie(name) => extract_cookie_value(headers, name)
-                .unwrap_or_else(|| "_".to_string()),
+            ZoneKeySource::Cookie(name) => {
+                extract_cookie_value(headers, name).unwrap_or_else(|| "_".to_string())
+            }
             ZoneKeySource::JwtClaim(claim) => {
                 extract_jwt_claim(headers, claim).unwrap_or_else(|| "_".to_string())
             }
             ZoneKeySource::Uri => path.to_string(),
-            ZoneKeySource::QueryParam(param) => {
-                query
-                    .and_then(|q| {
-                        q.split('&')
-                            .find(|p| p.starts_with(&format!("{}=", param)))
-                            .and_then(|p| p.split('=').nth(1))
-                            .map(String::from)
-                    })
-                    .unwrap_or_else(|| "_".to_string())
-            }
+            ZoneKeySource::QueryParam(param) => query
+                .and_then(|q| {
+                    q.split('&')
+                        .find(|p| p.starts_with(&format!("{}=", param)))
+                        .and_then(|p| p.split('=').nth(1))
+                        .map(String::from)
+                })
+                .unwrap_or_else(|| "_".to_string()),
             ZoneKeySource::Composite(sources) => {
                 let parts: Vec<String> = sources
                     .iter()
@@ -234,10 +227,7 @@ fn extract_jwt_claim(headers: &hyper::HeaderMap, claim: &str) -> Option<String> 
         .decode(parts[1])
         .ok()?;
     let claims: serde_json::Value = serde_json::from_slice(&payload).ok()?;
-    claims
-        .get(claim)
-        .and_then(|v| v.as_str())
-        .map(String::from)
+    claims.get(claim).and_then(|v| v.as_str()).map(String::from)
 }
 
 #[cfg(test)]
@@ -269,7 +259,10 @@ mod tests {
         let limiter = ZoneLimiter::new("test", 100, 10, 2);
         assert!(limiter.acquire_connection("key1"));
         assert!(limiter.acquire_connection("key1"));
-        assert!(!limiter.acquire_connection("key1"), "3rd connection should be denied");
+        assert!(
+            !limiter.acquire_connection("key1"),
+            "3rd connection should be denied"
+        );
     }
 
     #[test]
@@ -278,7 +271,10 @@ mod tests {
         assert!(limiter.acquire_connection("k"));
         assert!(!limiter.acquire_connection("k"));
         limiter.release_connection("k");
-        assert!(limiter.acquire_connection("k"), "after release, should allow again");
+        assert!(
+            limiter.acquire_connection("k"),
+            "after release, should allow again"
+        );
     }
 
     #[test]
@@ -321,7 +317,10 @@ mod tests {
     fn test_zone_key_source_cookie() {
         let src = ZoneKeySource::Cookie("session_id".to_string());
         let mut headers = hyper::HeaderMap::new();
-        headers.insert(hyper::header::COOKIE, "session_id=xyz789; other=val".parse().unwrap());
+        headers.insert(
+            hyper::header::COOKIE,
+            "session_id=xyz789; other=val".parse().unwrap(),
+        );
         assert_eq!(src.extract("ip", &headers, "/", None), "xyz789");
     }
 
@@ -333,8 +332,14 @@ mod tests {
             hyper::header::COOKIE,
             "session_id=abc; sid=xyz".parse().unwrap(),
         );
-        assert_eq!(extract_cookie_value(&headers, "sid"), Some("xyz".to_string()));
-        assert_eq!(extract_cookie_value(&headers, "session_id"), Some("abc".to_string()));
+        assert_eq!(
+            extract_cookie_value(&headers, "sid"),
+            Some("xyz".to_string())
+        );
+        assert_eq!(
+            extract_cookie_value(&headers, "session_id"),
+            Some("abc".to_string())
+        );
         assert_eq!(extract_cookie_value(&headers, "session"), None);
     }
 
@@ -349,7 +354,10 @@ mod tests {
     fn test_zone_key_source_query_param() {
         let src = ZoneKeySource::QueryParam("user_id".to_string());
         let headers = hyper::HeaderMap::new();
-        assert_eq!(src.extract("ip", &headers, "/", Some("user_id=42&page=1")), "42");
+        assert_eq!(
+            src.extract("ip", &headers, "/", Some("user_id=42&page=1")),
+            "42"
+        );
     }
 
     #[test]
@@ -361,12 +369,12 @@ mod tests {
 
     #[test]
     fn test_zone_key_source_composite() {
-        let src = ZoneKeySource::Composite(vec![
-            ZoneKeySource::ClientIp,
-            ZoneKeySource::Uri,
-        ]);
+        let src = ZoneKeySource::Composite(vec![ZoneKeySource::ClientIp, ZoneKeySource::Uri]);
         let headers = hyper::HeaderMap::new();
-        assert_eq!(src.extract("1.2.3.4", &headers, "/api", None), "1.2.3.4:/api");
+        assert_eq!(
+            src.extract("1.2.3.4", &headers, "/api", None),
+            "1.2.3.4:/api"
+        );
     }
 
     #[test]
@@ -381,8 +389,14 @@ mod tests {
             hyper::header::AUTHORIZATION,
             format!("Bearer {}", fake_token).parse().unwrap(),
         );
-        assert_eq!(extract_jwt_claim(&headers, "sub"), Some("user-42".to_string()));
-        assert_eq!(extract_jwt_claim(&headers, "role"), Some("admin".to_string()));
+        assert_eq!(
+            extract_jwt_claim(&headers, "sub"),
+            Some("user-42".to_string())
+        );
+        assert_eq!(
+            extract_jwt_claim(&headers, "role"),
+            Some("admin".to_string())
+        );
     }
 
     #[test]
@@ -401,7 +415,10 @@ mod tests {
         // Reload with higher connection limit
         limiter.reload(100, 10, 5);
         // Existing counters are preserved (2 active), but limit is now 5
-        assert!(limiter.acquire_connection("k"), "should allow 3rd after reload to 5");
+        assert!(
+            limiter.acquire_connection("k"),
+            "should allow 3rd after reload to 5"
+        );
     }
 
     /// M45 regression: concurrent acquire/release must not lose counters.

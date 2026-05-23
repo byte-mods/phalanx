@@ -99,8 +99,8 @@ pub struct ProtocolThreshold {
 impl Default for ProtocolThreshold {
     fn default() -> Self {
         Self {
-            bandwidth_bps_warn: 100 * 1024 * 1024,      // 100 MiB/s
-            bandwidth_bps_critical: 500 * 1024 * 1024,  // 500 MiB/s
+            bandwidth_bps_warn: 100 * 1024 * 1024,     // 100 MiB/s
+            bandwidth_bps_critical: 500 * 1024 * 1024, // 500 MiB/s
             connections_warn: 5_000,
             connections_critical: 20_000,
         }
@@ -126,11 +126,21 @@ impl BandwidthTracker {
 
         // Pre-create all known protocol buckets
         for proto in &[
-            "http1", "http2", "http3", "websocket", "grpc",
-            "tcp", "udp", "webrtc",
+            "http1",
+            "http2",
+            "http3",
+            "websocket",
+            "grpc",
+            "tcp",
+            "udp",
+            "webrtc",
         ] {
-            tracker.stats.insert(proto.to_string(), Arc::new(ProtocolStats::new()));
-            tracker.thresholds.insert(proto.to_string(), ProtocolThreshold::default());
+            tracker
+                .stats
+                .insert(proto.to_string(), Arc::new(ProtocolStats::new()));
+            tracker
+                .thresholds
+                .insert(proto.to_string(), ProtocolThreshold::default());
         }
 
         tracker
@@ -165,9 +175,7 @@ impl BandwidthTracker {
                 active_connections: e.value().active_connections.load(Ordering::Relaxed),
             })
             .collect();
-        snap.sort_by(|a, b| {
-            (b.bytes_in + b.bytes_out).cmp(&(a.bytes_in + a.bytes_out))
-        });
+        snap.sort_by(|a, b| (b.bytes_in + b.bytes_out).cmp(&(a.bytes_in + a.bytes_out)));
         snap
     }
 
@@ -184,9 +192,7 @@ impl BandwidthTracker {
                 active_connections: e.value().active_connections.load(Ordering::Relaxed),
             })
             .collect();
-        snap.sort_by(|a, b| {
-            (b.bytes_in + b.bytes_out).cmp(&(a.bytes_in + a.bytes_out))
-        });
+        snap.sort_by(|a, b| (b.bytes_in + b.bytes_out).cmp(&(a.bytes_in + a.bytes_out)));
         snap
     }
 
@@ -207,8 +213,8 @@ impl BandwidthTracker {
                 .map(|t| t.clone())
                 .unwrap_or_default();
 
-            let current_bytes = stat.bytes_in.load(Ordering::Relaxed)
-                + stat.bytes_out.load(Ordering::Relaxed);
+            let current_bytes =
+                stat.bytes_in.load(Ordering::Relaxed) + stat.bytes_out.load(Ordering::Relaxed);
             let active = stat.active_connections.load(Ordering::Relaxed);
 
             // Compute bytes-per-second rate since last check
@@ -223,7 +229,8 @@ impl BandwidthTracker {
             };
 
             // Update last-check snapshot
-            stat.last_check_bytes.store(current_bytes, Ordering::Relaxed);
+            stat.last_check_bytes
+                .store(current_bytes, Ordering::Relaxed);
             stat.last_check_time.store(now, Ordering::Relaxed);
 
             if bps >= threshold.bandwidth_bps_critical {
@@ -320,7 +327,16 @@ mod tests {
         let tracker = BandwidthTracker::new();
         let snap = tracker.snapshot();
         let protos: Vec<&str> = snap.iter().map(|s| s.protocol.as_str()).collect();
-        for p in &["http1", "http2", "http3", "websocket", "grpc", "tcp", "udp", "webrtc"] {
+        for p in &[
+            "http1",
+            "http2",
+            "http3",
+            "websocket",
+            "grpc",
+            "tcp",
+            "udp",
+            "webrtc",
+        ] {
             assert!(protos.contains(p), "Missing protocol: {}", p);
         }
     }
@@ -342,7 +358,9 @@ mod tests {
     fn test_request_counter() {
         let tracker = BandwidthTracker::new();
         let p = tracker.protocol("http2");
-        for _ in 0..5 { p.inc_requests(); }
+        for _ in 0..5 {
+            p.inc_requests();
+        }
         let snap = tracker.snapshot();
         let h2 = snap.iter().find(|s| s.protocol == "http2").unwrap();
         assert_eq!(h2.requests, 5);
@@ -382,12 +400,15 @@ mod tests {
     #[test]
     fn test_bandwidth_warning_alert() {
         let tracker = BandwidthTracker::new();
-        tracker.set_threshold("tcp", ProtocolThreshold {
-            bandwidth_bps_warn: 100,
-            bandwidth_bps_critical: 1_000_000,
-            connections_warn: 999_999,
-            connections_critical: 9_999_999,
-        });
+        tracker.set_threshold(
+            "tcp",
+            ProtocolThreshold {
+                bandwidth_bps_warn: 100,
+                bandwidth_bps_critical: 1_000_000,
+                connections_warn: 999_999,
+                connections_critical: 9_999_999,
+            },
+        );
         let p = tracker.protocol("tcp");
         // Seed last-check state to 1 second ago with 0 bytes
         let one_sec_ago = std::time::SystemTime::now()
@@ -400,7 +421,9 @@ mod tests {
         p.last_check_time.store(one_sec_ago, Ordering::Relaxed);
         p.add_in(200); // 200 B/s > 100 B/s warn threshold
         let alerts = tracker.check_thresholds();
-        let tcp_alert = alerts.iter().find(|a| a.protocol == "tcp" && a.metric == "bandwidth");
+        let tcp_alert = alerts
+            .iter()
+            .find(|a| a.protocol == "tcp" && a.metric == "bandwidth");
         assert!(tcp_alert.is_some(), "Expected bandwidth warning alert");
         assert_eq!(tcp_alert.unwrap().level, AlertLevel::Warning);
     }
@@ -408,12 +431,15 @@ mod tests {
     #[test]
     fn test_bandwidth_critical_alert() {
         let tracker = BandwidthTracker::new();
-        tracker.set_threshold("udp", ProtocolThreshold {
-            bandwidth_bps_warn: 100,
-            bandwidth_bps_critical: 500,
-            connections_warn: 999_999,
-            connections_critical: 9_999_999,
-        });
+        tracker.set_threshold(
+            "udp",
+            ProtocolThreshold {
+                bandwidth_bps_warn: 100,
+                bandwidth_bps_critical: 500,
+                connections_warn: 999_999,
+                connections_critical: 9_999_999,
+            },
+        );
         let p = tracker.protocol("udp");
         let one_sec_ago = std::time::SystemTime::now()
             .checked_sub(std::time::Duration::from_secs(1))
@@ -425,19 +451,24 @@ mod tests {
         p.last_check_time.store(one_sec_ago, Ordering::Relaxed);
         p.add_out(600); // 600 B/s > 500 B/s critical threshold
         let alerts = tracker.check_thresholds();
-        let a = alerts.iter().find(|a| a.protocol == "udp" && a.level == AlertLevel::Critical);
+        let a = alerts
+            .iter()
+            .find(|a| a.protocol == "udp" && a.level == AlertLevel::Critical);
         assert!(a.is_some(), "Expected bandwidth critical alert");
     }
 
     #[test]
     fn test_bandwidth_threshold_rate_not_cumulative() {
         let tracker = BandwidthTracker::new();
-        tracker.set_threshold("http1", ProtocolThreshold {
-            bandwidth_bps_warn: 1_000_000, // 1 MiB/s
-            bandwidth_bps_critical: 5_000_000,
-            connections_warn: 999_999,
-            connections_critical: 9_999_999,
-        });
+        tracker.set_threshold(
+            "http1",
+            ProtocolThreshold {
+                bandwidth_bps_warn: 1_000_000, // 1 MiB/s
+                bandwidth_bps_critical: 5_000_000,
+                connections_warn: 999_999,
+                connections_critical: 9_999_999,
+            },
+        );
         let p = tracker.protocol("http1");
         // Simulate a huge cumulative total with a very old baseline
         let ten_min_ago = std::time::SystemTime::now()
@@ -451,7 +482,9 @@ mod tests {
         p.add_in(10 * 1024 * 1024); // 10 MiB over 10 min = ~17 KiB/s
         let alerts = tracker.check_thresholds();
         // Should NOT alert because rate (17 KiB/s) is well below 1 MiB/s threshold
-        let bw_alert = alerts.iter().find(|a| a.protocol == "http1" && a.metric == "bandwidth");
+        let bw_alert = alerts
+            .iter()
+            .find(|a| a.protocol == "http1" && a.metric == "bandwidth");
         assert!(
             bw_alert.is_none(),
             "Rate-based check should not alert on low rate: {:?}",
@@ -462,18 +495,23 @@ mod tests {
     #[test]
     fn test_connection_warning_alert() {
         let tracker = BandwidthTracker::new();
-        tracker.set_threshold("webrtc", ProtocolThreshold {
-            bandwidth_bps_warn: u64::MAX,
-            bandwidth_bps_critical: u64::MAX,
-            connections_warn: 2,
-            connections_critical: 100,
-        });
+        tracker.set_threshold(
+            "webrtc",
+            ProtocolThreshold {
+                bandwidth_bps_warn: u64::MAX,
+                bandwidth_bps_critical: u64::MAX,
+                connections_warn: 2,
+                connections_critical: 100,
+            },
+        );
         let p = tracker.protocol("webrtc");
         p.conn_open();
         p.conn_open();
         p.conn_open();
         let alerts = tracker.check_thresholds();
-        let a = alerts.iter().find(|a| a.protocol == "webrtc" && a.metric == "connections");
+        let a = alerts
+            .iter()
+            .find(|a| a.protocol == "webrtc" && a.metric == "connections");
         assert!(a.is_some());
         assert_eq!(a.unwrap().level, AlertLevel::Warning);
     }
