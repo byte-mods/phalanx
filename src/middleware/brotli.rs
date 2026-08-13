@@ -24,10 +24,13 @@ pub async fn brotli_compress_async(body: Bytes, quality: u32) -> Option<Bytes> {
 pub const MIN_BROTLI_SIZE: usize = 1024;
 
 /// Checks if the client accepts Brotli encoding.
+///
+/// Uses the RFC 9110 §12.5.3 token/qvalue parser rather than a substring test:
+/// `contains("br")` matches any header value with those two letters in it
+/// (`libra`, `brotli-not-real`) and ignores `br;q=0`, which explicitly refuses
+/// the coding.
 pub fn accepts_brotli(accept_encoding: Option<&str>) -> bool {
-    accept_encoding
-        .map(|ae| ae.to_lowercase().contains("br"))
-        .unwrap_or(false)
+    crate::middleware::compression::accepts_encoding(accept_encoding, "br")
 }
 
 /// Compresses bytes using Brotli. Returns None if the body is too small or compression fails.

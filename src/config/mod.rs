@@ -173,6 +173,11 @@ pub struct UpstreamPoolConfig {
     pub health_check_timeout_secs: u64,
 }
 
+/// Name of the upstream pool used when a listener has no pool of its own.
+fn default_pool_name() -> String {
+    "default".to_string()
+}
+
 fn default_health_check_interval() -> u64 {
     5
 }
@@ -350,6 +355,15 @@ fn default_room_idle_timeout() -> u64 {
 pub struct AppConfig {
     /// TCP bind address for the HTTP/HTTPS reverse proxy listener (e.g. "0.0.0.0:8080").
     pub proxy_bind: String,
+    /// Every address the HTTP multiplexer should listen on — one per `listen`
+    /// directive across all `server` blocks, in declaration order and deduped.
+    ///
+    /// `proxy_bind` is the first of these and is kept for the many call sites
+    /// that want "the" bind address. Before this existed, each `server` block
+    /// simply overwrote `proxy_bind`, so a config with two `listen` directives
+    /// bound only the last one and the other port silently never opened.
+    #[serde(default)]
+    pub proxy_binds: Vec<String>,
     /// TCP bind address for the raw TCP stream multiplexer (e.g. "0.0.0.0:5000").
     pub tcp_bind: String,
     /// TCP bind address for the admin dashboard and metrics API (e.g. "127.0.0.1:9090").
@@ -405,6 +419,10 @@ pub struct AppConfig {
     /// UDP bind address for the HTTP/3 QUIC server (e.g. "0.0.0.0:8443").
     /// When None (default), HTTP/3 is disabled.
     pub quic_bind: Option<String>,
+    /// Explicit `Alt-Svc` header value. When unset and a QUIC listener is
+    /// configured, one is derived from the QUIC port — see `alt_svc_header()`.
+    #[serde(default)]
+    pub alt_svc: Option<String>,
     /// DNS resolver address (e.g. "8.8.8.8:53") for resolving hostnames in upstream blocks.
     /// When set, hostname-based backends are watched for DNS changes every 30 seconds.
     pub dns_resolver: Option<String>,
@@ -451,10 +469,24 @@ pub struct AppConfig {
     pub auth_request_url: Option<String>,
     /// Mirror/shadow upstream pool name for traffic tee.
     pub mirror_pool: Option<String>,
-    /// Enable PROXY Protocol v2 parsing on incoming connections.
-    /// When true, the PP2 header is stripped and the real client IP extracted.
+    /// Trust PROXY Protocol v2 headers from *any* peer on this listener.
+    ///
+    /// The header is always parsed and stripped so framing stays correct, but the
+    /// address it claims is only adopted when the immediate peer is in
+    /// `trusted_proxies` — otherwise any client that can reach the port could pick
+    /// its own apparent IP and walk straight through IP bans, per-IP rate limits
+    /// and geo rules. Set this when the listener is only reachable from a load
+    /// balancer that you cannot express as a `trusted_proxy` CIDR.
     #[serde(default)]
     pub proxy_proto_v2: bool,
+    /// Upstream pool the dedicated raw TCP listener forwards to. Defaults to
+    /// `"default"`, which is also the HTTP fallback pool — set `tcp_upstream_pool`
+    /// to give L4 traffic its own backends.
+    #[serde(default = "default_pool_name")]
+    pub tcp_upstream_pool: String,
+    /// Upstream pool the UDP listener forwards to. See `tcp_upstream_pool`.
+    #[serde(default = "default_pool_name")]
+    pub udp_upstream_pool: String,
     /// Path to a Rhai script file to run as a pre-upstream request hook.
     /// The script receives `uri`, `method`, `client_ip`, `headers`, `status`.
     #[serde(default)]
@@ -639,6 +671,23 @@ pub struct AppConfig {
     pub zone_max_connections: u32,
 }
 
+impl AppConfig {
+    /// The `Alt-Svc` value to advertise on HTTP/1 and HTTP/2 responses, if any.
+    ///
+    /// An explicit `alt_svc` directive wins. Otherwise, when a QUIC listener is
+    /// configured, one is derived from its port — browsers have no other way to
+    /// learn that an HTTP/3 endpoint exists, so without this header the QUIC
+    /// listener never sees real browser traffic no matter how well it works.
+    pub fn alt_svc_header(&self) -> Option<String> {
+        if let Some(ref explicit) = self.alt_svc {
+            return Some(explicit.clone());
+        }
+        let bind = self.quic_bind.as_ref()?;
+        let port = bind.rsplit(':').next()?;
+        Some(format!("h3=\":{}\"; ma=86400", port))
+    }
+}
+
 impl Default for AppConfig {
     /// Returns a minimal working configuration with a "default" upstream pool
     /// containing two localhost backends and a single "/" route pointing to it.
@@ -677,6 +726,7 @@ impl Default for AppConfig {
 
         Self {
             proxy_bind: "0.0.0.0:8080".to_string(),
+            proxy_binds: vec!["0.0.0.0:8080".to_string()],
             tcp_bind: "0.0.0.0:5000".to_string(),
             admin_bind: "127.0.0.1:9090".to_string(), // fixed 127.0.0.0 to 127.0.0.1
             workers: 4,
@@ -701,6 +751,7 @@ impl Default for AppConfig {
             otel_endpoint: None,
             otel_service_name: None,
             quic_bind: None,
+            alt_svc: None,
             dns_resolver: None,
             udp_bind: None,
             trusted_proxies: Vec::new(),
@@ -717,6 +768,8 @@ impl Default for AppConfig {
             auth_request_url: None,
             mirror_pool: None,
             proxy_proto_v2: false,
+            tcp_upstream_pool: default_pool_name(),
+            udp_upstream_pool: default_pool_name(),
             rhai_script: None,
             keyval_ttl_secs: 0,
             auto_ssl_domain: None,
@@ -770,6 +823,74 @@ impl Default for AppConfig {
 /// Synchronously loads and parses the given config path from disk.
 /// In strict mode, parse failures return `Err`.
 /// In lenient mode, parse failures are logged and defaults are returned.
+/// Warns about directives that name an upstream pool which does not exist.
+///
+/// Called both from `try_load_config` (which covers hot reloads) and from `main`
+/// once tracing is initialised — at first load the subscriber does not exist yet,
+/// so a warning emitted here would go nowhere.
+///
+/// These are silent failures at runtime rather than parse errors: a `mirror`
+/// pointing at a pool that was never declared just quietly stops mirroring, and
+/// nothing in the response tells the operator. The config still loads — a typo in
+/// a mirror target should not take a proxy down — but it no longer does so
+/// without saying anything.
+pub fn warn_on_unknown_pool_references(cfg: &AppConfig) {
+    let known = |name: &str| cfg.upstreams.contains_key(name);
+
+    for (path, route) in &cfg.routes {
+        if let Some(ref pool) = route.upstream {
+            if !known(pool) {
+                tracing::warn!(
+                    "route {} names upstream pool '{}', which is not declared — \
+                     requests will fall back to host-based routing",
+                    path,
+                    pool
+                );
+            }
+        }
+        if let Some(ref pool) = route.mirror_pool {
+            if !known(pool) {
+                tracing::warn!(
+                    "route {} mirrors to pool '{}', which is not declared — \
+                     mirroring is silently disabled for this route",
+                    path,
+                    pool
+                );
+            }
+        }
+        for pool in &route.split_pools {
+            if !known(pool) {
+                tracing::warn!(
+                    "route {} splits traffic to pool '{}', which is not declared",
+                    path,
+                    pool
+                );
+            }
+        }
+    }
+
+    if let Some(ref pool) = cfg.mirror_pool {
+        if !known(pool) {
+            tracing::warn!(
+                "mirror_pool '{}' is not declared — global mirroring is disabled",
+                pool
+            );
+        }
+    }
+    if !cfg.tcp_bind.is_empty() && !known(&cfg.tcp_upstream_pool) {
+        tracing::warn!(
+            "tcp_upstream_pool '{}' is not declared — the TCP listener has nowhere to forward",
+            cfg.tcp_upstream_pool
+        );
+    }
+    if cfg.udp_bind.is_some() && !known(&cfg.udp_upstream_pool) {
+        tracing::warn!(
+            "udp_upstream_pool '{}' is not declared — the UDP listener has nowhere to forward",
+            cfg.udp_upstream_pool
+        );
+    }
+}
+
 pub fn try_load_config(conf_path: &str, policy: ConfigParsePolicy) -> Result<AppConfig, String> {
     match std::fs::read_to_string(conf_path) {
         Ok(content) => {
@@ -810,11 +931,16 @@ pub fn try_load_config(conf_path: &str, policy: ConfigParsePolicy) -> Result<App
             }
 
             // Walk the http → server → route hierarchy and flatten it into AppConfig's
-            // flat HashMap-based structures. Multiple server blocks are merged sequentially.
+            // flat HashMap-based structures. Routes and server directives from every
+            // block are merged into one table; each block's `listen` adds a listener.
             if let Some(http) = phalanx_cfg.http {
+                let mut binds: Vec<String> = Vec::new();
                 for server in http.servers {
                     if let Some(listen) = server.listen {
-                        app_cfg.proxy_bind = format!("0.0.0.0:{}", listen);
+                        let bind = format!("0.0.0.0:{}", listen);
+                        if !binds.contains(&bind) {
+                            binds.push(bind);
+                        }
                     }
 
                     if server.ssl_certificate.is_some() {
@@ -840,6 +966,9 @@ pub fn try_load_config(conf_path: &str, policy: ConfigParsePolicy) -> Result<App
                         } else {
                             format!("0.0.0.0:{}", v)
                         });
+                    }
+                    if let Some(v) = server.directives.get("alt_svc") {
+                        app_cfg.alt_svc = Some(v.clone());
                     }
                     if let Some(v) = server.directives.get("listen_udp") {
                         app_cfg.udp_bind = Some(if v.contains(':') {
@@ -972,6 +1101,12 @@ pub fn try_load_config(conf_path: &str, policy: ConfigParsePolicy) -> Result<App
                     // Parse newer fields
                     if let Some(v) = server.directives.get("proxy_proto_v2") {
                         app_cfg.proxy_proto_v2 = v == "on" || v == "true";
+                    }
+                    if let Some(v) = server.directives.get("tcp_upstream_pool") {
+                        app_cfg.tcp_upstream_pool = v.clone();
+                    }
+                    if let Some(v) = server.directives.get("udp_upstream_pool") {
+                        app_cfg.udp_upstream_pool = v.clone();
                     }
                     if let Some(v) = server.directives.get("rhai_script") {
                         app_cfg.rhai_script = Some(v.clone());
@@ -1294,6 +1429,13 @@ pub fn try_load_config(conf_path: &str, policy: ConfigParsePolicy) -> Result<App
                     }
                 }
 
+                // Every `listen` becomes a listener. The first is `proxy_bind`,
+                // which the rest of the codebase treats as the primary address.
+                if !binds.is_empty() {
+                    app_cfg.proxy_bind = binds[0].clone();
+                    app_cfg.proxy_binds = binds;
+                }
+
                 // Convert parsed upstream blocks into typed UpstreamPoolConfig entries.
                 // The algorithm string is mapped to the LoadBalancingAlgorithm enum,
                 // and each server directive becomes a BackendConfig.
@@ -1347,6 +1489,7 @@ pub fn try_load_config(conf_path: &str, policy: ConfigParsePolicy) -> Result<App
                     );
                 }
             }
+            warn_on_unknown_pool_references(&app_cfg);
             tracing::info!("Loaded config from {}", conf_path);
             Ok(app_cfg)
         }

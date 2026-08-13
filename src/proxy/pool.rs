@@ -15,6 +15,7 @@ use std::collections::HashMap;
 use std::collections::VecDeque;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
@@ -136,6 +137,7 @@ impl ConnectionPool {
             stream: Some(stream),
             addr: addr.to_string(),
             pool: Arc::clone(self),
+            reusable: Arc::new(AtomicBool::new(true)),
         })
     }
 
@@ -165,12 +167,24 @@ pub struct PooledStream {
     stream: Option<TcpStream>,
     addr: String,
     pool: Arc<ConnectionPool>,
+    reusable: Arc<AtomicBool>,
 }
 
 impl PooledStream {
     /// Address this stream connects to. Useful for diagnostics + tests.
     pub fn addr(&self) -> &str {
         &self.addr
+    }
+
+    /// Handle for marking this connection non-reusable *after* the stream has
+    /// been handed to Hyper and is no longer reachable by the caller.
+    ///
+    /// Needed for protocol upgrades: once a connection has switched to
+    /// WebSocket (101), it is a raw tunnel and carries no HTTP framing, so
+    /// returning it to the idle queue would hand the next request a socket
+    /// that can never produce a valid HTTP response.
+    pub fn reuse_handle(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.reusable)
     }
 
     /// Move the inner `TcpStream` out of this wrapper, suppressing the
@@ -236,6 +250,12 @@ impl AsyncWrite for PooledStream {
 impl Drop for PooledStream {
     fn drop(&mut self) {
         if let Some(stream) = self.stream.take() {
+            if !self.reusable.load(Ordering::Relaxed) {
+                // Marked non-reusable (e.g. upgraded to WebSocket) — close it
+                // rather than poisoning the idle queue.
+                debug!("Discarding non-reusable connection to {}", self.addr);
+                return;
+            }
             self.pool
                 .release_sync(std::mem::take(&mut self.addr), stream);
         }

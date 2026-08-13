@@ -914,6 +914,38 @@ mod protocol_sniff_tests {
         assert_eq!(result, Protocol::Tls);
     }
 
+    /// The method set is open (RFC 9110 §9.1): WebDAV verbs, a cache `PURGE`,
+    /// and bespoke extension methods are all legal. They used to miss the
+    /// hardcoded method list, fall through to the raw-TCP passthrough, and get
+    /// dropped with no response at all — the client just hung until timeout.
+    /// The version token on the request line identifies them as HTTP.
+    #[tokio::test]
+    async fn test_sniff_extension_methods_are_http() {
+        for line in [
+            "PROPFIND /dav/ HTTP/1.1\r\nHost: x\r\n\r\n",
+            "MKCOL /dav/new HTTP/1.1\r\nHost: x\r\n\r\n",
+            "PURGE /cached HTTP/1.1\r\nHost: x\r\n\r\n",
+            "BOGUSMETHOD / HTTP/1.1\r\nHost: x\r\n\r\n",
+        ] {
+            let mut buf = BytesMut::from(line.as_bytes());
+            let empty: &[u8] = &[];
+            let mut cursor = std::io::Cursor::new(empty);
+            let result: Protocol = sniff_protocol(&mut cursor, &mut buf).await.unwrap();
+            assert_eq!(result, Protocol::Http1, "misclassified: {line:?}");
+        }
+    }
+
+    /// The version-token fallback must not steal raw-TCP traffic from the mux:
+    /// only an HTTP request line carries " HTTP/1." before its first CRLF.
+    #[tokio::test]
+    async fn test_sniff_raw_tcp_mentioning_http_later_is_not_http1() {
+        let mut buf = BytesMut::from(&b"BINARY-PAYLOAD\r\nmentions HTTP/1.1 on a later line\r\n"[..]);
+        let empty: &[u8] = &[];
+        let mut cursor = std::io::Cursor::new(empty);
+        let result: Protocol = sniff_protocol(&mut cursor, &mut buf).await.unwrap();
+        assert_eq!(result, Protocol::UnknownTcp);
+    }
+
     #[tokio::test]
     async fn test_sniff_unknown_tcp() {
         let data = b"\x00\x01\x02\x03\x04\x05\x06\x07";
@@ -921,6 +953,70 @@ mod protocol_sniff_tests {
         let mut buf = BytesMut::new();
         let result: Protocol = sniff_protocol(&mut cursor, &mut buf).await.unwrap();
         assert_eq!(result, Protocol::UnknownTcp);
+    }
+
+    /// The accept path reads ahead to test for a PROXY-protocol v2 header, so by
+    /// the time `sniff_protocol` runs the request head is already in `buf` and
+    /// the socket has nothing left to give. Sniffing must classify from those
+    /// buffered bytes; reading the stream again blocks until the client gives
+    /// up, which is what made every ordinary request hang.
+    ///
+    /// The reader here is empty on purpose: any attempt to read it returns EOF,
+    /// so a regression shows up as an `Err` instead of the right protocol.
+    #[tokio::test]
+    async fn test_sniff_uses_prebuffered_bytes_without_reading_again() {
+        let empty: &[u8] = b"";
+        let mut cursor = std::io::Cursor::new(empty);
+        let mut buf = BytesMut::from(&b"GET /health HTTP/1.1\r\nHost: x\r\n\r\n"[..]);
+
+        let result = sniff_protocol(&mut cursor, &mut buf).await;
+        assert_eq!(
+            result.expect("must classify from pre-buffered bytes, not re-read"),
+            Protocol::Http1
+        );
+    }
+
+    /// Pre-buffered bytes must survive sniffing — they are replayed to the
+    /// protocol handler, so dropping or reordering them corrupts the request.
+    #[tokio::test]
+    async fn test_sniff_preserves_prebuffered_bytes() {
+        let empty: &[u8] = b"";
+        let mut cursor = std::io::Cursor::new(empty);
+        let original = &b"POST /api HTTP/1.1\r\nContent-Length: 2\r\n\r\nhi"[..];
+        let mut buf = BytesMut::from(original);
+
+        let _ = sniff_protocol(&mut cursor, &mut buf).await.unwrap();
+        assert_eq!(&buf[..], original, "buffered request bytes must be intact");
+    }
+
+    #[tokio::test]
+    async fn test_sniff_prebuffered_http2_preface() {
+        let empty: &[u8] = b"";
+        let mut cursor = std::io::Cursor::new(empty);
+        let mut buf = BytesMut::from(&b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n"[..]);
+        let result: Protocol = sniff_protocol(&mut cursor, &mut buf).await.unwrap();
+        assert_eq!(result, Protocol::Http2);
+    }
+
+    /// RFC 9110 §9.3 methods must be recognised as HTTP rather than falling
+    /// through to the opaque raw-TCP path.
+    #[tokio::test]
+    async fn test_sniff_recognises_trace_and_connect() {
+        for raw in [
+            &b"TRACE / HTTP/1.1\r\nHost: x\r\n\r\n"[..],
+            &b"CONNECT example.com:443 HTTP/1.1\r\n\r\n"[..],
+        ] {
+            let empty: &[u8] = b"";
+            let mut cursor = std::io::Cursor::new(empty);
+            let mut buf = BytesMut::from(raw);
+            let result: Protocol = sniff_protocol(&mut cursor, &mut buf).await.unwrap();
+            assert_eq!(
+                result,
+                Protocol::Http1,
+                "expected HTTP/1 for {:?}",
+                String::from_utf8_lossy(&raw[..10])
+            );
+        }
     }
 }
 
@@ -3122,6 +3218,7 @@ mod fastcgi_protocol_tests {
             logger,
             "GET",
             "127.0.0.1",
+            None,
         )
         .await
         .unwrap();
@@ -3156,6 +3253,7 @@ mod fastcgi_protocol_tests {
             logger,
             "GET",
             "10.0.0.1",
+            None,
         )
         .await
         .unwrap();
@@ -3195,6 +3293,7 @@ mod fastcgi_protocol_tests {
             logger,
             "POST",
             "192.168.1.1",
+            None,
         )
         .await;
 
@@ -3239,6 +3338,7 @@ mod uwsgi_protocol_tests {
             logger,
             "GET",
             "127.0.0.1",
+            false,
         )
         .await
         .unwrap();
@@ -3276,6 +3376,7 @@ mod uwsgi_protocol_tests {
             logger,
             "GET",
             "10.1.2.3",
+            false,
         )
         .await;
 
@@ -3328,6 +3429,7 @@ mod uwsgi_protocol_tests {
             logger,
             "POST",
             "1.2.3.4",
+            false,
         )
         .await;
 
@@ -3428,6 +3530,8 @@ mod tcp_proxy_integration_tests {
             ai_load_balancer::proxy::tcp::start_tcp_proxy(
                 &proxy_addr.to_string(),
                 upstreams_clone,
+                "default".to_string(),
+                ai_load_balancer::proxy::realip::TrustedProxies::from_cidrs(&[]),
                 shutdown_clone,
             )
             .await;
@@ -3477,6 +3581,8 @@ mod tcp_proxy_integration_tests {
             ai_load_balancer::proxy::tcp::start_tcp_proxy(
                 &proxy_addr.to_string(),
                 upstreams,
+                "default".to_string(),
+                ai_load_balancer::proxy::realip::TrustedProxies::from_cidrs(&[]),
                 shutdown_clone,
             )
             .await;
@@ -3526,6 +3632,8 @@ mod tcp_proxy_integration_tests {
             ai_load_balancer::proxy::tcp::start_tcp_proxy(
                 &proxy_addr.to_string(),
                 upstreams,
+                "default".to_string(),
+                ai_load_balancer::proxy::realip::TrustedProxies::from_cidrs(&[]),
                 shutdown_clone,
             )
             .await;

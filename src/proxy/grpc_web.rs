@@ -31,6 +31,34 @@ pub fn is_grpc_web<T>(req: &Request<T>) -> bool {
         .unwrap_or(false)
 }
 
+/// Detects a browser's CORS preflight for a gRPC-Web call.
+///
+/// A preflight is an `OPTIONS` request that carries **no body and no gRPC-Web
+/// `Content-Type`** — the browser is asking permission before it sends the real
+/// request, so it announces the upcoming headers in `Access-Control-Request-*`
+/// instead. Gating the preflight on `is_grpc_web()` (a `Content-Type` check)
+/// therefore never fired for an actual browser: the preflight was proxied
+/// upstream and the browser blocked the real call. The HTTP/3 path already
+/// checked `Access-Control-Request-Headers`; this brings HTTP/1 and HTTP/2 in
+/// line.
+pub fn is_grpc_web_preflight<T>(req: &Request<T>) -> bool {
+    if *req.method() != hyper::Method::OPTIONS {
+        return false;
+    }
+    // Still honour the content-type form — non-browser clients do send it.
+    if is_grpc_web(req) {
+        return true;
+    }
+    req.headers()
+        .get("access-control-request-headers")
+        .and_then(|v| v.to_str().ok())
+        .map(|h| {
+            let h = h.to_ascii_lowercase();
+            h.contains("grpc-web") || h.contains("x-grpc-web") || h.contains("grpc-timeout")
+        })
+        .unwrap_or(false)
+}
+
 /// Translates a gRPC-Web request into a standard gRPC (HTTP/2) request.
 ///
 /// - Strips the `grpc-web` content type prefix → `application/grpc`

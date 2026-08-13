@@ -75,12 +75,18 @@ impl IpReputationManager {
 
     /// Increments the strike count for an IP locally without broadcasting.
     pub fn add_strike_local(&self, ip: &str, severity: u32) {
-        let mut entry = self
-            .strikes
-            .entry(ip.to_string())
-            .or_insert((0, Instant::now()));
+        let now = Instant::now();
+        let mut entry = self.strikes.entry(ip.to_string()).or_insert((0, now));
+
+        // Apply decay here too, not just in `is_banned`: strikes also arrive from
+        // the ML fraud engine and the Redis pub/sub subscriber, neither of which
+        // goes through an `is_banned` check first.
+        if entry.0 < self.ban_threshold && entry.1.elapsed().as_secs() >= self.ban_duration_secs {
+            entry.0 = 0;
+        }
+
         entry.0 = entry.0.saturating_add(severity);
-        entry.1 = Instant::now();
+        entry.1 = now;
     }
 
     /// Increments the strike count for an IP by the given severity amount.
@@ -109,9 +115,11 @@ impl IpReputationManager {
     pub fn is_banned(&self, ip: &str) -> bool {
         if let Some(entry) = self.strikes.get(ip) {
             let (count, last_time) = *entry;
+            let elapsed = last_time.elapsed().as_secs();
+
             if count >= self.ban_threshold {
                 // Check if the ban has expired
-                if last_time.elapsed().as_secs() >= self.ban_duration_secs {
+                if elapsed >= self.ban_duration_secs {
                     // Ban expired — clear strikes and allow
                     drop(entry);
                     self.strikes.remove(ip);
@@ -123,6 +131,20 @@ impl IpReputationManager {
                     return false;
                 }
                 return true; // Still banned
+            }
+
+            // Below the threshold: strikes decay after the same quiet period as a
+            // ban lasts. Without this, partial strikes were kept for the lifetime
+            // of the process, so an IP that tripped a rule once months ago stayed
+            // permanently closer to a ban than a first-time visitor.
+            if elapsed >= self.ban_duration_secs {
+                drop(entry);
+                self.strikes.remove(ip);
+                tracing::debug!(
+                    "IP {} strikes decayed after {}s without a violation.",
+                    ip,
+                    self.ban_duration_secs
+                );
             }
         }
         false

@@ -478,85 +478,99 @@ fn parse_server_block(tokens: &[String], mut i: usize) -> Result<(ServerBlock, u
 /// Returns true if `token` is a known server-level directive that follows the
 /// `key value;` pattern.  Keep this list in sync with the directives consumed
 /// by `try_load_config` in `config/mod.rs`.
+///
+/// **The table MUST stay sorted** — lookup is a binary search, and binary search
+/// over unsorted input silently fails to find entries rather than erroring. Three
+/// out-of-order pairs once made `global_rate_limit`, `gslb_policy`,
+/// `ml_fraud_model_path`, `ml_fraud_mode`, `webtransport` and
+/// `websocket_idle_timeout` unusable: every config naming one of them was
+/// rejected with "Unknown directive", so the features behind them could not be
+/// switched on at all. `test_known_server_directives_are_sorted` guards this.
+const KNOWN_SERVER_DIRECTIVES: &[&str] = &[
+    "ai_algorithm",
+    "ai_epsilon",
+    "ai_temperature",
+    "ai_thompson_threshold_ms",
+    "ai_ucb_constant",
+    "alt_svc",
+    "auth_request",
+    "auto_ssl_cache_dir",
+    "auto_ssl_domain",
+    "auto_ssl_email",
+    "brotli",
+    "cache_disk_path",
+    "captcha_challenge_threshold",
+    "captcha_provider",
+    "captcha_secret_key",
+    "captcha_site_key",
+    "client_max_body_size",
+    "etcd_endpoints",
+    "geo_allow",
+    "geo_deny",
+    "geoip_db",
+    "global_rate_limit",
+    "gossip_bind",
+    "gossip_interval_ms",
+    "gossip_seed_peers",
+    "gslb_max_latency_ms",
+    "gslb_policy",
+    "hsts_max_age",
+    "imap_bind",
+    "k8s_ingress_class",
+    "k8s_ingress_enabled",
+    "keyval_ttl_secs",
+    "listen_quic",
+    "listen_udp",
+    "mail_backend_starttls",
+    "mail_upstream_pool",
+    "mail_verify_backend_tls",
+    "mirror",
+    "mirror_pool",
+    "ml_fraud_mode",
+    "ml_fraud_model_path",
+    "node_id",
+    "ocsp_responder_url",
+    "otel_endpoint",
+    "pop3_bind",
+    "proxy_connect_timeout",
+    "proxy_next_upstream_timeout",
+    "proxy_next_upstream_tries",
+    "proxy_proto_v2",
+    "proxy_read_timeout",
+    "rate_limit_burst",
+    "rate_limit_per_ip",
+    "rate_limit_retry_after",
+    "redis_url",
+    "rhai_script",
+    "room_idle_timeout",
+    "shutdown_timeout",
+    "smtp_bind",
+    "ssl_ciphers",
+    "ssl_client_certificate",
+    "ssl_min_version",
+    "tcp_upstream_pool",
+    "tls_ca_cert_path",
+    "tls_ciphers",
+    "tls_min_version",
+    "trusted_proxy",
+    "turn_credential",
+    "turn_username",
+    "udp_session_timeout",
+    "udp_upstream_pool",
+    "waf_auto_ban_duration",
+    "waf_auto_ban_threshold",
+    "waf_enabled",
+    "waf_policy_path",
+    "wasm_plugin_config",
+    "websocket_idle_timeout",
+    "webtransport",
+    "zone_burst",
+    "zone_max_connections",
+    "zone_rate_per_sec",
+];
+
 fn is_known_server_directive(token: &str) -> bool {
-    const KNOWN: &[&str] = &[
-        "ai_algorithm",
-        "ai_epsilon",
-        "ai_temperature",
-        "ai_thompson_threshold_ms",
-        "ai_ucb_constant",
-        "auth_request",
-        "auto_ssl_cache_dir",
-        "auto_ssl_domain",
-        "auto_ssl_email",
-        "brotli",
-        "cache_disk_path",
-        "captcha_challenge_threshold",
-        "captcha_provider",
-        "captcha_secret_key",
-        "captcha_site_key",
-        "client_max_body_size",
-        "etcd_endpoints",
-        "geo_allow",
-        "geo_deny",
-        "geoip_db",
-        "gossip_bind",
-        "gossip_interval_ms",
-        "gossip_seed_peers",
-        "gslb_max_latency_ms",
-        "gslb_policy",
-        "global_rate_limit",
-        "hsts_max_age",
-        "imap_bind",
-        "k8s_ingress_class",
-        "k8s_ingress_enabled",
-        "keyval_ttl_secs",
-        "listen_quic",
-        "listen_udp",
-        "mail_backend_starttls",
-        "mail_upstream_pool",
-        "mail_verify_backend_tls",
-        "mirror",
-        "ml_fraud_model_path",
-        "ml_fraud_mode",
-        "node_id",
-        "ocsp_responder_url",
-        "pop3_bind",
-        "proxy_connect_timeout",
-        "proxy_next_upstream_timeout",
-        "proxy_next_upstream_tries",
-        "proxy_proto_v2",
-        "proxy_read_timeout",
-        "rate_limit_burst",
-        "rate_limit_per_ip",
-        "rate_limit_retry_after",
-        "redis_url",
-        "rhai_script",
-        "room_idle_timeout",
-        "shutdown_timeout",
-        "smtp_bind",
-        "ssl_ciphers",
-        "ssl_client_certificate",
-        "ssl_min_version",
-        "tls_ca_cert_path",
-        "tls_ciphers",
-        "tls_min_version",
-        "trusted_proxy",
-        "turn_credential",
-        "turn_username",
-        "udp_session_timeout",
-        "waf_auto_ban_duration",
-        "waf_auto_ban_threshold",
-        "waf_enabled",
-        "waf_policy_path",
-        "wasm_plugin_config",
-        "webtransport",
-        "websocket_idle_timeout",
-        "zone_burst",
-        "zone_max_connections",
-        "zone_rate_per_sec",
-    ];
-    KNOWN.binary_search(&token).is_ok()
+    KNOWN_SERVER_DIRECTIVES.binary_search(&token).is_ok()
 }
 
 /// Parses the contents inside a `route /path { ... }` block.
@@ -725,6 +739,35 @@ fn parse_route_block(
         if token == "auth_oauth_client_secret" {
             expect_directive_value_semicolon(tokens, i, "auth_oauth_client_secret")?;
             block.auth_oauth_client_secret = Some(tokens[i + 1].clone());
+            i += 3;
+            continue;
+        }
+
+        // Parse: `auth_jwks_uri https://idp.example.com/.well-known/jwks.json;`
+        //
+        // `RouteConfig` has carried this field — and `config/mod.rs` has copied it
+        // — since JWKS validation was written, but no parser branch ever set it,
+        // so JWKS-backed JWT validation could not be turned on from a config file.
+        if token == "auth_jwks_uri" {
+            expect_directive_value_semicolon(tokens, i, "auth_jwks_uri")?;
+            block.auth_jwks_uri = Some(tokens[i + 1].clone());
+            i += 3;
+            continue;
+        }
+
+        // Parse: `auth_oidc_issuer https://idp.example.com;`
+        // Same story as `auth_jwks_uri` — field present, parser branch missing.
+        if token == "auth_oidc_issuer" {
+            expect_directive_value_semicolon(tokens, i, "auth_oidc_issuer")?;
+            block.auth_oidc_issuer = Some(tokens[i + 1].clone());
+            i += 3;
+            continue;
+        }
+
+        // Parse: `auth_oidc_cookie_name phalanx_session;`
+        if token == "auth_oidc_cookie_name" {
+            expect_directive_value_semicolon(tokens, i, "auth_oidc_cookie_name")?;
+            block.auth_oidc_cookie_name = Some(tokens[i + 1].clone());
             i += 3;
             continue;
         }
@@ -2032,5 +2075,114 @@ mod tests {
         "#;
         let result = parse_phalanx_config(cfg);
         assert!(result.is_err());
+    }
+
+    /// The directive table is looked up with `binary_search`, which silently
+    /// fails to find entries when the slice is not sorted. Three out-of-order
+    /// pairs once made `global_rate_limit`, `gslb_policy`, `ml_fraud_model_path`,
+    /// `ml_fraud_mode`, `webtransport` and `websocket_idle_timeout` impossible to
+    /// use — every config naming one was rejected as an unknown directive, so the
+    /// features behind them could not be enabled at all.
+    #[test]
+    fn test_known_server_directives_are_sorted() {
+        let mut sorted = KNOWN_SERVER_DIRECTIVES.to_vec();
+        sorted.sort_unstable();
+        assert_eq!(
+            KNOWN_SERVER_DIRECTIVES.to_vec(),
+            sorted,
+            "KNOWN_SERVER_DIRECTIVES must stay sorted for binary_search to work"
+        );
+    }
+
+    /// Guards the same bug from the other side: every entry in the table must be
+    /// findable through the public predicate.
+    #[test]
+    fn test_every_known_server_directive_is_reachable() {
+        let unreachable: Vec<_> = KNOWN_SERVER_DIRECTIVES
+            .iter()
+            .filter(|d| !is_known_server_directive(d))
+            .collect();
+        assert!(
+            unreachable.is_empty(),
+            "these directives are listed but rejected by the parser: {:?}",
+            unreachable
+        );
+    }
+
+    /// The six directives the unsorted table used to swallow, exercised through a
+    /// real config parse rather than the lookup helper alone.
+    #[test]
+    fn test_previously_unreachable_directives_parse() {
+        let cfg = r#"
+            http {
+                upstream default { server 127.0.0.1:8080; }
+                server {
+                    listen 8080;
+                    global_rate_limit 5000;
+                    gslb_policy geo;
+                    ml_fraud_model_path /etc/phalanx/model.onnx;
+                    ml_fraud_mode active;
+                    webtransport on;
+                    websocket_idle_timeout 120;
+                    otel_endpoint http://127.0.0.1:4317;
+                    alt_svc h3=":8443";
+                    tcp_upstream_pool l4pool;
+                    udp_upstream_pool dnspool;
+                    route / { upstream default; }
+                }
+            }
+        "#;
+        let parsed = parse_phalanx_config(cfg).expect("config with these directives must parse");
+        let server = &parsed.http.unwrap().servers[0];
+        for key in [
+            "global_rate_limit",
+            "gslb_policy",
+            "ml_fraud_model_path",
+            "ml_fraud_mode",
+            "webtransport",
+            "websocket_idle_timeout",
+            "otel_endpoint",
+            "alt_svc",
+            "tcp_upstream_pool",
+            "udp_upstream_pool",
+        ] {
+            assert!(
+                server.directives.contains_key(key),
+                "directive {} did not reach the server block",
+                key
+            );
+        }
+    }
+
+    /// JWKS and OIDC had `RouteConfig` fields and consumers but no parser branch,
+    /// so a config following the documented syntax failed to start.
+    #[test]
+    fn test_jwks_and_oidc_route_directives_parse() {
+        let cfg = r#"
+            http {
+                upstream default { server 127.0.0.1:8080; }
+                server {
+                    listen 8080;
+                    route /secure {
+                        upstream default;
+                        auth_jwks_uri https://idp.example.com/jwks.json;
+                        auth_oidc_issuer https://idp.example.com;
+                        auth_oidc_cookie_name phalanx_session;
+                    }
+                }
+            }
+        "#;
+        let parsed = parse_phalanx_config(cfg).expect("JWKS/OIDC route directives must parse");
+        let server = &parsed.http.unwrap().servers[0];
+        let route = server.routes.get("/secure").expect("route /secure");
+        assert_eq!(
+            route.auth_jwks_uri.as_deref(),
+            Some("https://idp.example.com/jwks.json")
+        );
+        assert_eq!(
+            route.auth_oidc_issuer.as_deref(),
+            Some("https://idp.example.com")
+        );
+        assert_eq!(route.auth_oidc_cookie_name.as_deref(), Some("phalanx_session"));
     }
 }

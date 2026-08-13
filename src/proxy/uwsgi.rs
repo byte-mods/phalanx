@@ -67,6 +67,9 @@ pub async fn serve_uwsgi<T>(
     access_logger: Arc<AccessLogger>,
     method_str: &str,
     ip_str: &str,
+    // True when the client connection is TLS — sets `wsgi.url_scheme`, which
+    // WSGI apps use to build absolute URLs and decide on HTTPS redirects.
+    is_tls: bool,
 ) -> Result<Response<BoxBody<Bytes, hyper::Error>>, hyper::Error>
 where
     T: hyper::body::Body<Data = Bytes> + Send + Sync + Unpin + 'static,
@@ -124,18 +127,79 @@ where
 
     // Construct the uWSGI variable dictionary from HTTP request metadata.
     // Each key-value pair maps to a CGI environment variable.
+    let query_string = parts.uri.query().unwrap_or("");
     let mut params = std::collections::HashMap::new();
     params.insert("REQUEST_METHOD".to_string(), method_str.to_string());
-    params.insert("REQUEST_URI".to_string(), req_path.to_string());
-    params.insert("PATH_INFO".to_string(), req_path.to_string());
+    // REQUEST_URI carries the original target *with* the query string; PATH_INFO
+    // is the decoded path alone (PEP 3333).
     params.insert(
-        "QUERY_STRING".to_string(),
-        parts.uri.query().unwrap_or("").to_string(),
+        "REQUEST_URI".to_string(),
+        if query_string.is_empty() {
+            req_path.to_string()
+        } else {
+            format!("{}?{}", req_path, query_string)
+        },
     );
-    params.insert("SERVER_PROTOCOL".to_string(), "HTTP/1.1".to_string());
+    params.insert("PATH_INFO".to_string(), req_path.to_string());
+    // SCRIPT_NAME is required by PEP 3333. WSGI apps join SCRIPT_NAME +
+    // PATH_INFO to reconstruct the URL; an absent key (rather than an empty
+    // string) makes strict servers and URL-building helpers raise.
+    params.insert("SCRIPT_NAME".to_string(), String::new());
+    params.insert("QUERY_STRING".to_string(), query_string.to_string());
+    params.insert(
+        "SERVER_PROTOCOL".to_string(),
+        match parts.version {
+            hyper::Version::HTTP_10 => "HTTP/1.0",
+            hyper::Version::HTTP_2 => "HTTP/2.0",
+            _ => "HTTP/1.1",
+        }
+        .to_string(),
+    );
     params.insert("REMOTE_ADDR".to_string(), ip_str.to_string());
-    params.insert("SERVER_NAME".to_string(), "phalanx".to_string());
-    params.insert("SERVER_PORT".to_string(), "80".to_string());
+    params.insert(
+        "wsgi.url_scheme".to_string(),
+        if is_tls { "https" } else { "http" }.to_string(),
+    );
+
+    // SERVER_NAME / SERVER_PORT derive from the Host header. They were
+    // previously hardcoded to "phalanx" and "80", so an app that built absolute
+    // URLs or enforced a canonical host saw a name and port that did not exist.
+    let host_header = parts
+        .headers
+        .get(hyper::header::HOST)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    let (server_name, server_port) = match host_header.rsplit_once(':') {
+        // Guard against IPv6 literals like `[::1]` carrying no port.
+        Some((n, p)) if !p.is_empty() && p.chars().all(|c| c.is_ascii_digit()) => (n, p),
+        _ => (
+            host_header,
+            if is_tls { "443" } else { "80" },
+        ),
+    };
+    if !server_name.is_empty() {
+        params.insert("SERVER_NAME".to_string(), server_name.to_string());
+    }
+    params.insert("SERVER_PORT".to_string(), server_port.to_string());
+
+    // CONTENT_LENGTH / CONTENT_TYPE are WSGI variables in their own right, not
+    // `HTTP_*` copies. `environ['CONTENT_LENGTH']` is how a WSGI app knows how
+    // many bytes to read from `wsgi.input` — without it the body was delivered
+    // but frameworks read nothing, so `request.POST` / `request.body` were empty.
+    if let Some(ct) = parts
+        .headers
+        .get(hyper::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+    {
+        params.insert("CONTENT_TYPE".to_string(), ct.to_string());
+    }
+    if let Some(cl) = parts
+        .headers
+        .get(hyper::header::CONTENT_LENGTH)
+        .and_then(|v| v.to_str().ok())
+    {
+        params.insert("CONTENT_LENGTH".to_string(), cl.to_string());
+    }
 
     for (name, value) in parts.headers.iter() {
         let key = format!("HTTP_{}", name.as_str().to_uppercase().replace("-", "_"));

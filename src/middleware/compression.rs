@@ -10,11 +10,75 @@ use flate2::write::GzEncoder;
 use std::io::Write;
 use tracing::debug;
 
+/// Returns the qvalue the client assigned to `coding` in an `Accept-Encoding`
+/// header, per RFC 9110 §12.5.3.
+///
+/// The header is a comma-separated list of `codings [;q=qvalue]`. An entry
+/// naming the coding exactly takes precedence over a `*` wildcard entry;
+/// `None` means the client listed neither. A qvalue of `0` means "not
+/// acceptable" — the coding MUST NOT be used.
+///
+/// Parsing tokens (rather than substring-matching the raw header) matters:
+/// `contains("gzip")` also fires on `notgzipatall`, and `contains("br")` fires
+/// on any value containing those two letters, e.g. `libra`.
+pub fn encoding_qvalue(accept_encoding: &str, coding: &str) -> Option<f32> {
+    let mut exact: Option<f32> = None;
+    let mut wildcard: Option<f32> = None;
+
+    for entry in accept_encoding.split(',') {
+        let entry = entry.trim();
+        if entry.is_empty() {
+            continue;
+        }
+        let mut parts = entry.split(';');
+        let token = parts.next().unwrap_or("").trim().to_ascii_lowercase();
+
+        // Default qvalue is 1 when no q parameter is present.
+        let mut q = 1.0f32;
+        for param in parts {
+            let param = param.trim();
+            let (name, value) = match param.split_once('=') {
+                Some(kv) => kv,
+                None => continue,
+            };
+            if name.trim().eq_ignore_ascii_case("q") {
+                q = value.trim().parse::<f32>().unwrap_or(1.0);
+            }
+        }
+
+        if token == coding {
+            exact = Some(exact.map_or(q, |cur: f32| cur.max(q)));
+        } else if token == "*" {
+            wildcard = Some(wildcard.map_or(q, |cur: f32| cur.max(q)));
+        }
+    }
+
+    exact.or(wildcard)
+}
+
+/// Returns `true` if the client is willing to receive `coding`.
+///
+/// A missing `Accept-Encoding` header is treated as "do not compress". RFC 9110
+/// permits any coding in that case, but staying uncompressed is always a valid
+/// response and avoids surprising clients that omit the header.
+pub fn accepts_encoding(accept_encoding: Option<&str>, coding: &str) -> bool {
+    match accept_encoding {
+        Some(ae) => matches!(encoding_qvalue(ae, coding), Some(q) if q > 0.0),
+        None => false,
+    }
+}
+
 /// Checks if the client accepts gzip encoding.
 pub fn accepts_gzip(accept_encoding: Option<&str>) -> bool {
-    accept_encoding
-        .map(|ae| ae.to_lowercase().contains("gzip"))
-        .unwrap_or(false)
+    match accept_encoding {
+        // `x-gzip` is a deprecated alias for `gzip` (RFC 9110 §8.4.1.3); only
+        // consult it when the client did not name `gzip` explicitly.
+        Some(ae) => {
+            let q = encoding_qvalue(ae, "gzip").or_else(|| encoding_qvalue(ae, "x-gzip"));
+            matches!(q, Some(q) if q > 0.0)
+        }
+        None => false,
+    }
 }
 
 /// Checks if the content type is compressible (text/*, application/json, application/javascript, etc.)
@@ -103,6 +167,54 @@ mod tests {
     #[test]
     fn test_accepts_gzip_case_insensitive() {
         assert!(accepts_gzip(Some("GZIP")));
+    }
+
+    // ── RFC 9110 §12.5.3 qvalue / token handling ────────────────────────────
+
+    #[test]
+    fn test_qvalue_zero_refuses_coding() {
+        // "A qvalue of 0 means 'not acceptable'."
+        assert!(!accepts_gzip(Some("gzip;q=0")));
+        assert!(!accepts_gzip(Some("gzip;q=0.0")));
+        assert!(!accepts_gzip(Some("gzip; q=0")));
+        assert!(!accepts_encoding(Some("br;q=0"), "br"));
+    }
+
+    #[test]
+    fn test_qvalue_nonzero_accepts_coding() {
+        assert!(accepts_gzip(Some("gzip;q=1")));
+        assert!(accepts_gzip(Some("gzip;q=0.5")));
+        assert!(accepts_gzip(Some("deflate;q=0.5, gzip;q=0.9")));
+    }
+
+    #[test]
+    fn test_substring_tokens_do_not_match() {
+        // Previously `contains("gzip")` / `contains("br")` false-positived here.
+        assert!(!accepts_gzip(Some("notgzipatall")));
+        assert!(!accepts_encoding(Some("libra"), "br"));
+        assert!(!accepts_encoding(Some("brotli-not-real"), "br"));
+    }
+
+    #[test]
+    fn test_wildcard_entry() {
+        assert!(accepts_gzip(Some("*")));
+        assert!(accepts_gzip(Some("deflate, *;q=0.5")));
+        assert!(!accepts_gzip(Some("*;q=0")));
+        // An exact entry overrides the wildcard, in both directions.
+        assert!(!accepts_gzip(Some("*;q=1, gzip;q=0")));
+        assert!(accepts_gzip(Some("*;q=0, gzip;q=1")));
+    }
+
+    #[test]
+    fn test_x_gzip_alias() {
+        assert!(accepts_gzip(Some("x-gzip")));
+        assert!(!accepts_gzip(Some("x-gzip;q=0")));
+    }
+
+    #[test]
+    fn test_encoding_qvalue_absent_coding() {
+        assert_eq!(encoding_qvalue("deflate", "gzip"), None);
+        assert_eq!(encoding_qvalue("gzip", "gzip"), Some(1.0));
     }
 
     #[test]

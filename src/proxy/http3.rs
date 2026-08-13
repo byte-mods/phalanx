@@ -384,6 +384,16 @@ pub async fn start_http3_proxy(
                     // operator has opted in via `webtransport on;`.
                     let mut h3_builder = h3::server::builder();
                     h3_builder.enable_extended_connect(true);
+                    // Disable GREASE (RFC 9114 §7.2.8). `h3` appends a reserved
+                    // frame after the DATA frame of the first response on each
+                    // connection. That is legal — receivers MUST ignore reserved
+                    // frames — but a client that tracks stream end by "last frame
+                    // parsed" then never sees the response terminate, so the very
+                    // first request on every QUIC connection hangs until timeout.
+                    // Verified against aioquic: with GREASE on, `stream_ended` is
+                    // never set; with it off, the response completes normally.
+                    // Interop beats exercising a peer's extensibility handling.
+                    h3_builder.send_grease(false);
                     if config_c.webtransport_enabled {
                         h3_builder
                             .enable_webtransport(true)
@@ -780,45 +790,12 @@ async fn handle_h3_request(
             }
         }
     }
-    let request_body = match read_h3_request_body(&mut stream, max_body).await {
-        Ok(Some(body)) => body,
-        Ok(None) => {
-            warn!(
-                "HTTP/3 request body exceeded limit {} from {}",
-                max_body, ip_str
-            );
-            send_h3_error(&mut stream, StatusCode::PAYLOAD_TOO_LARGE).await;
-            return;
-        }
-        Err(e) => {
-            debug!("HTTP/3 request body read failed: {}", e);
-            send_h3_error(&mut stream, StatusCode::BAD_REQUEST).await;
-            return;
-        }
-    };
-
-    // ── CAPTCHA verify endpoint (short-circuit) ──
-    if path == "/__phalanx/captcha/verify" {
-        handle_h3_captcha_verify_request(
-            &mut stream,
-            &method,
-            &request_body,
-            &ip_str,
-            captcha_manager,
-        )
-        .await;
-        return;
-    }
-
-    // ── gRPC-Web CORS preflight (browser sends OPTIONS before grpc-web POST) ──
-    // Short-circuits before WAF / auth / route resolution because preflights
-    // are protocol-level, not application-level. Same response shape as
-    // `grpc_web::cors_preflight_response()` for HTTP/1.
-    if is_h3_grpc_web_preflight(&method, req.headers()) {
-        send_h3_grpc_web_preflight(&mut stream).await;
-        return;
-    }
-
+    // ── Extended CONNECT / WebTransport ──────────────────────────────────
+    // Must be answered *before* the request body is read. A CONNECT stream is
+    // the tunnel: the client keeps it open and never half-closes, so
+    // `read_h3_request_body` blocks forever waiting for an end-of-stream that
+    // will not come. The 501 below was therefore only ever delivered to a
+    // client that had already given up on the tunnel and closed its side.
     // ── WebTransport / Extended CONNECT fallback ─────────────────────────
     // The `:protocol = webtransport` case is handled before this function
     // is ever called — `serve_h3_connection` peeks at the resolved request
@@ -917,6 +894,46 @@ async fn handle_h3_request(
             hyper::header::HeaderValue::from_static(status_value),
         )
         .await;
+        return;
+    }
+
+    let request_body = match read_h3_request_body(&mut stream, max_body).await {
+        Ok(Some(body)) => body,
+        Ok(None) => {
+            warn!(
+                "HTTP/3 request body exceeded limit {} from {}",
+                max_body, ip_str
+            );
+            send_h3_error(&mut stream, StatusCode::PAYLOAD_TOO_LARGE).await;
+            return;
+        }
+        Err(e) => {
+            debug!("HTTP/3 request body read failed: {}", e);
+            send_h3_error(&mut stream, StatusCode::BAD_REQUEST).await;
+            return;
+        }
+    };
+
+
+    // ── CAPTCHA verify endpoint (short-circuit) ──
+    if path == "/__phalanx/captcha/verify" {
+        handle_h3_captcha_verify_request(
+            &mut stream,
+            &method,
+            &request_body,
+            &ip_str,
+            captcha_manager,
+        )
+        .await;
+        return;
+    }
+
+    // ── gRPC-Web CORS preflight (browser sends OPTIONS before grpc-web POST) ──
+    // Short-circuits before WAF / auth / route resolution because preflights
+    // are protocol-level, not application-level. Same response shape as
+    // `grpc_web::cors_preflight_response()` for HTTP/1.
+    if is_h3_grpc_web_preflight(&method, req.headers()) {
+        send_h3_grpc_web_preflight(&mut stream).await;
         return;
     }
 
@@ -1659,6 +1676,7 @@ async fn handle_h3_request(
         }
         body.freeze()
     };
+
 
     // gRPC-Web → gRPC-Web response translation: append a length-prefixed
     // trailer frame built from the upstream's `grpc-status`/`grpc-message`
@@ -2645,11 +2663,19 @@ fn build_quic_tls_config(app_config: &AppConfig) -> Option<rustls::ServerConfig>
         (vec![cert_der], key_der)
     };
 
-    let mut tls_config = rustls::ServerConfig::builder()
-        .with_no_client_auth()
-        .with_single_cert(cert_chain, private_key)
-        .map_err(|e| error!("QUIC TLS config error: {}", e))
-        .ok()?;
+    // Build from an explicit provider rather than the process default. Relying on
+    // the default made this a hard panic whenever `install_default_crypto_provider`
+    // had not run, which took the whole HTTP/3 listener down at startup.
+    let mut tls_config = rustls::ServerConfig::builder_with_provider(std::sync::Arc::new(
+        rustls::crypto::ring::default_provider(),
+    ))
+    .with_safe_default_protocol_versions()
+    .map_err(|e| error!("QUIC TLS protocol version error: {}", e))
+    .ok()?
+    .with_no_client_auth()
+    .with_single_cert(cert_chain, private_key)
+    .map_err(|e| error!("QUIC TLS config error: {}", e))
+    .ok()?;
 
     // HTTP/3 ALPN identifier
     tls_config.alpn_protocols = vec![b"h3".to_vec()];
@@ -2751,13 +2777,13 @@ mod tests {
     }
 
     /// Install the rustls process-level CryptoProvider exactly once.
-    /// Required because `build_quic_tls_config` uses the default provider,
-    /// which is installed lazily and panics if no provider has been chosen.
+    ///
+    /// Delegates to the same helper the binary calls at startup. Keeping a private
+    /// copy here is what previously hid the production defect: the tests installed
+    /// a provider that `main` never did, so `build_quic_tls_config` passed under
+    /// test and panicked in the real listener.
     fn ensure_crypto_provider() {
-        static INIT: std::sync::Once = std::sync::Once::new();
-        INIT.call_once(|| {
-            let _ = rustls::crypto::ring::default_provider().install_default();
-        });
+        crate::proxy::tls::install_default_crypto_provider();
     }
 
     #[test]

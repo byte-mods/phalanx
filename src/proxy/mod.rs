@@ -51,7 +51,7 @@ use std::task::{Context, Poll};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::{TcpListener, TcpStream};
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, error, info, warn};
+use tracing::{Instrument, debug, error, info, warn};
 
 use crate::middleware::compression;
 use arc_swap::ArcSwap;
@@ -231,6 +231,160 @@ fn headers_to_hashmap(header_map: &hyper::HeaderMap) -> std::collections::HashMa
         .iter()
         .map(|(k, v)| (k.as_str().to_string(), v.to_str().unwrap_or("").to_string()))
         .collect()
+}
+
+/// Re-point `req` at `new_path`, preserving its query string.
+///
+/// The rewrite engine and `RewritePath` hooks update the pipeline's local
+/// `path`, which is what drives route matching. The request that actually gets
+/// proxied carries its own URI, so it has to be updated too — otherwise the
+/// backend receives the client's original request target and an nginx-style
+/// `rewrite … last|break` has no visible effect upstream.
+///
+/// A rewrite rule that produces something unusable as a request target is
+/// logged and skipped rather than failing the request.
+
+/// Builds the per-request tracing span that the OpenTelemetry layer exports.
+///
+/// Returns a disabled span (`Span::none()`) unless an OTLP endpoint is
+/// configured, so the hot path pays nothing when tracing export is off.
+///
+/// This exists because the OTLP exporter had nothing to export: the layer was
+/// wired into the subscriber, but the codebase created no spans anywhere — only
+/// events — so a collector received an open connection and zero traces. Field
+/// names follow the OpenTelemetry HTTP semantic conventions.
+fn request_span<B>(
+    cfg: &crate::config::AppConfig,
+    req: &Request<B>,
+    protocol: &'static str,
+) -> tracing::Span {
+    if cfg.otel_endpoint.is_none() {
+        return tracing::Span::none();
+    }
+    tracing::info_span!(
+        "http.server.request",
+        otel.name = %format!("{} {}", req.method(), req.uri().path()),
+        "http.request.method" = %req.method(),
+        "url.path" = %req.uri().path(),
+        "url.query" = req.uri().query().unwrap_or(""),
+        "network.protocol.name" = protocol,
+        "http.response.status_code" = tracing::field::Empty,
+    )
+}
+
+fn apply_rewritten_path<B>(req: &mut Request<B>, new_path: &str) {
+    if req.uri().path() == new_path {
+        return;
+    }
+
+    // An origin-form target must begin with "/" (RFC 9112 §3.2.1). `PathAndQuery`
+    // happily parses an empty string, so without this guard a hook returning
+    // `"rewrite:"` — trivially easy to produce, since Rhai's `String::replace`
+    // mutates in place and returns unit — set an empty URI and Phalanx wrote
+    // `GET  HTTP/1.1` to the backend, which hyper rejected as "invalid HTTP
+    // version parsed" and the client saw a 502.
+    if !new_path.starts_with('/') {
+        warn!(
+            "Ignoring rewrite to {:?}: an origin-form request target must start with '/'",
+            new_path
+        );
+        return;
+    }
+
+    let target = match req.uri().query() {
+        Some(q) => format!("{}?{}", new_path, q),
+        None => new_path.to_string(),
+    };
+
+    let path_and_query = match target.parse::<hyper::http::uri::PathAndQuery>() {
+        Ok(pq) => pq,
+        Err(e) => {
+            warn!(
+                "Rewritten path {:?} is not a valid request target ({}); \
+                 forwarding the original URI unchanged",
+                target, e
+            );
+            return;
+        }
+    };
+
+    let mut parts = req.uri().clone().into_parts();
+    parts.path_and_query = Some(path_and_query);
+    match hyper::Uri::from_parts(parts) {
+        Ok(uri) => *req.uri_mut() = uri,
+        Err(e) => warn!(
+            "Could not rebuild upstream URI after rewrite to {:?}: {}",
+            new_path, e
+        ),
+    }
+}
+
+/// Rejects HTTP/1 requests whose framing or addressing is ambiguous.
+///
+/// A proxy is the wrong place to be lenient about these: when Phalanx and the
+/// next hop resolve an ambiguous message differently, the disagreement is a
+/// request-smuggling or host-confusion primitive rather than a cosmetic defect.
+///
+/// * **Missing `Host` on HTTP/1.1** (RFC 9112 §3.2) — a server MUST reject it.
+///   Forwarding it upstream also produced an invalid HTTP/1.1 request, since the
+///   backend then received no `Host` at all.
+/// * **Multiple `Host` fields** (RFC 9112 §3.2) — likewise a MUST-reject. Both
+///   values used to be forwarded verbatim, letting a client pick which host the
+///   backend (or a cache in front of it) keyed on.
+/// * **Both `Content-Length` and `Transfer-Encoding`** (RFC 9112 §6.1) — the
+///   classic CL.TE/TE.CL smuggling pair. Phalanx resolves it in favour of
+///   `Transfer-Encoding`, which is self-consistent, but a front proxy that
+///   prefers `Content-Length` would disagree and the two would desync.
+///
+/// Returns the status to answer with, or `None` when the request is well-formed.
+fn validate_http1_framing<B>(req: &Request<B>) -> Option<hyper::StatusCode> {
+    let headers = req.headers();
+
+    let host_count = headers.get_all(hyper::header::HOST).iter().count();
+    if host_count > 1 {
+        debug!("Rejecting request with {} Host headers", host_count);
+        return Some(hyper::StatusCode::BAD_REQUEST);
+    }
+    // HTTP/1.0 predates mandatory Host; only 1.1 and later require it.
+    if host_count == 0 && req.version() >= hyper::Version::HTTP_11 {
+        debug!("Rejecting HTTP/1.1 request with no Host header");
+        return Some(hyper::StatusCode::BAD_REQUEST);
+    }
+
+    if headers.contains_key(hyper::header::TRANSFER_ENCODING)
+        && headers.contains_key(hyper::header::CONTENT_LENGTH)
+    {
+        debug!("Rejecting request carrying both Transfer-Encoding and Content-Length");
+        return Some(hyper::StatusCode::BAD_REQUEST);
+    }
+
+    None
+}
+
+/// Reduce a request URI to origin-form (`/path?query`) for an HTTP/1 upstream hop.
+///
+/// RFC 9112 §3.2.1: a request sent directly to an origin server uses
+/// origin-form; absolute-form (`GET http://host/path HTTP/1.1`) is reserved for
+/// requests made *to* a proxy. HTTP/2 requests carry `:scheme` and `:authority`
+/// as pseudo-headers, so hyper reconstructs a full absolute URI — forwarding
+/// that verbatim makes the backend see an absolute-form request line, which
+/// many origin servers route on literally (404) or reject outright.
+fn normalize_origin_form<B>(req: &mut Request<B>) {
+    if req.uri().scheme().is_none() && req.uri().authority().is_none() {
+        return;
+    }
+    let path_and_query = req
+        .uri()
+        .path_and_query()
+        .cloned()
+        .unwrap_or_else(|| hyper::http::uri::PathAndQuery::from_static("/"));
+
+    let mut parts = hyper::http::uri::Parts::default();
+    parts.path_and_query = Some(path_and_query);
+    match hyper::Uri::from_parts(parts) {
+        Ok(uri) => *req.uri_mut() = uri,
+        Err(e) => debug!("Could not reduce request URI to origin-form: {}", e),
+    }
 }
 
 fn client_accepts_json(headers: &hyper::HeaderMap) -> bool {
@@ -527,11 +681,36 @@ pub async fn start_proxy(
 
             // Try to parse as PROXY Protocol v2. On success, override `peer` with
             // the real source address. On failure/mismatch, put all bytes back.
+            //
+            // The claimed address is only adopted when the *immediate* peer is
+            // allowed to speak for others — it is in `trusted_proxy`, or the
+            // operator opted the listener in with `proxy_proto_v2 on`. Adopting it
+            // unconditionally let any client that could reach the port choose its
+            // own apparent IP (verified: a loopback client claiming 8.8.8.8 was
+            // believed), which defeats IP bans, per-IP rate limits and geo rules.
+            // The header is still consumed either way, so framing stays correct;
+            // an untrusted sender simply keeps its socket address.
+            let pp2_cfg = config_clone.load();
+            let pp2_trusted = pp2_cfg.proxy_proto_v2
+                || realip::TrustedProxies::from_cidrs(&pp2_cfg.trusted_proxies)
+                    .is_trusted(&peer.ip());
             let (real_peer, remaining_bytes) = match proxy_proto_v2::parse_v2_header(&pp2_peek[..n])
             {
                 Ok((hdr, consumed)) => {
-                    let real_peer = hdr.src_addr.unwrap_or(peer);
-                    (real_peer, &pp2_peek[consumed..n])
+                    let claimed = hdr.src_addr.unwrap_or(peer);
+                    if pp2_trusted {
+                        (claimed, &pp2_peek[consumed..n])
+                    } else {
+                        warn!(
+                            "PROXY protocol v2 header from untrusted peer {} claimed source {} — \
+                             ignoring the claim. Add `trusted_proxy {}` or `proxy_proto_v2 on;` \
+                             if this peer is a real load balancer.",
+                            peer.ip(),
+                            claimed.ip(),
+                            peer.ip()
+                        );
+                        (peer, &pp2_peek[consumed..n])
+                    }
                 }
                 Err(proxy_proto_v2::ParseError::NotProxyProtocol) => {
                     // Not a PP2 connection — treat all peeked bytes as normal traffic
@@ -616,8 +795,9 @@ pub async fn start_proxy(
                         let bw_svc = Arc::clone(&bw_clone);
                         let oidc_svc = Arc::clone(&oidc_h1);
                         let dynamic_routes_svc = Arc::clone(&dynamic_routes_h1);
+                        let span = request_span(&cfg.load(), &req, "http/1.1");
                         async move {
-                            handle_http_request(
+                            let resp = handle_http_request(
                                 req,
                                 peer,
                                 upts,
@@ -639,13 +819,28 @@ pub async fn start_proxy(
                                 bw_svc,
                                 oidc_svc,
                                 dynamic_routes_svc,
+                                false,
                             )
-                            .await
+                            .await;
+                            if let Ok(ref r) = resp {
+                                tracing::Span::current()
+                                    .record("http.response.status_code", r.status().as_u16());
+                            }
+                            resp
                         }
+                        .instrument(span)
                     });
 
-                    // Start the Hyper HTTP/1 server logic
-                    if let Err(e) = http1::Builder::new().serve_connection(io, svc).await {
+                    // Start the Hyper HTTP/1 server logic.
+                    // `with_upgrades()` is required for 101 Switching Protocols:
+                    // without it `hyper::upgrade::on(&req)` fails with "upgrade
+                    // expected but low level API in use" and WebSocket tunnels
+                    // never establish.
+                    if let Err(e) = http1::Builder::new()
+                        .serve_connection(io, svc)
+                        .with_upgrades()
+                        .await
+                    {
                         debug!("Error serving HTTP/1 connection: {:?}", e);
                     }
                 }
@@ -673,8 +868,9 @@ pub async fn start_proxy(
                         let bw_svc = Arc::clone(&bw_clone);
                         let oidc_svc = Arc::clone(&oidc_h2);
                         let dynamic_routes_svc = Arc::clone(&dynamic_routes_h2);
+                        let span = request_span(&cfg.load(), &req, "http/2");
                         async move {
-                            handle_http2_request(
+                            let resp = handle_http2_request(
                                 req,
                                 peer,
                                 upts,
@@ -696,9 +892,16 @@ pub async fn start_proxy(
                                 bw_svc,
                                 oidc_svc,
                                 dynamic_routes_svc,
+                                false,
                             )
-                            .await
+                            .await;
+                            if let Ok(ref r) = resp {
+                                tracing::Span::current()
+                                    .record("http.response.status_code", r.status().as_u16());
+                            }
+                            resp
                         }
+                        .instrument(span)
                     });
 
                     // Start the Hyper HTTP/2 server logic
@@ -768,6 +971,7 @@ pub async fn start_proxy(
                                                 bw_svc,
                                                 oidc_svc,
                                                 dynamic_routes_svc,
+                                                true,
                                             )
                                             .await
                                         }
@@ -826,12 +1030,17 @@ pub async fn start_proxy(
                                                 bw_svc,
                                                 oidc_svc,
                                                 dynamic_routes_svc,
+                                                true,
                                             )
                                             .await
                                         }
                                     });
-                                    if let Err(e) =
-                                        http1::Builder::new().serve_connection(io, svc).await
+                                    // `with_upgrades()` so WSS (WebSocket over
+                                    // TLS) can complete its 101 upgrade.
+                                    if let Err(e) = http1::Builder::new()
+                                        .serve_connection(io, svc)
+                                        .with_upgrades()
+                                        .await
                                     {
                                         debug!("Error serving TLS HTTP/1 connection: {:?}", e);
                                     }
@@ -932,8 +1141,18 @@ async fn handle_http_request(
     bandwidth: Arc<crate::telemetry::bandwidth::BandwidthTracker>,
     oidc_sessions: crate::auth::oidc::OidcSessionStore,
     dynamic_routes: Arc<dashmap::DashMap<String, crate::config::RouteConfig>>,
+    // True when this connection was accepted over TLS. Decides the
+    // `X-Forwarded-Proto` value sent upstream — backends rely on it to build
+    // absolute URLs and to decide whether to redirect to HTTPS.
+    is_tls: bool,
 ) -> Result<Response<BoxBody<Bytes, hyper::Error>>, hyper::Error> {
     let app_config = app_config.load_full();
+
+    // Reject ambiguous framing/addressing before anything else looks at the
+    // request — routing, WAF and the upstream hop all assume it is unambiguous.
+    if let Some(status) = validate_http1_framing(&req) {
+        return Ok(empty_response(status));
+    }
 
     // Path is mutable so rewrite rules can modify it before route dispatch
     let mut path = req.uri().path().to_string();
@@ -943,6 +1162,20 @@ async fn handle_http_request(
     let is_websocket = is_websocket_upgrade(&req);
     let bw_proto = if is_websocket { "ws" } else { "http1" };
     bandwidth.protocol(bw_proto).inc_requests();
+    // Inbound byte accounting. Only `add_out` was ever called, so `bytes_in` sat
+    // at 0 no matter how much request body went through — a dashboard reporting
+    // exactly half the traffic. The request body is not always buffered (that
+    // depends on WAF/mirror/gRPC-Web being active), so the declared
+    // `Content-Length` is the one measure available on every path.
+    let request_body_len = req
+        .headers()
+        .get(hyper::header::CONTENT_LENGTH)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(0);
+    if request_body_len > 0 {
+        bandwidth.protocol(bw_proto).add_in(request_body_len);
+    }
     let method_str = req.method().to_string();
     let req_accepts_json = client_accepts_json(req.headers());
     // Generate a request-scoped trace ID for correlation across logs/errors
@@ -1172,6 +1405,10 @@ async fn handle_http_request(
         ) {
             warn!("WAF blocked request from {}: {}", ip_str, reason);
             metrics.waf_blocks_total.with_label_values(&[&reason]).inc();
+            // Feed the rolling attack log behind GET /api/waf/attacks. Nothing
+            // outside the WAF's own tests used to call this, so the dashboard's
+            // attack feed was always empty however much traffic was blocked.
+            waf.record_attack(&ip_str, &path, &method_str, &reason).await;
             log_rejected(
                 &access_logger,
                 &ip_str,
@@ -1216,7 +1453,7 @@ async fn handle_http_request(
     }
 
     // ── Step 6: gRPC-Web CORS Preflight ───────────────────────────────────────
-    if *req.method() == hyper::Method::OPTIONS && is_grpc_web_req {
+    if grpc_web::is_grpc_web_preflight(&req) {
         return Ok(grpc_web::cors_preflight_response());
     }
 
@@ -1306,6 +1543,10 @@ async fn handle_http_request(
         }
         break 'rewrite;
     }
+
+    // Carry the rewritten path onto the request itself so the backend receives
+    // the rewritten target (covers both `rewrite` rules and `RewritePath` hooks).
+    apply_rewritten_path(&mut req, &path);
 
     // After the rewrite loop, `path` is the final value used by the rest of
     // the pipeline. Build one Arc<str> here so PreUpstream / PostUpstream /
@@ -1454,10 +1695,20 @@ async fn handle_http_request(
                         msg.len() as u64,
                     );
                     let mut resp = error_response(status, &msg, &req_trace_id, req_accepts_json);
-                    resp.headers_mut().insert(
-                        hyper::header::WWW_AUTHENTICATE,
-                        hyper::header::HeaderValue::from_static("Bearer"),
-                    );
+                    // RFC 9110 §11.6.1: the challenge must match the scheme
+                    // guarding the resource, and RFC 7617 §2 defines that as
+                    // `Basic realm="…"`. Browsers ignore a `Bearer` challenge
+                    // and never present a login prompt.
+                    // `realm` is user-supplied config and may contain bytes
+                    // that are invalid in a header value — fall back rather
+                    // than panicking.
+                    let www_auth = crate::auth::basic::www_authenticate_header(realm)
+                        .parse()
+                        .unwrap_or_else(|_| {
+                            hyper::header::HeaderValue::from_static("Basic realm=\"protected\"")
+                        });
+                    resp.headers_mut()
+                        .insert(hyper::header::WWW_AUTHENTICATE, www_auth);
                     return Ok(resp);
                 }
             }
@@ -1855,7 +2106,7 @@ async fn handle_http_request(
     waf.ml_engine.queue_inspection(ml_event);
 
     // Inject forwarding headers only on the outbound upstream request.
-    realip::inject_forwarding_headers(req.headers_mut(), &real_ip, false);
+    realip::inject_forwarding_headers(req.headers_mut(), &real_ip, is_tls);
 
     // Extract Host Header to fallback if no specific path match is found
     let host = req
@@ -1866,23 +2117,17 @@ async fn handle_http_request(
     let host_name = host.split(':').next().unwrap_or("default");
 
     // Select Upstream Pool Name (if upstream exists, else fallback to host_name)
+    //
+    // Handler precedence matters: `fastcgi_pass` / `uwsgi_pass` win over `root`.
+    // `root` is not a handler when a gateway is configured — it is the document
+    // root the gateway resolves SCRIPT_FILENAME against, exactly as in nginx.
+    // Checking `root` first meant the canonical PHP config
+    //     route /app { fastcgi_pass 127.0.0.1:9000; root /srv/www; }
+    // served the raw `.php` source to the client instead of executing it, and
+    // made `serve_fastcgi`'s `doc_root` argument unreachable so DOCUMENT_ROOT
+    // always fell back to the process working directory.
     let pool_name = match route {
         Some((r_path, r)) => {
-            if let Some(ref root_path) = r.root {
-                // If a root directory is configured, serve static files directly!
-                let res = serve_static_file(
-                    r_path,
-                    &path,
-                    root_path.clone(),
-                    &req,
-                    Arc::clone(&access_logger),
-                    &method_str,
-                    &ip_str,
-                )
-                .await;
-                return res;
-            }
-
             if let Some(ref fastcgi_pass) = r.fastcgi_pass {
                 let res = serve_fastcgi(
                     r_path,
@@ -1892,6 +2137,7 @@ async fn handle_http_request(
                     Arc::clone(&access_logger),
                     &method_str,
                     &ip_str,
+                    r.root.as_deref(),
                 )
                 .await;
                 return res;
@@ -1903,6 +2149,22 @@ async fn handle_http_request(
                     &path,
                     uwsgi_pass.clone(),
                     req,
+                    Arc::clone(&access_logger),
+                    &method_str,
+                    &ip_str,
+                    is_tls,
+                )
+                .await;
+                return res;
+            }
+
+            if let Some(ref root_path) = r.root {
+                // No gateway configured — `root` means "serve static files".
+                let res = serve_static_file(
+                    r_path,
+                    &path,
+                    root_path.clone(),
+                    &req,
                     Arc::clone(&access_logger),
                     &method_str,
                     &ip_str,
@@ -2099,17 +2361,10 @@ async fn handle_http_request(
         }
     };
 
-    // 3. Request Header Injection Phase (from config)
-    if let Some((_, r)) = route {
-        for (k, v) in &r.add_headers {
-            if let (Ok(hk), Ok(hv)) = (
-                hyper::header::HeaderName::from_bytes(k.as_bytes()),
-                hyper::header::HeaderValue::from_str(v),
-            ) {
-                req.headers_mut().insert(hk, hv);
-            }
-        }
-    }
+    // `add_header` is a *response* directive (nginx semantics) and is applied
+    // to the response below. It is deliberately not copied onto the upstream
+    // request: doing so leaks values meant for the client (e.g. `X-Powered-By`)
+    // to the backend and can collide with headers the backend relies on.
     crate::telemetry::otel::inject_trace_context(
         req.headers_mut(),
         &req_trace_id,
@@ -2287,6 +2542,9 @@ async fn handle_http_request(
         ));
     };
 
+    // Grab the reuse handle before the stream disappears into Hyper, so a 101
+    // response can withdraw this socket from the keepalive pool.
+    let backend_reuse_handle = stream.reuse_handle();
     let io = TokioIo::new(stream);
 
     // Check if route requests HTTP/2 backend forwarding (e.g. for gRPC backends)
@@ -2371,7 +2629,15 @@ async fn handle_http_request(
         }
     }
 
-    // HTTP/1 backend path: conn stays in scope for WebSocket upgrade handling.
+    // HTTP/1 backend path.
+    //
+    // The returned `conn` future owns the socket and performs all actual I/O:
+    // until something polls it, `sender.send_request()` cannot write a single
+    // byte and never resolves. It must therefore be driven concurrently, not
+    // awaited after the request (see the HTTP/2 branch above, which already
+    // spawns its connection task). `with_upgrades()` keeps
+    // `hyper::upgrade::on(&mut response)` working for 101 responses, so the
+    // WebSocket tunnel path below still functions with `conn` spawned here.
     let (mut sender, conn) = match hyper::client::conn::http1::handshake(io).await {
         Ok(handshake) => handshake,
         Err(e) => {
@@ -2395,6 +2661,19 @@ async fn handle_http_request(
             ));
         }
     };
+
+    // Drive the backend connection. When this future completes, the
+    // `PooledStream` it owns is dropped, whose `Drop` returns the socket to the
+    // per-backend idle queue for keepalive reuse.
+    tokio::spawn(async move {
+        if let Err(e) = conn.with_upgrades().await {
+            debug!("Backend HTTP/1 connection error: {:?}", e);
+        }
+    });
+    // Kept so a 101 response can withdraw this socket from keepalive reuse.
+    let backend_reuse = backend_reuse_handle;
+
+    normalize_origin_form(&mut req);
 
     // Send the proxy request with read timeout
     let res = match tokio::time::timeout(read_timeout, sender.send_request(req)).await {
@@ -2429,11 +2708,14 @@ async fn handle_http_request(
             // Check if this is a 101 Switching Protocols response to our WebSocket upgrade
             let is_101 = response.status() == hyper::StatusCode::SWITCHING_PROTOCOLS;
             if is_websocket && is_101 {
-                tokio::spawn(async move {
-                    if let Err(e) = conn.await {
-                        debug!("WebSocket backend connection error: {:?}", e);
-                    }
-                });
+                // The backend connection task is already running (spawned with
+                // `with_upgrades()` above), so the 101 upgrade completes there.
+                //
+                // This socket is now a raw WebSocket tunnel with no HTTP
+                // framing left on it. Withdraw it from the keepalive pool so a
+                // later request is never handed a connection that cannot
+                // produce a valid HTTP response.
+                backend_reuse.store(false, Ordering::Relaxed);
                 if let Some(client_fut) = client_upgrade {
                     // Extract the backend's upgrade future from the response
                     let backend_upgrade = hyper::upgrade::on(&mut response);
@@ -2573,14 +2855,29 @@ async fn handle_http_request(
                     .inc();
             }
 
-            // HSTS header injection
-            if let Some(max_age) = app_config.hsts_max_age {
-                if let Ok(hv) =
-                    hyper::header::HeaderValue::from_str(&format!("max-age={}", max_age))
-                {
-                    response
-                        .headers_mut()
-                        .insert(hyper::header::STRICT_TRANSPORT_SECURITY, hv);
+            // HSTS header injection — secure transport only.
+            // RFC 6797 §7.2: an HSTS host MUST NOT include the header in responses
+            // sent over non-secure transport. A cleartext response carrying it is
+            // exactly what an active attacker can forge or strip, so honouring it
+            // would be unsafe and sending it is meaningless.
+            if is_tls {
+                if let Some(max_age) = app_config.hsts_max_age {
+                    if let Ok(hv) =
+                        hyper::header::HeaderValue::from_str(&format!("max-age={}", max_age))
+                    {
+                        response
+                            .headers_mut()
+                            .insert(hyper::header::STRICT_TRANSPORT_SECURITY, hv);
+                    }
+                }
+            }
+
+            // Alt-Svc advertisement — tells browsers an HTTP/3 endpoint exists.
+            // Without it a browser has no way to discover QUIC support and will
+            // never upgrade, so the HTTP/3 listener sits idle for real traffic.
+            if let Some(alt_svc) = app_config.alt_svc_header() {
+                if let Ok(hv) = hyper::header::HeaderValue::from_str(&alt_svc) {
+                    response.headers_mut().insert("alt-svc", hv);
                 }
             }
 
@@ -2755,30 +3052,10 @@ async fn handle_http_request(
                 }
             }
 
-            // Return backend socket to keepalive pool when possible.
-            // PooledStream's Drop normally re-pools automatically. The one
-            // exception: if hyper read ahead and `read_buf` isn't empty,
-            // re-pooling would hand the next caller a stream with stale
-            // data — call `take_stream()` to bypass auto-release and
-            // close the socket here.
-            match conn.without_shutdown().await {
-                Ok(parts) => {
-                    let pooled = parts.io.into_inner();
-                    if !parts.read_buf.is_empty() {
-                        // Discard explicitly — drop the raw TcpStream
-                        // rather than re-pooling a dirty connection.
-                        let _ = pooled.take_stream();
-                    }
-                    // else: `pooled` drops here → Drop calls release_sync.
-                    let _ = backend_addr;
-                }
-                Err(e) => {
-                    debug!(
-                        "Connection not reusable for backend {}: {}",
-                        backend_addr, e
-                    );
-                }
-            }
+            // The backend socket is owned by the spawned connection task above.
+            // When that task finishes, the `PooledStream` it holds is dropped and
+            // its `Drop` returns the socket to the per-backend idle queue.
+            let _ = &backend_addr;
 
             // Bandwidth tracking: record bytes in/out for this protocol
             let bw_proto = if is_websocket { "ws" } else { "http1" };
@@ -2788,6 +3065,9 @@ async fn handle_http_request(
             // Per-pool bandwidth tracking (inc_requests already called at pool resolution)
             let pool_bw = bandwidth.pool(&pool_name);
             pool_bw.add_out(body_len as u64);
+            if request_body_len > 0 {
+                pool_bw.add_in(request_body_len);
+            }
 
             // Wasm OnResponseHeaders: execute plugins on response
             if wasm_plugins.plugin_count() > 0 {
@@ -2945,6 +3225,10 @@ async fn handle_http2_request(
     bandwidth: Arc<crate::telemetry::bandwidth::BandwidthTracker>,
     oidc_sessions: crate::auth::oidc::OidcSessionStore,
     dynamic_routes: Arc<dashmap::DashMap<String, crate::config::RouteConfig>>,
+    // True when this connection was accepted over TLS. Decides the
+    // `X-Forwarded-Proto` value sent upstream — backends rely on it to build
+    // absolute URLs and to decide whether to redirect to HTTPS.
+    is_tls: bool,
 ) -> Result<Response<BoxBody<Bytes, hyper::Error>>, hyper::Error> {
     let app_config = app_config.load_full();
 
@@ -2959,6 +3243,16 @@ async fn handle_http2_request(
 
     let bw_proto = if is_grpc { "grpc" } else { "http2" };
     bandwidth.protocol(bw_proto).inc_requests();
+    // Inbound byte accounting — see the matching note in the HTTP/1 handler.
+    let request_body_len = req
+        .headers()
+        .get(hyper::header::CONTENT_LENGTH)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(0);
+    if request_body_len > 0 {
+        bandwidth.protocol(bw_proto).add_in(request_body_len);
+    }
 
     if is_grpc {
         debug!("gRPC request detected: {}", path);
@@ -3143,6 +3437,7 @@ async fn handle_http2_request(
         ) {
             warn!("WAF blocked HTTP/2 request from {}: {}", ip_str, reason);
             metrics.waf_blocks_total.with_label_values(&[&reason]).inc();
+            waf.record_attack(&ip_str, &path, &method_str, &reason).await;
             return Ok(empty_response(hyper::StatusCode::FORBIDDEN));
         }
     }
@@ -3159,6 +3454,14 @@ async fn handle_http2_request(
             }
             crate::geo::inject_geo_headers(req.headers_mut(), &geo_result);
         }
+    }
+
+    // ── gRPC-Web CORS preflight (parity with HTTP/1 and HTTP/3) ──
+    // Browsers speak gRPC-Web over HTTP/2 whenever the connection is TLS, so the
+    // preflight has to be answered here too — the HTTP/1 handler alone was not
+    // enough for the common deployment.
+    if grpc_web::is_grpc_web_preflight(&req) {
+        return Ok(grpc_web::cors_preflight_response());
     }
 
     // ── Rewrite Engine (parity with HTTP/1) ──
@@ -3226,6 +3529,10 @@ async fn handle_http2_request(
         }
         break 'rewrite;
     }
+
+    // Carry the rewritten path onto the request itself so the backend receives
+    // the rewritten target (covers both `rewrite` rules and `RewritePath` hooks).
+    apply_rewritten_path(&mut req, &path);
 
     // P2: post-rewrite path Arc<str>; cloned into PreUpstream / PostUpstream / Log contexts.
     let final_path_arc: std::sync::Arc<str> = std::sync::Arc::from(path.as_str());
@@ -3715,22 +4022,10 @@ async fn handle_http2_request(
     // Mirror pool: route-level overrides global
     let mirror_pool = route_mirror.or_else(|| app_config.mirror_pool.clone());
 
+    // Same handler precedence as the HTTP/1 path: a configured gateway wins over
+    // `root`, which is the gateway's document root rather than a static handler.
     let pool_name = match route {
         Some((r_path, r)) => {
-            if let Some(ref root_path) = r.root {
-                let res = serve_static_file(
-                    r_path,
-                    &path,
-                    root_path.clone(),
-                    &req,
-                    Arc::clone(&access_logger),
-                    &method_str,
-                    &ip_str,
-                )
-                .await;
-                return res;
-            }
-
             if let Some(ref fastcgi_pass) = r.fastcgi_pass {
                 let res = serve_fastcgi(
                     r_path,
@@ -3740,6 +4035,7 @@ async fn handle_http2_request(
                     Arc::clone(&access_logger),
                     &method_str,
                     &ip_str,
+                    r.root.as_deref(),
                 )
                 .await;
                 return res;
@@ -3751,6 +4047,21 @@ async fn handle_http2_request(
                     &path,
                     uwsgi_pass.clone(),
                     req,
+                    Arc::clone(&access_logger),
+                    &method_str,
+                    &ip_str,
+                    is_tls,
+                )
+                .await;
+                return res;
+            }
+
+            if let Some(ref root_path) = r.root {
+                let res = serve_static_file(
+                    r_path,
+                    &path,
+                    root_path.clone(),
+                    &req,
                     Arc::clone(&access_logger),
                     &method_str,
                     &ip_str,
@@ -3922,17 +4233,9 @@ async fn handle_http2_request(
     };
 
     // 3. Request Header Injection Phase (from config) + forwarding headers
-    realip::inject_forwarding_headers(req.headers_mut(), &real_ip, false);
-    if let Some((_, r)) = route {
-        for (k, v) in &r.add_headers {
-            if let (Ok(hk), Ok(hv)) = (
-                hyper::header::HeaderName::from_bytes(k.as_bytes()),
-                hyper::header::HeaderValue::from_str(v),
-            ) {
-                req.headers_mut().insert(hk, hv);
-            }
-        }
-    }
+    realip::inject_forwarding_headers(req.headers_mut(), &real_ip, is_tls);
+    // `add_header` is response-only (nginx semantics) — applied to the response
+    // below, not copied onto the upstream request.
     crate::telemetry::otel::inject_trace_context(
         req.headers_mut(),
         &req_trace_id,
@@ -4030,12 +4333,57 @@ async fn handle_http2_request(
 
     let io = TokioIo::new(stream);
 
-    let (mut sender, conn) =
-        match hyper::client::conn::http2::handshake(executor::TokioExecutor, io).await {
+    // The protocol the *client* used says nothing about what the backend
+    // speaks. Upstream stays HTTP/1.1 unless the route opts in with
+    // `proxy_http_version 2` — the same gate the HTTP/1 handler uses. Speaking
+    // h2 to an HTTP/1.1 backend makes it answer with an HTTP/1.1 status line,
+    // which the h2 client rejects as a malformed frame (FRAME_SIZE_ERROR).
+    let use_h2_backend = route
+        .and_then(|(_, r)| r.proxy_http_version.as_deref())
+        .map(|v| v == "2")
+        .unwrap_or(false);
+
+    let send_result = if use_h2_backend {
+        let (mut sender, conn) =
+            match hyper::client::conn::http2::handshake(executor::TokioExecutor, io).await {
+                Ok(handshake) => handshake,
+                Err(e) => {
+                    error!(
+                        "HTTP/2 Handshake failed with backend {}: {}",
+                        backend.config.address, e
+                    );
+                    metrics
+                        .backend_errors_total
+                        .with_label_values(&[
+                            &backend.config.address,
+                            &pool_name,
+                            &"handshake".to_string(),
+                        ])
+                        .inc();
+                    backend.active_connections.fetch_sub(1, Ordering::Relaxed);
+                    metrics.active_connections.dec();
+                    return Ok(error_response(
+                        hyper::StatusCode::SERVICE_UNAVAILABLE,
+                        "HTTP/2 handshake failed with backend",
+                        &req_trace_id,
+                        req_accepts_json,
+                    ));
+                }
+            };
+
+        tokio::spawn(async move {
+            if let Err(e) = conn.await {
+                debug!("Backend HTTP/2 connection error: {:?}", e);
+            }
+        });
+
+        tokio::time::timeout(h2_read_timeout, sender.send_request(req)).await
+    } else {
+        let (mut sender, conn) = match hyper::client::conn::http1::handshake(io).await {
             Ok(handshake) => handshake,
             Err(e) => {
                 error!(
-                    "HTTP/2 Handshake failed with backend {}: {}",
+                    "Handshake failed with backend {}: {}",
                     backend.config.address, e
                 );
                 metrics
@@ -4050,20 +4398,26 @@ async fn handle_http2_request(
                 metrics.active_connections.dec();
                 return Ok(error_response(
                     hyper::StatusCode::SERVICE_UNAVAILABLE,
-                    "HTTP/2 handshake failed with backend",
+                    "Backend handshake failed",
                     &req_trace_id,
                     req_accepts_json,
                 ));
             }
         };
 
-    tokio::spawn(async move {
-        if let Err(e) = conn.await {
-            debug!("Backend HTTP/2 connection error: {:?}", e);
-        }
-    });
+        // As in the HTTP/1 handler: nothing is written to the socket until this
+        // future is polled, so it has to run alongside `send_request`.
+        tokio::spawn(async move {
+            if let Err(e) = conn.await {
+                debug!("Backend HTTP/1 connection error: {:?}", e);
+            }
+        });
 
-    let res = match tokio::time::timeout(h2_read_timeout, sender.send_request(req)).await {
+        normalize_origin_form(&mut req);
+        tokio::time::timeout(h2_read_timeout, sender.send_request(req)).await
+    };
+
+    let res = match send_result {
         Ok(r) => r,
         Err(_) => {
             warn!(
@@ -4179,14 +4533,23 @@ async fn handle_http2_request(
                     .inc();
             }
 
-            // HSTS header injection
-            if let Some(max_age) = app_config.hsts_max_age {
-                if let Ok(hv) =
-                    hyper::header::HeaderValue::from_str(&format!("max-age={}", max_age))
-                {
-                    response
-                        .headers_mut()
-                        .insert(hyper::header::STRICT_TRANSPORT_SECURITY, hv);
+            // HSTS header injection — secure transport only (RFC 6797 §7.2).
+            if is_tls {
+                if let Some(max_age) = app_config.hsts_max_age {
+                    if let Ok(hv) =
+                        hyper::header::HeaderValue::from_str(&format!("max-age={}", max_age))
+                    {
+                        response
+                            .headers_mut()
+                            .insert(hyper::header::STRICT_TRANSPORT_SECURITY, hv);
+                    }
+                }
+            }
+
+            // Alt-Svc advertisement for HTTP/3 discovery.
+            if let Some(alt_svc) = app_config.alt_svc_header() {
+                if let Ok(hv) = hyper::header::HeaderValue::from_str(&alt_svc) {
+                    response.headers_mut().insert("alt-svc", hv);
                 }
             }
 
@@ -4359,6 +4722,9 @@ async fn handle_http2_request(
             // Per-pool bandwidth tracking (inc_requests already called at pool resolution)
             let pool_bw = bandwidth.pool(&pool_name);
             pool_bw.add_out(body_len as u64);
+            if request_body_len > 0 {
+                pool_bw.add_in(request_body_len);
+            }
 
             // Wasm OnResponseHeaders
             if wasm_plugins.plugin_count() > 0 {
@@ -4508,7 +4874,45 @@ pub fn chrono_timestamp() -> String {
     let now = SystemTime::now()
         .duration_since(SystemTime::UNIX_EPOCH)
         .unwrap_or_default();
-    format!("{}.{:03}Z", now.as_secs(), now.subsec_millis())
+
+    let secs = now.as_secs() as i64;
+    let millis = now.subsec_millis();
+
+    let days = secs.div_euclid(86_400);
+    let tod = secs.rem_euclid(86_400);
+    let (year, month, day) = civil_from_days(days);
+
+    // RFC 3339 / ISO 8601 in UTC. The previous format was epoch seconds with a
+    // trailing `Z`, which reads as a timestamp to log processors but parses as
+    // neither, so every consumer expecting RFC 3339 rejected the field.
+    format!(
+        "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}.{:03}Z",
+        year,
+        month,
+        day,
+        tod / 3600,
+        (tod % 3600) / 60,
+        tod % 60,
+        millis
+    )
+}
+
+/// Converts days since the Unix epoch into a proleptic-Gregorian `(year, month, day)`.
+///
+/// Howard Hinnant's `civil_from_days`, which avoids pulling in a date library
+/// for the one place the proxy needs calendar arithmetic.
+fn civil_from_days(z: i64) -> (i64, u32, u32) {
+    // Shift the epoch to 0000-03-01 so leap days land at the end of the cycle.
+    let z = z + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = (z - era * 146_097) as i64; // day of era, [0, 146096]
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146_096) / 365; // [0, 399]
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100); // [0, 365]
+    let mp = (5 * doy + 2) / 153; // [0, 11], March-based
+    let d = (doy - (153 * mp + 2) / 5 + 1) as u32; // [1, 31]
+    let m = if mp < 10 { mp + 3 } else { mp - 9 } as u32; // [1, 12]
+    (if m <= 2 { y + 1 } else { y }, m, d)
 }
 
 /// Safely resolves a requested path against a base directory, preventing
@@ -4732,15 +5136,120 @@ async fn serve_static_file<T>(
 mod tests {
     use super::*;
 
+    /// Builds a bare request for framing checks.
+    fn framing_req(
+        version: hyper::Version,
+        headers: &[(&str, &str)],
+    ) -> Request<http_body_util::Empty<Bytes>> {
+        let mut b = Request::builder().method("POST").uri("/x").version(version);
+        for (k, v) in headers {
+            b = b.header(*k, *v);
+        }
+        b.body(http_body_util::Empty::<Bytes>::new()).unwrap()
+    }
+
+    #[test]
+    fn test_framing_rejects_missing_host_on_http11() {
+        // RFC 9112 §3.2. Previously answered 200 and forwarded upstream with no
+        // Host at all, producing an invalid HTTP/1.1 request at the backend.
+        let req = framing_req(hyper::Version::HTTP_11, &[]);
+        assert_eq!(
+            validate_http1_framing(&req),
+            Some(hyper::StatusCode::BAD_REQUEST)
+        );
+    }
+
+    #[test]
+    fn test_framing_allows_missing_host_on_http10() {
+        // Host only became mandatory in HTTP/1.1.
+        let req = framing_req(hyper::Version::HTTP_10, &[]);
+        assert_eq!(validate_http1_framing(&req), None);
+    }
+
+    #[test]
+    fn test_framing_rejects_duplicate_host() {
+        // Both values used to be forwarded verbatim, letting the client choose
+        // which host the backend or an intermediary cache keyed on.
+        let req = framing_req(
+            hyper::Version::HTTP_11,
+            &[("host", "a.example"), ("host", "b.example")],
+        );
+        assert_eq!(
+            validate_http1_framing(&req),
+            Some(hyper::StatusCode::BAD_REQUEST)
+        );
+    }
+
+    #[test]
+    fn test_framing_rejects_content_length_with_transfer_encoding() {
+        // RFC 9112 §6.1 — the CL.TE request-smuggling pair.
+        let req = framing_req(
+            hyper::Version::HTTP_11,
+            &[
+                ("host", "a.example"),
+                ("content-length", "6"),
+                ("transfer-encoding", "chunked"),
+            ],
+        );
+        assert_eq!(
+            validate_http1_framing(&req),
+            Some(hyper::StatusCode::BAD_REQUEST)
+        );
+    }
+
+    #[test]
+    fn test_framing_allows_well_formed_requests() {
+        for headers in [
+            &[("host", "a.example")][..],
+            &[("host", "a.example"), ("content-length", "5")][..],
+            &[("host", "a.example"), ("transfer-encoding", "chunked")][..],
+        ] {
+            let req = framing_req(hyper::Version::HTTP_11, headers);
+            assert_eq!(
+                validate_http1_framing(&req),
+                None,
+                "well-formed request rejected: {headers:?}"
+            );
+        }
+    }
+
     #[test]
     fn test_chrono_timestamp_format() {
+        // RFC 3339 UTC with millisecond precision: YYYY-MM-DDTHH:MM:SS.sssZ
         let ts = chrono_timestamp();
-        assert!(ts.ends_with('Z'));
-        assert!(ts.contains('.'));
-        let parts: Vec<&str> = ts.trim_end_matches('Z').split('.').collect();
-        assert_eq!(parts.len(), 2);
-        assert!(parts[0].parse::<u64>().is_ok());
-        assert_eq!(parts[1].len(), 3);
+        assert_eq!(ts.len(), 24, "unexpected timestamp length: {ts}");
+        assert!(ts.ends_with('Z'), "must be UTC-qualified: {ts}");
+
+        let (date, rest) = ts.trim_end_matches('Z').split_once('T').expect("date/time separator");
+        let date_parts: Vec<&str> = date.split('-').collect();
+        assert_eq!(date_parts.len(), 3, "malformed date in {ts}");
+        let year: i64 = date_parts[0].parse().expect("year");
+        let month: u32 = date_parts[1].parse().expect("month");
+        let day: u32 = date_parts[2].parse().expect("day");
+        assert!(year >= 2020, "implausible year in {ts}");
+        assert!((1..=12).contains(&month), "bad month in {ts}");
+        assert!((1..=31).contains(&day), "bad day in {ts}");
+
+        let (clock, millis) = rest.split_once('.').expect("fractional seconds");
+        let clock_parts: Vec<&str> = clock.split(':').collect();
+        assert_eq!(clock_parts.len(), 3, "malformed time in {ts}");
+        assert!(clock_parts[0].parse::<u32>().expect("hour") < 24);
+        assert!(clock_parts[1].parse::<u32>().expect("minute") < 60);
+        assert!(clock_parts[2].parse::<u32>().expect("second") < 61);
+        assert_eq!(millis.len(), 3, "millisecond field must be 3 digits: {ts}");
+        assert!(millis.parse::<u32>().is_ok());
+    }
+
+    #[test]
+    fn test_civil_from_days_known_dates() {
+        assert_eq!(civil_from_days(0), (1970, 1, 1));
+        assert_eq!(civil_from_days(1), (1970, 1, 2));
+        assert_eq!(civil_from_days(59), (1970, 3, 1));
+        // 2000-02-29 — a leap day in a century year divisible by 400.
+        assert_eq!(civil_from_days(11016), (2000, 2, 29));
+        assert_eq!(civil_from_days(19723), (2024, 1, 1));
+        // 2024-02-29 — leap day.
+        assert_eq!(civil_from_days(19782), (2024, 2, 29));
     }
 
     #[test]

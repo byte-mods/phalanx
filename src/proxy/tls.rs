@@ -27,6 +27,26 @@ use std::sync::Arc;
 use tokio_rustls::TlsAcceptor;
 use tracing::{error, info, warn};
 
+/// Installs the process-wide rustls `CryptoProvider` exactly once.
+///
+/// rustls 0.23 refuses to pick a provider on its own when more than one backend
+/// could be linked in, and any `ServerConfig::builder()` / `ClientConfig::builder()`
+/// call **panics** until one has been installed. The HTTP/1 and HTTP/2 TLS paths
+/// build their providers explicitly and so were unaffected, but the QUIC listener
+/// used the process default and panicked on every start — restart-looping forever
+/// so HTTP/3 never bound a socket.
+///
+/// Call this once, before any listener is spawned. Idempotent and safe to call
+/// from tests.
+pub fn install_default_crypto_provider() {
+    static INIT: std::sync::Once = std::sync::Once::new();
+    INIT.call_once(|| {
+        // `install_default` errors only if a provider is already installed, which
+        // is precisely the state we want — so the result is intentionally ignored.
+        let _ = rustls::crypto::ring::default_provider().install_default();
+    });
+}
+
 /// Loads a certificate chain and private key from disk into a `CertifiedKey`.
 fn load_certified_key(
     cert_path: &str,

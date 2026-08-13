@@ -101,6 +101,29 @@ fn url_decode(input: &str) -> String {
     String::from_utf8_lossy(&result).to_string()
 }
 
+/// Maximum decoding passes applied before inspection.
+///
+/// One pass is not enough: `..%252f` decodes to `..%2f`, which still hides the
+/// traversal from the rules, and a backend that decodes twice would see `../`.
+/// Repeated decoding is bounded so a payload of nested escapes cannot drive
+/// unbounded work.
+const MAX_DECODE_PASSES: usize = 3;
+
+/// Decodes repeatedly until the value stops changing, up to
+/// [`MAX_DECODE_PASSES`], so multiply-encoded payloads are inspected in the
+/// form a backend would ultimately see.
+fn url_decode_recursive(input: &str) -> String {
+    let mut current = url_decode(input);
+    for _ in 1..MAX_DECODE_PASSES {
+        let next = url_decode(&current);
+        if next == current {
+            break;
+        }
+        current = next;
+    }
+    current
+}
+
 impl WafEngine {
     /// Creates a new WAF engine with default OWASP rules and an empty policy engine.
     ///
@@ -236,11 +259,19 @@ impl WafEngine {
 
         // Tiered bot classification (GoodBot / BadBot / Unknown / Human)
         // Falls through to this if the regex quick-check above didn't block.
+        //
+        // Only a BadBot classification takes a strike. A non-browser User-Agent is
+        // not evidence of an attack: curl, python-requests, Go-http-client, okhttp,
+        // axios and every mobile SDK classify as `Unknown`, and health checks
+        // routinely omit the header entirely. Striking those fired on *every*
+        // request from an ordinary API client, and because strikes are cumulative
+        // the client was auto-banned after `waf_auto_ban_threshold` perfectly
+        // benign requests (15 by default). The classification is still recorded
+        // for CAPTCHA/challenge decisions, which are reversible — a ban is not.
         if let Some(ua) = user_agent {
             if ua.trim().is_empty() {
                 // Explicitly empty UA is as suspicious as a missing one
                 debug!("WAF: Empty User-Agent string from {}", ip);
-                self.reputation.add_strike(ip, 1);
             } else {
                 match bot::classify_user_agent(ua) {
                     bot::BotClass::BadBot => {
@@ -253,7 +284,6 @@ impl WafEngine {
                     }
                     bot::BotClass::Unknown => {
                         debug!("WAF: Unknown bot UA from {}: {}", ip, ua);
-                        self.reputation.add_strike(ip, 1);
                     }
                     bot::BotClass::Human => {}
                 }
@@ -262,7 +292,6 @@ impl WafEngine {
             // Missing User-Agent: suspicious but not an automatic block.
             // Legitimate health checks and internal services often omit UA.
             debug!("WAF: Missing User-Agent from {}", ip);
-            self.reputation.add_strike(ip, 1);
         }
 
         // 3. Path & Query Inspection (OWASP Top 10)
@@ -271,7 +300,7 @@ impl WafEngine {
             Some(q) => format!("{}?{}", path, q),
             None => path.to_string(),
         };
-        let decoded_url = url_decode(&full_url);
+        let decoded_url = url_decode_recursive(&full_url);
 
         if let Some(violation) = rules.inspect_payload(&decoded_url) {
             warn!(
@@ -309,7 +338,7 @@ impl WafEngine {
         let rules = self.rules.load();
 
         // URL-decode the body in case form-encoded data contains payloads
-        let decoded = url_decode(body);
+        let decoded = url_decode_recursive(body);
 
         if let Some(violation) = rules.inspect_payload(&decoded) {
             warn!(
@@ -370,8 +399,8 @@ mod tests {
     fn test_waf_reload_policy_missing_file() {
         let reputation = IpReputationManager::new(100, 60, None);
         let waf = WafEngine::new(true, reputation);
-        // Reload with missing file should log warning, not panic
-        waf.reload_policy("/nonexistent/policy.json");
+        // Reload with missing file should return an error, not panic
+        assert!(waf.reload_policy("/nonexistent/policy.json").is_err());
         // Engine should still work
         let empty_headers = std::collections::HashMap::new();
         let result = waf.inspect(
@@ -427,14 +456,41 @@ mod tests {
     }
 
     #[test]
-    fn test_waf_bot_classification_unknown_allowed_with_strike() {
+    fn test_waf_bot_classification_unknown_allowed_without_strike() {
         let reputation = IpReputationManager::new(100, 60, None);
         let waf = WafEngine::new(true, reputation.clone());
         let empty_headers = std::collections::HashMap::new();
-        // curl is classified as Unknown — should be allowed but accumulate strikes
+        // curl classifies as Unknown. It is allowed and takes no strike: a
+        // non-browser UA is the normal case for API traffic, not an attack.
         let result = waf.inspect("1.2.3.4", "/safe", None, &empty_headers, Some("curl/8.4.0"));
         assert_eq!(result, WafAction::Allow);
-        assert_eq!(reputation.get_strikes("1.2.3.4"), 1);
+        assert_eq!(reputation.get_strikes("1.2.3.4"), 0);
+    }
+
+    #[test]
+    fn test_waf_ordinary_api_client_is_never_auto_banned() {
+        // Regression guard for the defect this replaced: one strike per request
+        // from any non-browser UA meant a benign client crossed the default
+        // ban threshold after 15 requests and was locked out for an hour.
+        let reputation = IpReputationManager::new(15, 3600, None);
+        let waf = WafEngine::new(true, reputation.clone());
+        let empty_headers = std::collections::HashMap::new();
+
+        for ua in [
+            "curl/8.4.0",
+            "python-requests/2.31.0",
+            "Go-http-client/1.1",
+            "okhttp/4.12.0",
+            "axios/1.6.0",
+        ] {
+            for _ in 0..50 {
+                let result = waf.inspect("1.2.3.4", "/api/orders", None, &empty_headers, Some(ua));
+                assert_eq!(result, WafAction::Allow, "benign request from {ua} blocked");
+            }
+        }
+
+        assert_eq!(reputation.get_strikes("1.2.3.4"), 0);
+        assert!(!reputation.is_banned("1.2.3.4"));
     }
 
     #[test]
@@ -442,22 +498,45 @@ mod tests {
         let reputation = IpReputationManager::new(100, 60, None);
         let waf = WafEngine::new(true, reputation.clone());
         let empty_headers = std::collections::HashMap::new();
-        // Empty UA should not block (health checks, internal services)
+        // Missing UA must not block or strike — health checks and internal
+        // services routinely omit the header.
         let result = waf.inspect("1.2.3.4", "/health", None, &empty_headers, None);
         assert_eq!(result, WafAction::Allow);
-        // Still accumulates strikes for suspicious behavior
-        assert_eq!(reputation.get_strikes("1.2.3.4"), 1);
+        assert_eq!(reputation.get_strikes("1.2.3.4"), 0);
     }
 
     #[test]
-    fn test_waf_blank_user_agent_string_allowed_with_strike() {
+    fn test_waf_blank_user_agent_string_allowed_without_strike() {
         let reputation = IpReputationManager::new(100, 60, None);
         let waf = WafEngine::new(true, reputation.clone());
         let empty_headers = std::collections::HashMap::new();
         // Explicitly empty UA string "   " treated same as None
         let result = waf.inspect("1.2.3.4", "/health", None, &empty_headers, Some("   "));
         assert_eq!(result, WafAction::Allow);
-        assert_eq!(reputation.get_strikes("1.2.3.4"), 1);
+        assert_eq!(reputation.get_strikes("1.2.3.4"), 0);
+    }
+
+    #[test]
+    fn test_waf_real_attacks_still_strike_and_ban() {
+        // The flip side of the above: genuine rule violations must still
+        // accumulate and reach the ban threshold.
+        let reputation = IpReputationManager::new(6, 3600, None);
+        let waf = WafEngine::new(true, reputation.clone());
+        let empty_headers = std::collections::HashMap::new();
+
+        for _ in 0..2 {
+            let result = waf.inspect(
+                "9.9.9.9",
+                "/x",
+                Some("id=1' OR '1'='1"),
+                &empty_headers,
+                Some("curl/8.4.0"),
+            );
+            assert!(matches!(result, WafAction::Block(_)));
+        }
+
+        assert_eq!(reputation.get_strikes("9.9.9.9"), 6);
+        assert!(reputation.is_banned("9.9.9.9"));
     }
 
     #[test]

@@ -12,7 +12,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::net::{TcpListener, TcpStream};
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 
 use crate::routing::UpstreamManager;
 use std::sync::atomic::Ordering;
@@ -20,17 +20,21 @@ use std::sync::atomic::Ordering;
 /// Starts a dedicated raw TCP proxy server.
 ///
 /// This runs on a separate port from the main multiplexer and blindly forwards
-/// bytes in both directions between the client and a backend server from the
-/// "default" upstream pool.
+/// bytes in both directions between the client and a backend server from
+/// `pool_name`.
 ///
 /// # Arguments
 ///
 /// * `bind_addr` - Socket address to listen on (e.g. `"0.0.0.0:9000"`).
 /// * `upstreams` - Shared upstream pool manager used to select a healthy backend.
+/// * `pool_name` - Upstream pool to forward to (`tcp_upstream_pool`, default `"default"`).
+/// * `trusted`   - Peers allowed to declare a client address via PROXY protocol.
 /// * `shutdown`  - Cancellation token that triggers graceful shutdown.
 pub async fn start_tcp_proxy(
     bind_addr: &str,
     upstreams: Arc<UpstreamManager>,
+    pool_name: String,
+    trusted: crate::proxy::realip::TrustedProxies,
     shutdown: CancellationToken,
 ) {
     let addr: SocketAddr = match bind_addr.parse() {
@@ -72,6 +76,11 @@ pub async fn start_tcp_proxy(
 
         debug!("Accepted TCP connection from {}", peer);
         let upts = Arc::clone(&upstreams);
+        let pool_name = pool_name.clone();
+        // A PROXY protocol header is only believed from a peer that is allowed to
+        // speak for others; otherwise the header is stripped but the socket
+        // address stands. See the matching note in the mux accept path.
+        let pp_trusted = trusted.is_trusted(&peer.ip());
 
         // Spawn a green thread for each connection
         tokio::spawn(async move {
@@ -92,8 +101,17 @@ pub async fn start_tcp_proxy(
                             )
                             .await;
                             let addr = hdr.src_addr.unwrap_or(peer);
-                            debug!("TCP proxy: PP2 real client IP: {}", addr);
-                            addr
+                            if pp_trusted {
+                                debug!("TCP proxy: PP2 real client IP: {}", addr);
+                                addr
+                            } else {
+                                warn!(
+                                    "TCP proxy: PP2 header from untrusted peer {} claimed {} — ignoring",
+                                    peer.ip(),
+                                    addr.ip()
+                                );
+                                peer
+                            }
                         }
                         Err(crate::proxy::proxy_proto_v2::ParseError::NotProxyProtocol) => {
                             // PP2 magic didn't match — try PROXY protocol v1
@@ -118,12 +136,15 @@ pub async fn start_tcp_proxy(
             };
             debug!("TCP proxy: effective client: {}", real_peer);
 
-            // Because it's a raw TCP proxy, we don't have SNI or Host header (unless we parse TLS/HTTP),
-            // so we route everything to the 'default' pool for this dedicated port.
-            let pool = match upts.get_pool("default") {
+            // Because it's a raw TCP proxy, we don't have SNI or Host header (unless we parse
+            // TLS/HTTP), so the whole listener forwards to one configured pool.
+            let pool = match upts.get_pool(&pool_name) {
                 Some(p) => p,
                 None => {
-                    error!("No default upstream pool configured for TCP proxy");
+                    error!(
+                        "TCP proxy: upstream pool '{}' not configured (set `tcp_upstream_pool`)",
+                        pool_name
+                    );
                     return;
                 }
             };

@@ -33,7 +33,27 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Snapshot the current config for components that need a static Arc<AppConfig>
     let cfg_snapshot = cfg.load_full();
 
-    // 2. Initialize Telemetry (Logging, Metrics, Tracing)
+    // 2. Install the rustls crypto provider before any listener can touch rustls.
+    // Must happen on the main thread at startup: the QUIC listener builds its
+    // `ServerConfig` from the process default and panics if none is installed.
+    proxy::tls::install_default_crypto_provider();
+
+
+    // 3. Build Tokio Runtime
+    // We dynamically allocate the number of OS threads based on `worker_threads` config.
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(cfg_snapshot.workers)
+        .enable_all()
+        .build()?;
+
+    // 4. Initialize Telemetry (Logging, Metrics, Tracing)
+    //
+    // Must run *inside* the runtime context: the OTLP exporter builds a hyper
+    // client at construction, which panics with "there is no reactor running"
+    // when created off-runtime. That path was unreachable while `otel_endpoint`
+    // was missing from the directive table; the moment it became configurable,
+    // setting it killed the process at startup.
+    let _rt_guard = rt.enter();
     let _otel_provider = telemetry::init_telemetry(
         cfg_snapshot.otel_endpoint.as_deref(),
         cfg_snapshot.otel_service_name.as_deref(),
@@ -44,20 +64,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         env!("CARGO_PKG_VERSION")
     );
 
+    // Config was parsed before the tracing subscriber existed, so re-run the
+    // reference checks now that warnings can actually reach the log.
+    config::warn_on_unknown_pool_references(&cfg_snapshot);
+
     tracing::info!(
         "Starting AI Load Balancer with {} worker threads... (Config: {})",
         cfg_snapshot.workers,
         config_path
     );
 
-    // 3. Build Tokio Runtime
-    // We dynamically allocate the number of OS threads based on `worker_threads` config.
-    let rt = tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(cfg_snapshot.workers)
-        .enable_all()
-        .build()?;
 
-    // 4. Start the Async Application Block
+    // 5. Start the Async Application Block
     rt.block_on(async {
         // --- Graceful Shutdown ---
         // A CancellationToken propagates shutdown signals to all spawned tasks.
@@ -84,10 +102,27 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         )));
 
         // Service Discovery: RocksDB-backed persistent backend registry.
-        let discovery = Arc::new(
-            discovery::ServiceDiscovery::new("data/discovery.db")
-                .expect("Failed to open RocksDB for service discovery"),
-        );
+        //
+        // RocksDB takes an exclusive lock on its directory, so a second instance
+        // started from the same working directory cannot open it. That is worth a
+        // clear message: the raw panic ("Resource temporarily unavailable") gave
+        // no hint that the cause was another Phalanx already running here.
+        let discovery = Arc::new(match discovery::ServiceDiscovery::new("data/discovery.db") {
+            Ok(d) => d,
+            Err(e) => {
+                let hint = if e.to_string().contains("lock") {
+                    "\nAnother Phalanx instance is already using this working directory. \
+                     Run the second instance from its own directory, or stop the first."
+                } else {
+                    ""
+                };
+                eprintln!(
+                    "Failed to open the service-discovery database at data/discovery.db: {}{}",
+                    e, hint
+                );
+                std::process::exit(1);
+            }
+        });
 
         // State & Routing: Manages backend health and load balancing algorithms.
         let upstreams = Arc::new(routing::UpstreamManager::new(
@@ -760,9 +795,20 @@ async fn supervise_proxy_listener(
         }
     };
 
-    let mut current_bind = config_rx.borrow().proxy_bind.clone();
-    let mut running = Some(start(current_bind.clone()));
-    let mut restart_attempt: u32 = 0;
+    // One listener per configured bind address. A config can declare several
+    // `server` blocks with different `listen` ports; each needs its own accept
+    // loop, and each is supervised (and restarted) independently.
+    let mut running: std::collections::HashMap<String, RunningListener> =
+        std::collections::HashMap::new();
+    let mut restart_attempts: std::collections::HashMap<String, u32> =
+        std::collections::HashMap::new();
+    let mut current_binds = config_rx.borrow().proxy_binds.clone();
+    if current_binds.is_empty() {
+        current_binds = vec![config_rx.borrow().proxy_bind.clone()];
+    }
+    for bind in &current_binds {
+        running.insert(bind.clone(), start(bind.clone()));
+    }
     let mut health_tick = time::interval(std::time::Duration::from_secs(1));
     health_tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
 
@@ -770,54 +816,68 @@ async fn supervise_proxy_listener(
         tokio::select! {
             _ = shutdown.cancelled() => break,
             _ = health_tick.tick() => {
-                let finished = running
-                    .as_ref()
-                    .is_some_and(|task| task.handle.is_finished());
-                if finished {
-                    if let Some(task) = running.take() {
+                let finished: Vec<String> = running
+                    .iter()
+                    .filter(|(_, task)| task.handle.is_finished())
+                    .map(|(bind, _)| bind.clone())
+                    .collect();
+                if finished.is_empty() {
+                    continue;
+                }
+                if shutdown.is_cancelled() {
+                    break;
+                }
+                for bind in finished {
+                    if let Some(task) = running.remove(&bind) {
                         if let Err(e) = task.join().await {
-                            tracing::warn!("Proxy listener task join error: {}", e);
+                            tracing::warn!("Proxy listener task join error ({}): {}", bind, e);
                         }
                     }
-                    if shutdown.is_cancelled() {
-                        break;
-                    }
-                    let backoff = listener_restart_backoff(restart_attempt);
+                    let attempt = restart_attempts.entry(bind.clone()).or_insert(0);
+                    let backoff = listener_restart_backoff(*attempt);
                     tracing::warn!(
-                        "Proxy listener task exited unexpectedly. Restarting in {:?}.",
+                        "Proxy listener on {} exited unexpectedly. Restarting in {:?}.",
+                        bind,
                         backoff
                     );
                     tokio::select! {
                         _ = shutdown.cancelled() => break,
                         _ = time::sleep(backoff) => {}
                     }
-                    running = Some(start(current_bind.clone()));
-                    restart_attempt = restart_attempt.saturating_add(1);
+                    running.insert(bind.clone(), start(bind.clone()));
+                    *attempt = attempt.saturating_add(1);
                 }
             }
             changed = config_rx.changed() => {
                 if changed.is_err() {
                     break;
                 }
-                let next_bind = config_rx.borrow().proxy_bind.clone();
-                if next_bind != current_bind {
+                let mut next_binds = config_rx.borrow().proxy_binds.clone();
+                if next_binds.is_empty() {
+                    next_binds = vec![config_rx.borrow().proxy_bind.clone()];
+                }
+                if next_binds != current_binds {
                     info!(
-                        "Proxy listener bind changed: {} -> {}. Restarting listener.",
-                        current_bind,
-                        next_bind
+                        "Proxy listener binds changed: {:?} -> {:?}.",
+                        current_binds, next_binds
                     );
-                    if let Some(task) = running.take() {
-                        task.stop().await;
+                    for bind in current_binds.iter().filter(|b| !next_binds.contains(b)) {
+                        if let Some(task) = running.remove(bind) {
+                            task.stop().await;
+                        }
+                        restart_attempts.remove(bind);
                     }
-                    current_bind = next_bind.clone();
-                    running = Some(start(next_bind));
-                    restart_attempt = 0;
+                    for bind in next_binds.iter().filter(|b| !current_binds.contains(b)) {
+                        running.insert(bind.clone(), start(bind.clone()));
+                        restart_attempts.insert(bind.clone(), 0);
+                    }
+                    current_binds = next_binds;
                 }
             }
         }
     }
 
-    if let Some(task) = running.take() {
+    for (_, task) in running.drain() {
         task.stop().await;
     }
 }
@@ -917,12 +977,19 @@ async fn supervise_tcp_listener(
     upstreams: Arc<routing::UpstreamManager>,
     shutdown: CancellationToken,
 ) {
+    // Separate handle so the closure does not hold a borrow of `config_rx`,
+    // which the supervisor loop below needs mutably.
+    let cfg_reader = config_rx.clone();
     let start = |bind_addr: String| {
         let listener_shutdown = shutdown.child_token();
         let task_shutdown = listener_shutdown.clone();
         let upstreams = Arc::clone(&upstreams);
+        let cfg = cfg_reader.borrow().clone();
+        let pool_name = cfg.tcp_upstream_pool.clone();
+        let trusted = proxy::realip::TrustedProxies::from_cidrs(&cfg.trusted_proxies);
         let handle = tokio::spawn(async move {
-            proxy::tcp::start_tcp_proxy(&bind_addr, upstreams, task_shutdown).await;
+            proxy::tcp::start_tcp_proxy(&bind_addr, upstreams, pool_name, trusted, task_shutdown)
+                .await;
         });
         RunningListener {
             shutdown: listener_shutdown,
@@ -1001,13 +1068,16 @@ async fn supervise_udp_listener(
     upstreams: Arc<routing::UpstreamManager>,
     shutdown: CancellationToken,
 ) {
+    let cfg_reader = config_rx.clone();
     let start = |bind_addr: String, session_timeout_secs: u64| {
         let listener_shutdown = shutdown.child_token();
         let task_shutdown = listener_shutdown.clone();
         let upstreams = Arc::clone(&upstreams);
         let timeout = std::time::Duration::from_secs(session_timeout_secs);
+        let pool_name = cfg_reader.borrow().udp_upstream_pool.clone();
         let handle = tokio::spawn(async move {
-            proxy::udp::start_udp_proxy(&bind_addr, upstreams, timeout, task_shutdown).await;
+            proxy::udp::start_udp_proxy(&bind_addr, upstreams, pool_name, timeout, task_shutdown)
+                .await;
         });
         RunningListener {
             shutdown: listener_shutdown,

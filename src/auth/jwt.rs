@@ -77,6 +77,12 @@ pub fn check(headers: &HeaderMap, secret: &str, algorithm: &str) -> (AuthResult,
     let mut validation = Validation::new(algo);
     // Disable audience validation by default (configurable in future)
     validation.validate_aud = false;
+    // RFC 7519 §4.1.5: a token carrying `nbf` MUST NOT be accepted before that
+    // time. `jsonwebtoken` leaves this off by default, which would let a
+    // not-yet-valid token authenticate immediately. `exp` is already validated
+    // by default, and the shared `leeway` (60s) covers clock skew for both,
+    // as §4.1.4/§4.1.5 permit.
+    validation.validate_nbf = true;
 
     match decode::<Claims>(token, &key, &validation) {
         Ok(data) => (AuthResult::Allowed, Some(data.claims)),
@@ -84,6 +90,7 @@ pub fn check(headers: &HeaderMap, secret: &str, algorithm: &str) -> (AuthResult,
             use jsonwebtoken::errors::ErrorKind;
             let msg = match e.kind() {
                 ErrorKind::ExpiredSignature => "JWT token has expired",
+                ErrorKind::ImmatureSignature => "JWT token is not valid yet",
                 ErrorKind::InvalidSignature => "JWT signature verification failed",
                 ErrorKind::InvalidToken => "JWT token is malformed",
                 _ => "JWT authentication failed",
@@ -257,6 +264,44 @@ mod tests {
             map.get("X-Auth-Email").map(String::as_str),
             Some("test@test.com")
         );
+    }
+
+    fn now_secs() -> i64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64
+    }
+
+    /// RFC 7519 §4.1.5 — a token whose `nbf` is in the future MUST be rejected.
+    #[test]
+    fn test_nbf_in_future_is_rejected() {
+        let now = now_secs();
+        let token = encode(
+            &Header::new(Algorithm::HS256),
+            &serde_json::json!({ "sub": "u", "exp": now + 3600, "nbf": now + 3600 }),
+            &EncodingKey::from_secret(b"secret"),
+        )
+        .unwrap();
+        let (result, _) = check(&bearer_headers(&token), "secret", "HS256");
+        assert!(
+            matches!(result, AuthResult::Denied(..)),
+            "a not-yet-valid (nbf in future) token must not authenticate"
+        );
+    }
+
+    /// A past `nbf` is fine and must still authenticate.
+    #[test]
+    fn test_nbf_in_past_is_accepted() {
+        let now = now_secs();
+        let token = encode(
+            &Header::new(Algorithm::HS256),
+            &serde_json::json!({ "sub": "u", "exp": now + 3600, "nbf": now - 3600 }),
+            &EncodingKey::from_secret(b"secret"),
+        )
+        .unwrap();
+        let (result, _) = check(&bearer_headers(&token), "secret", "HS256");
+        assert!(matches!(result, AuthResult::Allowed));
     }
 
     #[test]

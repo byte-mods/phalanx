@@ -442,8 +442,42 @@ pub async fn start_admin_server(
         })
     };
 
+    // Token gate for state-changing requests.
+    //
+    // RBAC used to be enforced only inside the handlers in `api.rs`, which left
+    // `POST /api/reload`, `POST /api/waf/ban/{ip}`, the keyval writes, backend
+    // add/remove and cache purge answering 200 to anyone who could reach the
+    // port — with `admin_listen` accepting any bind address, that is not
+    // necessarily just localhost. This wrapper closes the gap for every mutating
+    // route at once. Behaviour is unchanged when no `api_token` is configured,
+    // so existing deployments keep working and opting in is a config change.
+    let gate_tokens = Arc::new(admin_api_tokens.clone());
+
     let server = HttpServer::new(move || {
+        let gate_tokens = Arc::clone(&gate_tokens);
         App::new()
+            .wrap_fn(move |req, srv| {
+                use actix_web::dev::Service;
+                let is_mutation = !matches!(*req.method(), actix_web::http::Method::GET
+                    | actix_web::http::Method::HEAD
+                    | actix_web::http::Method::OPTIONS);
+                let authorized = gate_tokens.is_empty()
+                    || req
+                        .headers()
+                        .get("Authorization")
+                        .and_then(|v| v.to_str().ok())
+                        .and_then(|v| v.strip_prefix("Bearer "))
+                        .is_some_and(|t| gate_tokens.contains_key(t));
+                let fut = srv.call(req);
+                async move {
+                    if is_mutation && !authorized {
+                        return Err(actix_web::error::ErrorUnauthorized(
+                            "admin API token required for state-changing requests",
+                        ));
+                    }
+                    fut.await
+                }
+            })
             .app_data(admin_state.clone())
             .app_data(dash_state.clone())
             .app_data(extended_state.clone())
@@ -1106,9 +1140,12 @@ mod tests {
                 "sdp": "v=0\r\no=- 0 0 IN IP4 0.0.0.0\r\ns=-\r\nt=0 0\r\n"
             }))
             .to_request();
-        // The publish will fail (no real WebRTC stack), but the room
-        // is created inside get_or_create_room before the failure.
-        let _ = test::call_service(&app, req).await;
+        // This SDP has no ice-ufrag, so set_remote_description rejects it.
+        // `get_or_create_room` has already run by then, so the handler has to
+        // unwind: a failed publish must leave no room behind. It used to leave
+        // one reporting `peer_count: 1` for a peer that never connected.
+        let resp = test::call_service(&app, req).await;
+        assert_eq!(resp.status(), 400);
 
         let req = test::TestRequest::get()
             .uri("/api/webrtc/rooms")
@@ -1117,8 +1154,11 @@ mod tests {
         assert_eq!(resp.status(), 200);
         let body: serde_json::Value = test::read_body_json(resp).await;
         let rooms = body["rooms"].as_array().unwrap();
-        assert_eq!(rooms.len(), 1);
-        assert_eq!(rooms[0]["id"], "test-room");
+        assert!(
+            rooms.is_empty(),
+            "a rejected publish must not leave a room behind: {:?}",
+            rooms
+        );
     }
 
     #[actix_web::test]
@@ -1239,11 +1279,13 @@ mod tests {
         assert_eq!(resp.status(), 200);
         let body: serde_json::Value = test::read_body_json(resp).await;
         let rooms = body["rooms"].as_array().unwrap();
-        assert_eq!(rooms.len(), 1);
-        assert_eq!(rooms[0]["id"], "flow-room");
-        assert_eq!(rooms[0]["peer_count"], 2);
-        assert_eq!(rooms[0]["publishers"], 1);
-        assert_eq!(rooms[0]["subscribers"], 1);
+        // Both SDPs are rejected (no ice-ufrag), so both handlers unwind and
+        // the room list ends up empty rather than reporting phantom peers.
+        assert!(
+            rooms.is_empty(),
+            "rejected publish/subscribe must not leave a room behind: {:?}",
+            rooms
+        );
     }
 
     /// Integration: two publishes to different rooms + verify both show
@@ -1278,10 +1320,13 @@ mod tests {
         assert_eq!(resp.status(), 200);
         let body: serde_json::Value = test::read_body_json(resp).await;
         let rooms = body["rooms"].as_array().unwrap();
-        assert_eq!(rooms.len(), 2);
-        let ids: Vec<&str> = rooms.iter().map(|r| r["id"].as_str().unwrap()).collect();
-        assert!(ids.contains(&"room-a"));
-        assert!(ids.contains(&"room-b"));
+        // Both publishes are rejected at SDP validation, and each unwinds its
+        // own room independently.
+        assert!(
+            rooms.is_empty(),
+            "rejected publishes must not leave rooms behind: {:?}",
+            rooms
+        );
     }
 
     /// Integration: the admin state carries ice_servers and the publish

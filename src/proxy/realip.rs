@@ -154,9 +154,26 @@ pub fn resolve_client_ip(
     // maliciously long XFF chains.
     const MAX_XFF_HOPS: usize = 20;
     if let Some(xff) = headers.get("x-forwarded-for").and_then(|v| v.to_str().ok()) {
-        let addrs: Vec<&str> = xff.split(',').map(str::trim).take(MAX_XFF_HOPS).collect();
+        let addrs: Vec<&str> = xff.split(',').map(str::trim).collect();
+
+        // Consider only the *nearest* MAX_XFF_HOPS entries. Those are the ones
+        // appended by infrastructure we control, and bounding the scan keeps a
+        // maliciously long chain from costing unbounded work.
+        //
+        // The window must be taken from the right, not the left: a client
+        // controls the start of the chain, so keeping the leftmost N would let
+        // it prepend N spoofed entries and push the genuine, proxy-appended
+        // address out of the window entirely — handing the client full control
+        // over its own apparent IP, and with it any IP ban, per-IP rate limit,
+        // or geo rule keyed on that address.
+        let window = if addrs.len() > MAX_XFF_HOPS {
+            &addrs[addrs.len() - MAX_XFF_HOPS..]
+        } else {
+            &addrs[..]
+        };
+
         // Walk from the right (closest to us) and skip trusted proxies
-        for addr_str in addrs.iter().rev() {
+        for addr_str in window.iter().rev() {
             if let Ok(ip) = addr_str.parse::<IpAddr>() {
                 if !is_bogus_ip(&ip) && !trusted.is_trusted(&ip) {
                     debug!("Real IP from X-Forwarded-For: {}", ip);
@@ -164,13 +181,91 @@ pub fn resolve_client_ip(
                 }
             }
         }
-        // All addresses in XFF are trusted — use leftmost
-        if let Some(first) = addrs.first().and_then(|s| s.parse::<IpAddr>().ok()) {
+        // Every address in the window is trusted — use the furthest one we looked at
+        if let Some(first) = window.first().and_then(|s| s.parse::<IpAddr>().ok()) {
             return first;
         }
     }
 
+    // 3. RFC 7239 `Forwarded` — the standardised replacement for the de-facto
+    //    `X-Forwarded-*` family. Checked last so an existing deployment that
+    //    sends both keeps the address it has always resolved to.
+    if let Some(fwd) = headers.get("forwarded").and_then(|v| v.to_str().ok()) {
+        if let Some(ip) = parse_forwarded_for(fwd, trusted) {
+            debug!("Real IP from Forwarded: {}", ip);
+            return ip;
+        }
+    }
+
     socket_ip
+}
+
+/// Extracts the client address from an RFC 7239 `Forwarded` header.
+///
+/// The header is a comma-separated list of elements, each a set of
+/// semicolon-separated `token=value` pairs — for example
+/// `for=192.0.2.60;proto=http;by=203.0.113.43, for="[2001:db8::1]:8080"`.
+/// Values may be quoted, IPv6 literals are bracketed, and a `:port` suffix is
+/// permitted. As with `X-Forwarded-For`, the list is walked from the right so a
+/// client cannot displace the entry a trusted proxy appended, and the same hop
+/// cap bounds the work a long header can cost.
+fn parse_forwarded_for(header: &str, trusted: &TrustedProxies) -> Option<IpAddr> {
+    const MAX_FORWARDED_HOPS: usize = 20;
+
+    let elements: Vec<&str> = header.split(',').collect();
+    let window = if elements.len() > MAX_FORWARDED_HOPS {
+        &elements[elements.len() - MAX_FORWARDED_HOPS..]
+    } else {
+        &elements[..]
+    };
+
+    let mut furthest: Option<IpAddr> = None;
+    for element in window.iter().rev() {
+        for pair in element.split(';') {
+            let (key, value) = match pair.split_once('=') {
+                Some(kv) => kv,
+                None => continue,
+            };
+            if !key.trim().eq_ignore_ascii_case("for") {
+                continue;
+            }
+            if let Some(ip) = parse_forwarded_node(value.trim()) {
+                if is_bogus_ip(&ip) {
+                    continue;
+                }
+                furthest = Some(ip);
+                if !trusted.is_trusted(&ip) {
+                    return Some(ip);
+                }
+            }
+        }
+    }
+    // Every hop we could parse is itself trusted — fall back to the furthest.
+    furthest
+}
+
+/// Parses a single RFC 7239 node identifier into an address.
+///
+/// Handles `192.0.2.60`, `"192.0.2.60:4711"`, `"[2001:db8::1]"` and
+/// `"[2001:db8::1]:8080"`. The obfuscated (`_hidden`) and `unknown` forms carry
+/// no address and yield `None`.
+fn parse_forwarded_node(raw: &str) -> Option<IpAddr> {
+    let node = raw.trim().trim_matches('"').trim();
+    if node.is_empty() || node.eq_ignore_ascii_case("unknown") || node.starts_with('_') {
+        return None;
+    }
+    // Bracketed IPv6, optionally with a port.
+    if let Some(rest) = node.strip_prefix('[') {
+        let (addr, _) = rest.split_once(']')?;
+        return addr.parse::<IpAddr>().ok();
+    }
+    // Bare IPv6 (not strictly legal unbracketed, but seen in the wild).
+    if node.matches(':').count() > 1 {
+        return node.parse::<IpAddr>().ok();
+    }
+    // IPv4, optionally with a port.
+    let addr = node.split(':').next()?;
+    addr.parse::<IpAddr>().ok()
 }
 
 /// Injects standard proxy headers (`X-Forwarded-For`, `X-Forwarded-Proto`, `X-Real-IP`)
@@ -259,6 +354,43 @@ mod tests {
         headers.insert("x-forwarded-for", "203.0.113.50, 10.0.0.2".parse().unwrap());
         let resolved = resolve_client_ip(&peer, &headers, &trusted);
         assert_eq!(resolved, "203.0.113.50".parse::<IpAddr>().unwrap());
+    }
+
+    /// A client cannot escape detection by prepending a long run of spoofed
+    /// hops: the hop cap must be applied from the right, so the address the
+    /// trusted proxy actually appended stays inside the examined window.
+    #[test]
+    fn test_long_xff_chain_cannot_hide_the_real_client() {
+        let trusted = TrustedProxies::from_cidrs(&["10.0.0.0/8".to_string()]);
+        let peer: SocketAddr = "10.0.0.1:12345".parse().unwrap();
+
+        // 30 attacker-supplied entries, then the address our own proxy appended.
+        let mut chain: Vec<String> = (1..=30).map(|i| format!("198.51.100.{}", i)).collect();
+        chain.push("203.0.113.99".to_string());
+
+        let mut headers = hyper::HeaderMap::new();
+        headers.insert("x-forwarded-for", chain.join(", ").parse().unwrap());
+
+        let resolved = resolve_client_ip(&peer, &headers, &trusted);
+        assert_eq!(
+            resolved,
+            "203.0.113.99".parse::<IpAddr>().unwrap(),
+            "the rightmost untrusted hop wins, not an attacker-prepended entry"
+        );
+    }
+
+    /// The cap still bounds how much of a hostile chain we inspect.
+    #[test]
+    fn test_long_xff_chain_is_bounded() {
+        let trusted = TrustedProxies::from_cidrs(&["10.0.0.0/8".to_string()]);
+        let peer: SocketAddr = "10.0.0.1:12345".parse().unwrap();
+        let chain: Vec<String> = (1..=100).map(|i| format!("10.0.0.{}", i % 250 + 1)).collect();
+        let mut headers = hyper::HeaderMap::new();
+        headers.insert("x-forwarded-for", chain.join(", ").parse().unwrap());
+        // All hops are trusted, so this falls through to the window fallback
+        // rather than scanning every entry; it must still return an address.
+        let resolved = resolve_client_ip(&peer, &headers, &trusted);
+        assert!(matches!(resolved, IpAddr::V4(_)));
     }
 
     #[test]
@@ -352,5 +484,78 @@ mod tests {
         );
         let resolved = resolve_client_ip(&peer, &headers, &trusted);
         assert_eq!(resolved, "203.0.113.50".parse::<IpAddr>().unwrap());
+    }
+
+    /// RFC 7239 `Forwarded` is the standardised header; only the `X-Forwarded-*`
+    /// family used to be honoured, so a client behind a proxy that emits the
+    /// standard header resolved to the proxy's own address.
+    #[test]
+    fn test_forwarded_header_resolves_client_ip() {
+        let trusted = TrustedProxies::from_cidrs(&["127.0.0.1/32".to_string()]);
+        let peer: SocketAddr = "127.0.0.1:5000".parse().unwrap();
+
+        let cases = [
+            ("for=198.51.100.7", "198.51.100.7"),
+            ("for=198.51.100.7;proto=https;by=203.0.113.43", "198.51.100.7"),
+            ("For=\"198.51.100.7:4711\"", "198.51.100.7"),
+            ("for=\"[2001:db8::1]\"", "2001:db8::1"),
+            ("for=\"[2001:db8::1]:8080\"", "2001:db8::1"),
+            // Rightmost non-trusted entry wins, exactly as for X-Forwarded-For.
+            ("for=198.51.100.7, for=203.0.113.9", "203.0.113.9"),
+        ];
+
+        for (header, expected) in cases {
+            let mut headers = hyper::HeaderMap::new();
+            headers.insert("forwarded", header.parse().unwrap());
+            assert_eq!(
+                resolve_client_ip(&peer, &headers, &trusted),
+                expected.parse::<IpAddr>().unwrap(),
+                "Forwarded: {}",
+                header
+            );
+        }
+    }
+
+    /// Obfuscated and unknown node identifiers carry no address, and an
+    /// untrusted peer must not be able to use the header at all.
+    #[test]
+    fn test_forwarded_header_ignored_when_unusable() {
+        let trusted = TrustedProxies::from_cidrs(&["127.0.0.1/32".to_string()]);
+        let peer: SocketAddr = "127.0.0.1:5000".parse().unwrap();
+
+        for header in ["for=_hidden", "for=unknown", "proto=https", "garbage"] {
+            let mut headers = hyper::HeaderMap::new();
+            headers.insert("forwarded", header.parse().unwrap());
+            assert_eq!(
+                resolve_client_ip(&peer, &headers, &trusted),
+                "127.0.0.1".parse::<IpAddr>().unwrap(),
+                "Forwarded: {}",
+                header
+            );
+        }
+
+        // Untrusted direct peer: the header must not be consulted at all.
+        let untrusted_peer: SocketAddr = "203.0.113.200:5000".parse().unwrap();
+        let mut headers = hyper::HeaderMap::new();
+        headers.insert("forwarded", "for=198.51.100.7".parse().unwrap());
+        assert_eq!(
+            resolve_client_ip(&untrusted_peer, &headers, &trusted),
+            "203.0.113.200".parse::<IpAddr>().unwrap()
+        );
+    }
+
+    /// `X-Forwarded-For` keeps priority so existing deployments that send both
+    /// headers resolve to the address they always have.
+    #[test]
+    fn test_xff_takes_priority_over_forwarded() {
+        let trusted = TrustedProxies::from_cidrs(&["127.0.0.1/32".to_string()]);
+        let peer: SocketAddr = "127.0.0.1:5000".parse().unwrap();
+        let mut headers = hyper::HeaderMap::new();
+        headers.insert("x-forwarded-for", "198.51.100.7".parse().unwrap());
+        headers.insert("forwarded", "for=203.0.113.9".parse().unwrap());
+        assert_eq!(
+            resolve_client_ip(&peer, &headers, &trusted),
+            "198.51.100.7".parse::<IpAddr>().unwrap()
+        );
     }
 }

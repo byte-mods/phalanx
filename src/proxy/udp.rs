@@ -47,12 +47,14 @@ struct UdpSession {
 ///
 /// * `bind_addr`          - UDP socket address to listen on (e.g. `"0.0.0.0:5353"`).
 /// * `upstreams`          - Shared upstream pool manager for backend selection.
+/// * `pool_name`          - Upstream pool to forward to (`udp_upstream_pool`, default `"default"`).
 /// * `session_timeout`    - Idle session timeout. Sessions without traffic for this
 ///                          duration are garbage-collected.
 /// * `shutdown`           - Cancellation token for graceful shutdown.
 pub async fn start_udp_proxy(
     bind_addr: &str,
     upstreams: Arc<UpstreamManager>,
+    pool_name: String,
     session_timeout: Duration,
     shutdown: CancellationToken,
 ) {
@@ -125,11 +127,14 @@ pub async fn start_udp_proxy(
                 debug!("UDP forward to {} failed: {}", backend_addr, e);
             }
         } else {
-            // Select a backend from the "default" pool
-            let pool = match upstreams.get_pool("default") {
+            // Select a backend from the configured pool
+            let pool = match upstreams.get_pool(&pool_name) {
                 Some(p) => p,
                 None => {
-                    error!("No default pool for UDP proxy");
+                    error!(
+                        "UDP proxy: upstream pool '{}' not configured (set `udp_upstream_pool`)",
+                        pool_name
+                    );
                     continue;
                 }
             };

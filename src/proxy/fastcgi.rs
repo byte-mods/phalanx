@@ -70,6 +70,9 @@ pub async fn serve_fastcgi<T>(
     access_logger: Arc<AccessLogger>,
     method_str: &str,
     ip_str: &str,
+    // Route `root`, used as DOCUMENT_ROOT and to build SCRIPT_FILENAME.
+    // Falls back to the process working directory when unset.
+    doc_root: Option<&str>,
 ) -> Result<Response<BoxBody<Bytes, hyper::Error>>, hyper::Error>
 where
     T: hyper::body::Body<Data = Bytes> + Send + Sync + Unpin + 'static,
@@ -128,14 +131,85 @@ where
     let (parts, body) = req.into_parts();
     let query_string = parts.uri.query().unwrap_or("");
 
+    // `REQUEST_URI` is the *original* target including the query string
+    // (RFC 3875 §4.1.x conventions as implemented by nginx/Apache). Sending the
+    // bare path here made every framework that re-parses REQUEST_URI — most PHP
+    // routers do — lose the query string.
+    let request_uri = if query_string.is_empty() {
+        req_path.to_string()
+    } else {
+        format!("{}?{}", req_path, query_string)
+    };
+
+    // SCRIPT_FILENAME is what PHP-FPM opens. Without it PHP-FPM answers
+    // "Primary script unknown" and never runs anything, which made the whole
+    // FastCGI handler unusable against the most common FastCGI backend.
+    // Resolve it the way nginx does: $document_root$script_name.
+    let document_root = doc_root
+        .map(|r| r.trim_end_matches('/').to_string())
+        .unwrap_or_else(|| {
+            std::env::current_dir()
+                .map(|p| p.to_string_lossy().trim_end_matches('/').to_string())
+                .unwrap_or_default()
+        });
+    let script_filename = format!("{}{}", document_root, req_path);
+
     // Build the standard CGI environment variables that FastCGI expects.
     // These map 1:1 to the variables a CGI script would receive.
     let mut params = Params::default()
         .request_method(method_str)
-        .request_uri(req_path)
+        .request_uri(request_uri.as_str())
         .script_name(req_path)
+        .document_uri(req_path)
+        .document_root(document_root.as_str())
+        .script_filename(script_filename.as_str())
         .query_string(query_string)
-        .remote_addr(ip_str);
+        .remote_addr(ip_str)
+        .server_software(concat!("Phalanx/", env!("CARGO_PKG_VERSION")))
+        .server_protocol(match parts.version {
+            hyper::Version::HTTP_10 => "HTTP/1.0",
+            hyper::Version::HTTP_2 => "HTTP/2.0",
+            _ => "HTTP/1.1",
+        });
+
+    // SERVER_NAME / SERVER_PORT come from the Host header, which is what a
+    // CGI application expects to see for the vhost it is serving.
+    let host_header = parts
+        .headers
+        .get(hyper::header::HOST)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    if !host_header.is_empty() {
+        let (name, port) = match host_header.rsplit_once(':') {
+            // Guard against IPv6 literals like `[::1]` with no port.
+            Some((n, p)) if p.chars().all(|c| c.is_ascii_digit()) && !p.is_empty() => (n, p),
+            _ => (host_header, ""),
+        };
+        params = params.server_name(name);
+        if let Ok(p) = port.parse::<u16>() {
+            params = params.server_port(p);
+        }
+    }
+
+    // CONTENT_LENGTH / CONTENT_TYPE are CGI variables in their own right, not
+    // just `HTTP_*` copies. PHP and most CGI runtimes read the unprefixed names
+    // to decide whether to consume stdin at all — without them a POST body was
+    // delivered but never parsed, so `$_POST` came back empty.
+    if let Some(ct) = parts
+        .headers
+        .get(hyper::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+    {
+        params = params.content_type(ct);
+    }
+    if let Some(cl) = parts
+        .headers
+        .get(hyper::header::CONTENT_LENGTH)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.parse::<usize>().ok())
+    {
+        params = params.content_length(cl);
+    }
 
     // Convert HTTP headers to CGI-style HTTP_* environment variables
     // (e.g. "Content-Type" -> "HTTP_CONTENT_TYPE")

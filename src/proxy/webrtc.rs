@@ -180,6 +180,15 @@ impl SfuState {
             .clone()
     }
 
+    /// Drops a room outright, without waiting for the idle sweeper.
+    ///
+    /// Used when signalling fails before anyone actually joined — the room was
+    /// created optimistically by `get_or_create_room`, and leaving it behind
+    /// makes the room list report participants that do not exist.
+    pub fn remove_room(&self, room_id: &str) {
+        self.rooms.remove(room_id);
+    }
+
     /// List all active rooms with their track and bandwidth stats.
     pub fn list_rooms(&self) -> Vec<serde_json::Value> {
         self.rooms
@@ -550,27 +559,49 @@ pub async fn handle_publish(
         },
     ));
 
-    // Set the remote description (publisher's offer)
-    let offer =
-        RTCSessionDescription::offer(offer_sdp).map_err(|e| format!("Invalid SDP offer: {}", e))?;
-    peer_connection
-        .set_remote_description(offer)
-        .await
-        .map_err(|e| format!("set_remote_description failed: {}", e))?;
+    // Negotiation from here on can fail on client-supplied input. The peer was
+    // registered in the room above (the `on_track` callback needs it in place
+    // before the remote description is applied), so every failure path has to
+    // take it back out again — otherwise a rejected offer left a phantom
+    // publisher behind and `/api/webrtc/rooms` reported a room with
+    // `peer_count: 1` that no one was ever connected to.
+    let negotiate = async {
+        let offer = RTCSessionDescription::offer(offer_sdp)
+            .map_err(|e| format!("Invalid SDP offer: {}", e))?;
+        peer_connection
+            .set_remote_description(offer)
+            .await
+            .map_err(|e| format!("set_remote_description failed: {}", e))?;
 
-    // Create and set local description (our answer)
-    let answer = peer_connection
-        .create_answer(None)
-        .await
-        .map_err(|e| format!("create_answer failed: {}", e))?;
+        // Create and set local description (our answer)
+        let answer = peer_connection
+            .create_answer(None)
+            .await
+            .map_err(|e| format!("create_answer failed: {}", e))?;
 
-    // Gather ICE candidates (non-trickle mode: wait for complete gather)
-    let mut gather_complete = peer_connection.gathering_complete_promise().await;
+        // Gather ICE candidates (non-trickle mode: wait for complete gather)
+        let gather_complete = peer_connection.gathering_complete_promise().await;
 
-    peer_connection
-        .set_local_description(answer)
-        .await
-        .map_err(|e| format!("set_local_description failed: {}", e))?;
+        peer_connection
+            .set_local_description(answer)
+            .await
+            .map_err(|e| format!("set_local_description failed: {}", e))?;
+
+        Ok::<_, String>(gather_complete)
+    };
+
+    let mut gather_complete = match negotiate.await {
+        Ok(g) => g,
+        Err(e) => {
+            room.peers.remove(&peer_id);
+            room.publishers.remove(&peer_id);
+            let _ = peer_connection.close().await;
+            if room.peers.is_empty() {
+                sfu.remove_room(&room_id);
+            }
+            return Err(e);
+        }
+    };
 
     // Block until all ICE candidates have been gathered, but cap wait so
     // a slow STUN/TURN probe cannot block the async runtime indefinitely.
@@ -720,25 +751,47 @@ pub async fn handle_subscribe(
         },
     ));
 
-    // Set subscriber offer and generate answer
-    let offer = RTCSessionDescription::offer(offer_sdp)
-        .map_err(|e| format!("Invalid subscriber SDP offer: {}", e))?;
-    peer_connection
-        .set_remote_description(offer)
-        .await
-        .map_err(|e| format!("Subscriber set_remote_description failed: {}", e))?;
+    // As in `handle_publish`: the subscriber is already registered in the room,
+    // so a rejected offer has to be unwound rather than left behind as a
+    // phantom participant.
+    let negotiate = async {
+        let offer = RTCSessionDescription::offer(offer_sdp)
+            .map_err(|e| format!("Invalid subscriber SDP offer: {}", e))?;
+        peer_connection
+            .set_remote_description(offer)
+            .await
+            .map_err(|e| format!("Subscriber set_remote_description failed: {}", e))?;
 
-    let answer = peer_connection
-        .create_answer(None)
-        .await
-        .map_err(|e| format!("Subscriber create_answer failed: {}", e))?;
+        let answer = peer_connection
+            .create_answer(None)
+            .await
+            .map_err(|e| format!("Subscriber create_answer failed: {}", e))?;
 
-    let mut gather_complete = peer_connection.gathering_complete_promise().await;
+        let gather_complete = peer_connection.gathering_complete_promise().await;
 
-    peer_connection
-        .set_local_description(answer)
-        .await
-        .map_err(|e| format!("Subscriber set_local_description failed: {}", e))?;
+        peer_connection
+            .set_local_description(answer)
+            .await
+            .map_err(|e| format!("Subscriber set_local_description failed: {}", e))?;
+
+        Ok::<_, String>(gather_complete)
+    };
+
+    let mut gather_complete = match negotiate.await {
+        Ok(g) => g,
+        Err(e) => {
+            room.peers.remove(&peer_id);
+            room.subscriber_tokens.remove(&peer_id);
+            if let Some((_, handle)) = room.subscriber_handles.remove(&peer_id) {
+                handle.abort();
+            }
+            let _ = peer_connection.close().await;
+            if room.peers.is_empty() {
+                sfu.remove_room(&room_id);
+            }
+            return Err(e);
+        }
+    };
 
     const ICE_GATHER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
     if tokio::time::timeout(ICE_GATHER_TIMEOUT, gather_complete.recv())

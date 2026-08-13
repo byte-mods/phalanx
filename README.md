@@ -93,7 +93,19 @@ limitations under the License.
 
 ## What Is Built
 
-Every item below is fully implemented, compiles, and is covered by tests. **1,129 tests total (896 unit + 229 integration + 2 smoke + 2 binary) — all passing.**
+Every item below is fully implemented, compiles, and is covered by tests. **1,178 tests total (938 unit + 235 integration + 2 smoke + 2 binary + 1 end-to-end) — all passing.**
+
+> **2026-08-13 update — the request path, verified against a live process.** The suite up to this point was entirely unit tests calling helpers directly, so `accept → sniff → route → forward → respond` had no coverage at all, and a fully green run coexisted with a proxy that answered *nothing* to an ordinary HTTP request. `tests/e2e_proxy.rs` now boots the real binary against a real backend over real sockets and asserts what a client that writes its request in one `write()` and waits actually observes. It found, and this batch fixes:
+>
+> - **The HTTP/1 backend connection future was never polled.** `hyper::client::conn::http1::handshake` returns a `conn` future that owns the socket and performs all I/O; until something drives it, `sender.send_request()` cannot write a byte and never resolves. It is now spawned with `with_upgrades()` (so 101 upgrades still work), and the socket returns to the per-backend idle queue when that task ends.
+> - **The PROXY-v2 pre-read consumed the request head**, after which `sniff_protocol` issued a second `read()` that blocked forever. Peeked bytes are now carried forward.
+> - **PROXY-v2 source spoofing.** The claimed address was adopted unconditionally, so any client that could reach the port chose its own apparent IP — verified: a loopback client claiming `8.8.8.8` was believed, defeating IP bans, per-IP rate limits and geo rules. The claim is now honoured only from a `trusted_proxy` peer or a listener with `proxy_proto_v2 on`; the header is still consumed either way, so framing stays correct.
+> - **The h2 client was used for h2 clients.** The protocol the client used says nothing about what the backend speaks; an HTTP/1.1 upstream answered with a status line the h2 client rejected as a malformed frame. Upstream now stays HTTP/1.1 unless the route sets `proxy_http_version 2`.
+> - **Startup panics.** The rustls crypto provider is installed on the main thread before any listener touches rustls (the QUIC listener built its `ServerConfig` from the process default and panicked — hidden because the H3 tests installed a provider `main` never did). Telemetry init moved *inside* the runtime, since the OTLP exporter builds a hyper client at construction and panics with "there is no reactor running" off-runtime.
+> - **The directive table was not sorted.** Lookup is a binary search, which silently fails to find entries in unsorted input rather than erroring: `global_rate_limit`, `gslb_policy`, `ml_fraud_model_path`, `ml_fraud_mode`, `webtransport` and `websocket_idle_timeout` were rejected as "Unknown directive", so the features behind them could not be switched on at all. `test_known_server_directives_are_sorted` guards it now.
+> - **Only one `listen` bind was supervised.** A config with several `server` blocks on different ports got one accept loop; each bind now has its own supervised, independently restarted listener.
+>
+> Correctness work alongside it: HTTP/1 framing validation (missing/duplicate `Host` on 1.1, `Content-Length` with `Transfer-Encoding`), origin-form normalisation, RFC 7239 `Forwarded` parsing (walked right-to-left with the same hop cap as `X-Forwarded-For`), recursive URL-decoding before WAF inspection (`..%252f` hid traversal from the rules) bounded by `MAX_DECODE_PASSES`, WAF false-positive tuning (a signup form can accept "O'Brien" again; SSTI, time-based blind SQLi, stream-wrapper LFI and Shellshock added), RFC 9110 `Accept-Encoding` qvalue parsing (`contains("br")` also fired on `libra`), JWT `nbf` enforcement, WebRTC room cleanup when signalling fails before anyone joins, and a readable error when RocksDB's exclusive lock means another Phalanx is already running in this directory.
 
 > **2026-04-27 update (later, batch 9):** Two long-deferred items closed (one fully, one as detection). **P2** — `HookContext`'s hot-path string fields (`client_ip`, `method`, `path`, `query`) now use `Arc<str>` instead of `String`. Each HTTP/1, HTTP/2, and HTTP/3 handler builds a single `ip_arc` / `method_arc` / `final_path_arc` per request and `Arc::clone` (atomic increment, no heap allocation) at every per-phase HookContext construction site. Net per request when hooks fire: 12 `String` allocations → 5 `Arc::from(&str)` allocations + 12 atomic increments (~58% fewer heap allocations). PreRoute keeps a separate path Arc because it sees the original (pre-rewrite) path. `IpAccessHook` switched to slice-deref comparison; `RhaiHookHandler` converts to `String` at the Rhai scope boundary (Rhai needs the concrete `String` type for `starts_with`/`contains` dispatch). `WasmRequestContext` and `AccessLogEntry` keep `String` deliberately — they're downstream serialisation boundaries where the API ripple cost outweighs the marginal allocation save. **WebTransport detection** — `is_h3_extended_connect` recognises any HTTP/3 CONNECT request (and `sec-webtransport-http3-draft02`); responds 501 with a `phalanx-webtransport-status: not_implemented` header so operators see attempted WT usage and clients distinguish "feature not implemented" from "URL not found". The actual WT session protocol (bidi streams, datagrams, SETTINGS_ENABLE_WEBTRANSPORT) is **not** implemented — that needs the experimental `h3-webtransport` crate plus a forwarding-semantics design. 6 new tests; 955 passing.
 
@@ -181,7 +193,7 @@ The following modules are **fully implemented** but not yet integrated into the 
 | **AdvancedCache (disk tier)** | ✅ **Wired** | `AdvancedCache` initialized in `main.rs` with `cache_disk_path` config; L1 Moka + L2 disk with stale-while-revalidate |
 | **OIDC Auth** | ✅ **Wired** | `OidcSessionStore` passed to `handle_http_request`; session cookie validation runs for routes with `auth_oidc_issuer` + `auth_oidc_cookie_name` |
 | **JWKS Manager** | ✅ **Wired** | `JwksManager` used in JWT validation path for routes with `auth_jwks_uri`; RS256/ES256 public keys fetched and cached from JWKS endpoint |
-| **HTTP/3 AI/Cache** | ✅ **Wired** | AI engine passed to `get_next_backend(None, Some(ai_engine))`; `update_score()` called with latency after each request; GET 200 responses stored in cache; cache hit returns early with `X-Cache: HIT` |
+| **HTTP/3 AI/Cache** | ✅ **Wired** | AI engine passed to `get_next_backend(None, Some(ai_engine))`; `update_score()` called with latency after each request; GET 200 responses stored in cache; cache hit returns early with `X-Phalanx-Cache: HIT` |
 | **HTTP/3 Access Log + Bandwidth** | ✅ **Wired** | `AccessLogger.log()` called after response with full `AccessLogEntry` (timestamp, client IP, method, path, status, latency, backend, pool, bytes sent, referer, UA); `BandwidthTracker.protocol("http3")` and `.pool(name)` increment requests, in-bytes, and out-bytes |
 | **HTTP/3 Shared Upstream Client** | ✅ **Wired** | Forwarder uses one process-wide `OnceLock<reqwest::Client>` instead of building per request; DNS resolver, TLS context, and HTTP/1 keepalive pool are constructed once. Mirror request body is only cloned when a `mirror_pool` is configured |
 
@@ -231,7 +243,7 @@ cargo build --release
 # Debug build
 cargo build
 
-# Run tests (1,109 total: 876 unit + 231 integration + 2 smoke — all passing)
+# Run tests (1,178 total: 940 unit + 235 integration + 2 smoke + 1 end-to-end — all passing)
 cargo test
 
 # Run with default config
@@ -692,8 +704,8 @@ Licensed under the Apache License, Version 2.0
 route /admin {
     upstream admin_pool;
     auth_basic            "Admin Area";
-    auth_basic_user       "alice" "$2b$10$...bcrypt_hash...";
-    auth_basic_user       "bob"   "plaintext_password";
+    auth_basic_user       "alice:$2b$10$...bcrypt_hash...";
+    auth_basic_user       "bob:plaintext_password";
 }
 ```
 
@@ -1313,14 +1325,33 @@ Licensed under the Apache License, Version 2.0
 **Rhai script example** (`script.rhai`):
 
 ```rhai
-// Called in PreRoute phase
-if uri.starts_with("/legacy") {
-    uri = uri.replace("/legacy", "/v2");
-}
+// Called in PreRoute phase.
+//
+// The script communicates by its RETURN VALUE, not by assignment: the last
+// expression is read as a directive string. Assigning to `uri` changes only the
+// script's local copy and has no effect on the request.
+//
+//   "rewrite:/new/path"        -> rewrite the request target
+//   "respond:403:Forbidden"    -> short-circuit with that status and body
+//   ()                         -> continue unchanged
+//   false                      -> 403 Forbidden
+//
+// Available bindings: `uri`, `method`, `client_ip`, `status`, `headers`
+// Available functions: `set_header(name, value)`, `set_var(key, value)`
 
-// Block requests from a specific IP
+set_header("X-Checked-By", "phalanx");
+
 if client_ip == "1.2.3.4" {
-    respond(403, "Forbidden");
+    "respond:403:Forbidden"
+} else if uri.starts_with("/legacy") {
+    // NOTE: Rhai's String::replace mutates in place and returns unit, so build
+    // the new path in a local first. Returning a bare "rewrite:" with an empty
+    // path is rejected — a request target must start with "/".
+    let p = uri;
+    p.replace("/legacy", "/v2");
+    "rewrite:" + p
+} else {
+    ()
 }
 ```
 
@@ -2514,7 +2545,7 @@ All test scripts live in `scripts/`. No external test framework is required for 
 ### Rust Tests
 
 ```bash
-# All 955 tests (729 unit + 226 integration)
+# All 1,178 tests (940 unit + 235 integration + 2 smoke + 1 end-to-end)
 cargo test
 
 # Only unit tests
@@ -2522,6 +2553,9 @@ cargo test --lib
 
 # Only integration tests
 cargo test --test proxy_test
+
+# End-to-end: boots the real binary against a real backend over real sockets
+cargo test --test e2e_proxy
 
 # Run a specific test
 cargo test bandwidth::tests::test_bandwidth_warning_alert
@@ -2921,7 +2955,7 @@ http {
 
             # --- Auth ---
             auth_basic            "realm";
-            auth_basic_user       "user" "password_or_bcrypt";
+            auth_basic_user       "user:password_or_bcrypt";   # single "user:secret" value
             auth_jwt_secret       "secret";
             auth_jwt_algorithm    HS256;
             auth_oauth_introspect_url  http://oauth/introspect;
